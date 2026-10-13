@@ -1,0 +1,23 @@
+# Core. Install torch first, matched to your CUDA module, from pytorch.org.
+torch>=2.4
+numpy>=1.24
+
+# ESMFold2-Fast loads via AutoModel(trust_remote_code=True), which pulls the
+# FastPLMs implementation from the model repository. Check the model card's own
+# requirements.txt for the revision you are using -- recent ESMFold2 cards pin
+# newer transformers than this floor.
+transformers>=4.44
+accelerate>=0.30
+huggingface_hub>=0.23
+
+# Optional but recommended: exact TM-align. Without it the pipeline uses its
+# own seed-refined TM-score, which agrees closely but costs more per call.
+tmtools>=0.2.0
+
+# LigandMPNN is used as a source checkout rather than a package:
+#   git clone https://github.com/dauparas/LigandMPNN
+#   cd LigandMPNN && bash get_model_params.sh ./model_params
+#   export MPNN_REPO=$PWD
+# Its own runtime deps that this pipeline exercises:
+ml-collections>=0.1.1
+prody>=2.4.0

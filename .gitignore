@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run artifacts
+outputs/
+logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Inputs are large and live on shared storage, not in git
+input_pdbs/
