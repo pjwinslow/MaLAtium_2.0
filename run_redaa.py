@@ -61,6 +61,25 @@ def main(argv=None) -> int:
         help="override INPUT_PDB_DIR",
     )
     parser.add_argument(
+        "--fetch",
+        metavar="SPECS",
+        default=None,
+        help="fetch and prepare inputs before running, e.g. "
+        "--fetch '1ubq_A, 2gb1, cath:1cukA01, af:P0DTC2'. Accepts PDB IDs "
+        "(optionally _CHAIN and :FIRST-LAST), cath:/af:/pdbe: prefixes, URLs "
+        "and local paths. Written to --input-dir.",
+    )
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="with --fetch, prepare the inputs and exit without searching",
+    )
+    parser.add_argument(
+        "--chain",
+        default=None,
+        help="with --fetch, chain to use for any spec that does not name one",
+    )
+    parser.add_argument(
         "--chunk-index",
         type=int,
         default=None,
@@ -75,12 +94,20 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.self_test:
-        from tests import test_pipeline, test_search, test_structure
+        from tests import (
+            test_colab,
+            test_fetch,
+            test_pipeline,
+            test_search,
+            test_structure,
+        )
 
         failed = 0
         for label, module in (
             ("structural metrics", test_structure),
             ("search and chemistry", test_search),
+            ("fetching and input prep", test_fetch),
+            ("colab helpers", test_colab),
             ("pipeline orchestration", test_pipeline),
         ):
             print(f"\n=== {label} ===")
@@ -107,6 +134,23 @@ def main(argv=None) -> int:
     if args.test:
         cfg.apply_test_mode()
         print("\n*** TEST MODE: first domain, 1 replicate, reduced budgets ***\n")
+
+    if args.fetch:
+        from redaa.colab import describe_inputs, gather_inputs
+
+        print(f"Preparing inputs in {cfg.input_pdb_dir}\n")
+        reports = gather_inputs(
+            specs=args.fetch, input_dir=cfg.input_pdb_dir, chain=args.chain
+        )
+        if not reports:
+            print("\nNo inputs could be prepared.")
+            return 1
+        print("\n" + describe_inputs(reports))
+        if args.fetch_only:
+            return 0
+        print()
+    elif args.fetch_only:
+        parser.error("--fetch-only requires --fetch")
 
     if args.print_config:
         print("Resolved configuration:")

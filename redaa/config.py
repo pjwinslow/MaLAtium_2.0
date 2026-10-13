@@ -13,6 +13,27 @@ from dataclasses import dataclass, field, fields
 
 ALL_AAS = tuple("ACDEFGHIKLMNPQRSTVWY")
 
+# Every environment variable this module reads. Exported so a caller can
+# report the settings actually in effect without pattern-matching os.environ
+# and picking up unrelated variables.
+ENV_VARS = (
+    "AUTO_RESUME", "BASELINE_TOLERANCE", "CHUNK_INDEX", "CHUNK_SIZE",
+    "DO_BACKWARD_PRUNING", "DYNAMIC_SEEDING", "DYNAMIC_SEED_SIZE",
+    "ESM_START_AFTER_N_AAS", "EXHAUSTIVE_PRUNING_THRESHOLD",
+    "FOLD_BATCH_SIZE", "FOLD_CACHE_PATH", "FOLD_LOOPS", "FOLD_MAX_RESIDUES",
+    "FOLD_MODEL_ID", "FOLD_PRECISION", "FOLD_SEED", "FOLD_STEPS_FINAL",
+    "FOLD_STEPS_SCREEN", "INPUT_PDB_DIR", "MAX_IDENTITY_FOR_FOLD",
+    "MAX_RMSD_THRESHOLD", "MAX_WALL_SECONDS", "MIN_PLDDT_DISORDER",
+    "MIN_TM_SCORE", "MPNN_BASELINE_TEMP", "MPNN_BATCH_SIZE",
+    "MPNN_CHECKPOINT", "MPNN_MODEL_TYPE", "MPNN_NUM_SEQ", "MPNN_REPO",
+    "MPNN_TEMP", "NATIVE_PLDDT_MIN", "NATIVE_TM_MIN", "NUM_REPLICATES",
+    "NUM_SEQS_TO_FOLD", "OUTPUT_ROOT", "PRUNE_FOLDS",
+    "PRUNING_DOWNWARD_CLOSURE", "PRUNING_MIN_SIZE", "RESUME_FROM",
+    "RUN_NAME", "SAVE_FOLD_PDBS", "SCREEN_FOLDS_STAGE1",
+    "SCREEN_FOLDS_STAGE2", "SCREEN_STAGE2_KEEP", "USE_FOLD_CACHE",
+    "USE_HYDROPHOBIC_SEEDING", "USE_PLDDT_GATE", "USE_TORCH_COMPILE",
+)
+
 
 def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)

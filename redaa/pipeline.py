@@ -48,7 +48,18 @@ class StopRequested(Exception):
 
 
 class Pipeline:
-    def __init__(self, cfg):
+    """One batch run.
+
+    *folder* and *mpnn* let a caller hand in already-loaded engines.  That is
+    for interactive use -- in a notebook, loading ESMFold2 takes a few minutes,
+    and re-running the run cell with a different threshold should not pay for
+    it again.  An injected engine is reused only if it was built for the same
+    model and checkpoint; otherwise it is reloaded, so changing the model in a
+    form cell still does the right thing.
+    """
+
+    def __init__(self, cfg, folder: FoldEngine | None = None,
+                 mpnn: MPNNEngine | None = None):
         self.cfg = cfg
         self.started = time.time()
         self.stop_requested = False
@@ -58,6 +69,8 @@ class Pipeline:
         self.folder: FoldEngine | None = None
         self.mpnn: MPNNEngine | None = None
         self.cache: FoldCache | None = None
+        self._injected_folder = folder
+        self._injected_mpnn = mpnn
 
     # -- lifecycle --------------------------------------------------------
     def install_signal_handlers(self) -> None:
@@ -139,11 +152,28 @@ class Pipeline:
         if self.cache.enabled:
             print(f"Fold cache: {cache_path}")
 
-        self.folder = FoldEngine(cfg, self.cache)
-        self.folder.load()
+        reuse = self._injected_folder
+        if reuse is not None and reuse.cfg.fold_model_id == cfg.fold_model_id:
+            reuse.cfg = cfg            # pick up this run's step counts etc.
+            reuse.cache = self.cache   # but point at this run's cache
+            self.folder = reuse
+            print(f"  reusing the {cfg.fold_model_id} model already in memory")
+        else:
+            self.folder = FoldEngine(cfg, self.cache)
+            self.folder.load()
 
-        self.mpnn = MPNNEngine(cfg)
-        self.mpnn.load()
+        reuse_mpnn = self._injected_mpnn
+        if (
+            reuse_mpnn is not None
+            and reuse_mpnn.cfg.mpnn_checkpoint == cfg.mpnn_checkpoint
+            and reuse_mpnn.cfg.mpnn_model_type == cfg.mpnn_model_type
+        ):
+            reuse_mpnn.cfg = cfg
+            self.mpnn = reuse_mpnn
+            print("  reusing the LigandMPNN model already in memory")
+        else:
+            self.mpnn = MPNNEngine(cfg)
+            self.mpnn.load()
 
         if not st.have_tmtools():
             print(

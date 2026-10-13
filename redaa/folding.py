@@ -125,8 +125,17 @@ class FoldEngine:
 
         try:
             model = AutoModel.from_pretrained(self.cfg.fold_model_id, **kwargs)
-        except TypeError:
-            # Older or stripped-down revisions may not take esmc_precision.
+        except (TypeError, ValueError) as exc:
+            # Older or stripped-down revisions may not accept esmc_precision at
+            # all, and a revision that does may reject the particular value --
+            # 'fp16' is worth trying on a pre-Ampere GPU with no bf16, but not
+            # every build offers it.  Either way, retry on the default.
+            if "esmc_precision" not in kwargs:
+                raise
+            print(
+                f"  esmc_precision={self.cfg.fold_precision!r} rejected "
+                f"({exc}); retrying with the model default"
+            )
             kwargs.pop("esmc_precision", None)
             model = AutoModel.from_pretrained(self.cfg.fold_model_id, **kwargs)
 

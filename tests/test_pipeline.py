@@ -61,9 +61,10 @@ def _write_reference(path, seq=NATIVE):
 class StubMPNN:
     """Deterministic sequence sampler over the allowed alphabet."""
 
-    def __init__(self, length=len(NATIVE)):
+    def __init__(self, length=len(NATIVE), cfg=None):
         self.length = length
         self.calls = 0
+        self.cfg = cfg
 
     def load(self):
         pass
@@ -91,10 +92,12 @@ class StubMPNN:
 class StubFolder:
     """Folds to the reference when the alphabet is sufficient, else garbage."""
 
-    def __init__(self, ref_xyz):
+    def __init__(self, ref_xyz, cfg=None):
         self.ref = ref_xyz
         self.calls = 0
         self.seen: list[str] = []
+        self.cfg = cfg
+        self.cache = None
 
     def load(self):
         pass
@@ -375,6 +378,75 @@ def test_wall_clock_budget_stops_cleanly_and_reports_resumable():
         # Summaries are still written, so the run is inspectable.
         assert os.path.exists(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_setup_reuses_injected_engines_when_the_models_match():
+    """A notebook re-running the run cell should not reload ESMFold2.
+
+    Reuse is checked against the real Pipeline.setup, not the stub's: if the
+    reuse branch were not taken, setup would try to build a genuine FoldEngine
+    and fail for want of torch.
+    """
+    tmp = tempfile.mkdtemp(prefix="redaa_reuse_")
+    try:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp)
+
+        folder = StubFolder(_helix(len(NATIVE)), cfg=cfg)
+        mpnn = StubMPNN(cfg=cfg)
+        pipe = Pipeline(cfg, folder=folder, mpnn=mpnn)
+        pipe.setup()
+
+        assert pipe.folder is folder
+        assert pipe.mpnn is mpnn
+        # The engine is repointed at this run's cache rather than keeping a
+        # stale one from the previous run.
+        assert pipe.folder.cache is pipe.cache
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_setup_reloads_when_the_requested_model_changed():
+    """Changing the model in a form cell must not silently reuse the old one."""
+    import redaa.pipeline as P
+
+    tmp = tempfile.mkdtemp(prefix="redaa_noreuse_")
+    built = []
+
+    class _Sentinel:
+        def __init__(self, cfg, cache=None):
+            built.append(cfg.fold_model_id)
+            self.cfg = cfg
+            self.cache = cache
+
+        def load(self):
+            pass
+
+    real_fold, real_mpnn = P.FoldEngine, P.MPNNEngine
+    try:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        _write_reference(os.path.join(tmp, "inputs", "testdomA00.pdb"))
+
+        old_cfg = _make_config(tmp)
+        old_cfg.fold_model_id = "Synthyra/ESMFold2-Fast"
+        new_cfg = _make_config(tmp)
+        new_cfg.fold_model_id = "Synthyra/ESMFold2-600"
+
+        P.FoldEngine = _Sentinel
+        P.MPNNEngine = _Sentinel
+        pipe = Pipeline(
+            new_cfg,
+            folder=StubFolder(_helix(len(NATIVE)), cfg=old_cfg),
+            mpnn=StubMPNN(cfg=old_cfg),
+        )
+        pipe.setup()
+        assert built == ["Synthyra/ESMFold2-600"], built
+        assert isinstance(pipe.folder, _Sentinel)
+    finally:
+        P.FoldEngine, P.MPNNEngine = real_fold, real_mpnn
         shutil.rmtree(tmp, ignore_errors=True)
 
 

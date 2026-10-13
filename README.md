@@ -20,7 +20,21 @@ existing analysis scripts keep working.
 
 ---
 
-## Quick start
+## Two ways to run it
+
+**Google Colab** — `colab/RedAA_Colab.ipynb`. Fetches structures by accession or
+takes your own uploads, picks defaults to match whichever GPU the session got,
+and keeps results on Drive so a disconnect resumes instead of restarting.
+See [Running on Colab](#running-on-colab).
+
+**MSI batch** — `slurm/redaa_array.slurm`. An array job over chunks of a domain
+panel, with a shared fold cache and preemption-safe checkpointing.
+
+Both import the same `redaa/` package, so results are comparable.
+
+---
+
+## Quick start (MSI)
 
 ```bash
 # 1. Point at your LigandMPNN checkout and your domain PDBs
@@ -39,6 +53,67 @@ python run_redaa.py --test
 # 5. Submit the real thing
 sbatch slurm/redaa_array.slurm
 ```
+
+## Inputs: fetch or supply
+
+The MSI runs take a directory of pre-cleaned, single-chain CATH domain PDBs.
+When you have an accession instead, `--fetch` turns one into the other:
+
+```bash
+python run_redaa.py --fetch "1ubq_A, 2gb1_A, cath:1cukA01, af:P0DTC2" \
+                    --input-dir ./inputs --fetch-only
+python run_redaa.py --input-dir ./inputs
+```
+
+| spec | meaning |
+|---|---|
+| `1UBQ` | RCSB entry, largest protein chain |
+| `1ubq_A` | chain A (`:` and `.` also work as the separator) |
+| `1ubq_A:1-76` | chain A, residues 1–76 |
+| `cath:1cukA01` | CATH domain, already domain-bounded |
+| `af:P0DTC2` | AlphaFold DB model for a UniProt accession |
+| `pdbe:1ubq` | the same entry via PDBe instead of RCSB |
+| `https://…/x.pdb` | any direct URL |
+| `./my/domain.pdb` | a local file — still cleaned and chain-split |
+
+Lists may be comma-, space- or newline-separated, with `#` comments. Unusable
+entries are reported and skipped rather than aborting the batch. Entries too
+large for the PDB format fall back to mmCIF, which is parsed directly. Downloads
+are cached, so re-running costs nothing.
+
+Whatever the source, each input is reduced to **one chain, standard residues,
+primary altloc, and only residues with a complete N–CA–C backbone**. That last
+filter matters: MPNN needs those three atoms and a raw RCSB entry routinely has
+residues that lack them. `--chain` sets the chain for every spec that does not
+name one. The prepared-input table reports dropped residues and chain gaps so
+you can see what the cleaning did.
+
+## Running on Colab
+
+Open `colab/RedAA_Colab.ipynb` (Runtime → Change runtime type → GPU). Seven
+cells: install, GPU check, Drive, inputs, settings, run, results.
+
+What it handles that the batch job does not need to:
+
+- **GPU roulette.** A free session is usually a T4, which is pre-Ampere and has
+  **no bfloat16** — and ESMFold2's ESM-C backbone loads in bf16 by default. The
+  GPU-check cell reports this up front and suggests `FOLD_PRECISION="fp16"`, a
+  smaller ESMFold2 variant, or an L4/A100 runtime, rather than letting you
+  discover it twenty minutes in. It also caps `FOLD_MAX_RESIDUES` from the
+  VRAM it actually finds (320 at T4 scale, 512 at L4, 1024 at A100).
+- **Sessions that end without warning.** The Drive cell points `OUTPUT_ROOT`,
+  `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
+  checkpointed and every fold is cached, so re-running after a disconnect
+  resumes; without Drive it starts over.
+- **Hours, not days.** Defaults drop to 3 replicates and 5 final folds. The
+  gate is unchanged, so the answers mean the same thing — there are just fewer
+  replicates behind them. `TEST_MODE` runs one domain first.
+- **Re-running the run cell is cheap.** The loaded ESMFold2 and LigandMPNN
+  models are handed back into the next run, so changing a threshold does not
+  pay for a model load again. Changing the model id does reload, deliberately.
+
+The notebook is generated from `colab/build_notebook.py` — edit that and
+re-run it rather than hand-editing the JSON.
 
 ## Install
 
@@ -213,26 +288,36 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
+python run_redaa.py --self-test  # all five suites, 81 tests
+
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
+python tests/test_fetch.py       # spec parsing, download ladder, mmCIF, cleaning
+python tests/test_colab.py       # GPU recommendations, input gathering, results
 python tests/test_pipeline.py    # full orchestration against stub engines
 ```
 
-All three run without torch, a GPU or model weights.
+All of them run without torch, a GPU, model weights or network access — HTTP is
+stubbed in the fetch tests.
 
 ## Layout
 
 ```
-run_redaa.py                 entry point
+run_redaa.py                 entry point (--test, --fetch, --self-test)
 redaa/config.py              environment-driven configuration
 redaa/structure.py           PDB parsing, Kabsch, RMSD, TM-score
 redaa/chemistry.py           disulfide and cis-Pro detection
+redaa/fetch.py               RCSB/CATH/AlphaFold fetching, mmCIF, input cleaning
 redaa/folding.py             ESMFold2-Fast engine
 redaa/mpnn.py                in-process LigandMPNN engine
 redaa/foldcache.py           SQLite fold cache
 redaa/search.py              selection, validation, backward pruning
 redaa/pipeline.py            batch and replicate orchestration
+redaa/colab.py               GPU-aware defaults, Drive wiring, input gathering
+colab/RedAA_Colab.ipynb      the notebook
+colab/build_notebook.py      generates the notebook; edit this, not the JSON
 slurm/redaa_array.slurm      MSI array job template
+reference/New_V9_619.py      the original script, for diffing
 ```
 
 ## Notes and caveats
@@ -256,6 +341,13 @@ slurm/redaa_array.slurm      MSI array job template
   true and is the standard assumption, but it is an assumption; set
   `PRUNING_DOWNWARD_CLOSURE=0` if a particular result needs the unconditional
   sweep.
+- **Fetched inputs are not the same as curated inputs.** `--fetch` picks the
+  largest protein chain when you do not name one, and keeps the whole chain
+  unless you give a residue range. A multidomain crystal chain fetched whole
+  will usually fail the native round-trip check and be flagged — which is the
+  system working, but it means a fetched panel needs a look at
+  `FLAGGED_DOMAINS.csv` before you trust it. Domain-bounded sources
+  (`cath:…`) avoid this.
 - **TM-score is still the only gate.** RMSD is computed for every sequence and
   ranks candidates that all clear the gate, but a fixed Ångström cutoff across
   a 50–250 residue panel is biased against the longer domains, so it does not
