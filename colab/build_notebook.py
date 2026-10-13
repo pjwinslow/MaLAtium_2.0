@@ -301,20 +301,29 @@ if result.returncode != 0:
 code_with_bootstrap(
     """
 #@title Step 3 — Mount Google Drive (optional, recommended)
-#@markdown Keeps outputs, the fold cache and model weights across disconnects,
-#@markdown so a reconnected session resumes instead of starting over.
+#@markdown Keeps outputs and the fold cache across disconnects, so a
+#@markdown reconnected session resumes instead of starting over.
+#@markdown
+#@markdown Model weights stay on local disk on purpose: safetensors reads them
+#@markdown by memory-mapping, and Drive's FUSE mount cannot serve that, so a
+#@markdown model cached on Drive fails with "SafetensorError: header too
+#@markdown large". Re-downloading after a restart is the cheaper problem.
 USE_DRIVE = True #@param {type:"boolean"}
 DRIVE_FOLDER = "redaa" #@param {type:"string"}
+WEIGHTS_ON_DRIVE = False #@param {type:"boolean"}
 
 import os
 
 if USE_DRIVE:
     from google.colab import drive
     drive.mount("/content/drive")
-    env = rc.use_drive("/content/drive/MyDrive/" + DRIVE_FOLDER)
+    env = rc.use_drive(
+        "/content/drive/MyDrive/" + DRIVE_FOLDER, hf_cache=WEIGHTS_ON_DRIVE
+    )
     print("\\nUsing Drive for:")
     for key, value in env.items():
         print("  %s=%s" % (key, value))
+    print("\\nModel weight cache: " + rc.hf_cache_dir())
 else:
     os.environ["OUTPUT_ROOT"] = "/content/redaa_outputs"
     print("Drive off — results live in /content and are lost on disconnect.")
@@ -552,10 +561,27 @@ code_with_bootstrap(
 #@markdown load both models -- slow, but it separates "the environment is
 #@markdown wrong" from "this model will not load on this GPU".
 TRY_MODEL_LOAD = False #@param {type:"boolean"}
+REPAIR_HF_CACHE = False #@param {type:"boolean"}
+#@markdown `REPAIR_HF_CACHE` deletes cached model files whose headers do not
+#@markdown parse, so the next load re-downloads them. Use it after a
+#@markdown "SafetensorError: header too large", which means a weight file was
+#@markdown truncated or was cached somewhere that cannot serve it.
 
 import importlib
 
 importlib.reload(rc)
+
+if REPAIR_HF_CACHE:
+    removed = rc.repair_hf_cache()
+    if removed:
+        print("Deleted %d cached entr%s:" % (
+            len(removed), "y" if len(removed) == 1 else "ies"))
+        for path in removed:
+            print("  " + path)
+        print("\\nRe-run Step 6; the weights will be downloaded again.\\n")
+    else:
+        print("Nothing to repair -- no corrupt weight files found.\\n")
+
 report = rc.print_diagnosis(try_model_load=TRY_MODEL_LOAD)
 """
 )
@@ -578,6 +604,12 @@ on something that obviously exists, a segfault) usually means `pip` replaced a
 package this kernel had already imported. Step 1 now detects that and stops
 with `RESTART REQUIRED`; if you see it, do Runtime > Restart session and
 continue from Step 2 — do not re-run the install.
+
+**`SafetensorError: Error while deserializing header: header too large`.** A
+cached weight file is unreadable. Either the download was truncated, or the
+cache was on Google Drive, whose FUSE mount cannot serve the memory-mapped
+reads safetensors uses. Re-run Step 3 (which keeps weights on local disk) and
+then Step 8 with `REPAIR_HF_CACHE` to clear the bad entries.
 
 **bf16 / `esmc_precision` errors on a T4.** The free-tier T4 is pre-Ampere and
 has no bfloat16. Try `FOLD_PRECISION="fp16"` in step 5, or one of the smaller

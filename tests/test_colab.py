@@ -86,9 +86,13 @@ def test_use_drive_points_everything_at_the_given_base():
         env = C.use_drive(base)
         assert env["OUTPUT_ROOT"] == os.path.join(base, "outputs")
         assert env["FOLD_CACHE_PATH"] == os.path.join(base, "fold_cache.sqlite")
-        assert env["HF_HOME"] == os.path.join(base, "hf")
         assert os.path.isdir(env["OUTPUT_ROOT"])
-        assert os.path.isdir(env["HF_HOME"])
+        # Model weights are deliberately NOT sent to Drive; see
+        # test_use_drive_keeps_model_weights_off_drive_by_default.
+        assert "HF_HOME" not in env
+
+        opted_in = C.use_drive(base, hf_cache=True)
+        assert opted_in["HF_HOME"] == os.path.join(base, "hf")
     finally:
         for k, v in saved.items():
             if v is None:
@@ -392,6 +396,170 @@ def test_print_diagnosis_emits_every_section():
                     "checks passed", "PROBLEMS"):
         assert section in out, section
     assert "python" in out
+
+
+# ---------------------------------------------------------------------------
+# Model cache integrity
+# ---------------------------------------------------------------------------
+
+
+def _safetensors(path, header_len=None, header=None, data=b"\x00" * 4):
+    import json, struct
+
+    header = header if header is not None else json.dumps(
+        {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    ).encode()
+    n = len(header) if header_len is None else header_len
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", n) + header + data)
+    return path
+
+
+def test_check_safetensors_accepts_a_well_formed_file():
+    tmp = tempfile.mkdtemp()
+    try:
+        assert C.check_safetensors(_safetensors(os.path.join(tmp, "m.safetensors"))) == (
+            True, "ok",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_check_safetensors_reproduces_the_header_too_large_failure():
+    """The exact failure seen on Colab, with a message that says why."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _safetensors(
+            os.path.join(tmp, "m.safetensors"), header_len=10**12, header=b"junk"
+        )
+        ok, reason = C.check_safetensors(path)
+        assert not ok
+        assert "header claims" in reason and "truncated" in reason
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_check_safetensors_catches_truncation_and_bad_json():
+    tmp = tempfile.mkdtemp()
+    try:
+        empty = os.path.join(tmp, "a.safetensors")
+        open(empty, "wb").write(b"abc")
+        ok, reason = C.check_safetensors(empty)
+        assert not ok and "never started" in reason
+
+        zero = _safetensors(os.path.join(tmp, "b.safetensors"), header_len=0, header=b"")
+        ok, reason = C.check_safetensors(zero)
+        assert not ok and "zero" in reason
+
+        junk = _safetensors(
+            os.path.join(tmp, "c.safetensors"), header=b"not json at all"
+        )
+        ok, reason = C.check_safetensors(junk)
+        assert not ok and "does not parse" in reason
+
+        missing = os.path.join(tmp, "nope.safetensors")
+        assert C.check_safetensors(missing)[0] is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scan_and_repair_remove_the_whole_broken_model_directory():
+    tmp = tempfile.mkdtemp()
+    try:
+        hub = os.path.join(tmp, "hub")
+        good_dir = os.path.join(hub, "models--ok--model", "snapshots", "r1")
+        bad_dir = os.path.join(hub, "models--broken--model", "snapshots", "r1")
+        _safetensors(os.path.join(good_dir, "model.safetensors"))
+        _safetensors(
+            os.path.join(bad_dir, "model.safetensors"), header_len=10**12, header=b"x"
+        )
+
+        broken = C.scan_hf_cache(hub)
+        assert len(broken) == 1 and "broken--model" in broken[0][0]
+
+        removed = C.repair_hf_cache(cache_dir=hub)
+        assert removed == [os.path.join(hub, "models--broken--model")], removed
+        # A partially repaired snapshot is worse than none, so the whole
+        # model directory goes -- and the healthy model is untouched.
+        assert not os.path.exists(os.path.join(hub, "models--broken--model"))
+        assert os.path.exists(os.path.join(good_dir, "model.safetensors"))
+        assert C.scan_hf_cache(hub) == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_repair_can_target_one_model_by_id():
+    tmp = tempfile.mkdtemp()
+    try:
+        hub = os.path.join(tmp, "hub")
+        target = os.path.join(hub, "models--Synthyra--ESMFold2-Fast")
+        _safetensors(os.path.join(target, "snapshots", "r1", "model.safetensors"))
+        other = os.path.join(hub, "models--other--model")
+        _safetensors(os.path.join(other, "snapshots", "r1", "model.safetensors"))
+
+        removed = C.repair_hf_cache("Synthyra/ESMFold2-Fast", cache_dir=hub)
+        assert removed == [target]
+        assert os.path.exists(other)
+        assert C.repair_hf_cache("Synthyra/ESMFold2-Fast", cache_dir=hub) == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_use_drive_keeps_model_weights_off_drive_by_default():
+    """Weights on Drive are unreadable, so the default must not put them there."""
+    tmp = tempfile.mkdtemp()
+    saved = {k: os.environ.get(k) for k in
+             ("OUTPUT_ROOT", "FOLD_CACHE_PATH", "HF_HOME")}
+    try:
+        base = os.path.join(tmp, "redaa")
+        env = C.use_drive(base)
+        assert "OUTPUT_ROOT" in env and "FOLD_CACHE_PATH" in env
+        assert env.get("HF_HOME") != os.path.join(base, "hf")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_hf_cache_dir_honours_the_env_and_detects_drive():
+    saved = {k: os.environ.get(k) for k in
+             ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        os.environ["HF_HOME"] = "/content/drive/MyDrive/redaa/hf"
+        assert C.hf_cache_dir() == "/content/drive/MyDrive/redaa/hf/hub"
+        assert C.on_drive(C.hf_cache_dir())
+
+        os.environ["HF_HUB_CACHE"] = "/content/hf/hub"
+        assert C.hf_cache_dir() == "/content/hf/hub"
+        assert not C.on_drive(C.hf_cache_dir())
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_diagnose_flags_a_cache_sitting_on_drive():
+    saved = os.environ.get("HF_HOME")
+    try:
+        os.environ["HF_HOME"] = "/content/drive/MyDrive/redaa/hf"
+        report = C.diagnose()
+        hit = [p for p in report["problems"] if "Google Drive" in p]
+        assert hit, report["problems"]
+        assert "header too large" in hit[0]
+        assert "REPAIR_HF_CACHE" in hit[0]
+    finally:
+        if saved is None:
+            os.environ.pop("HF_HOME", None)
+        else:
+            os.environ["HF_HOME"] = saved
 
 
 def main():

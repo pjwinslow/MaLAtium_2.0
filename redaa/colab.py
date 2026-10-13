@@ -160,15 +160,38 @@ def apply_env(env: dict[str, str], override: bool = False) -> dict[str, str]:
     return applied
 
 
+def hf_cache_dir() -> str:
+    """Where huggingface_hub will actually put model weights."""
+    for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(key):
+            return os.environ[key]
+    if os.environ.get("HF_HOME"):
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    return os.path.expanduser("~/.cache/huggingface/hub")
+
+
+def on_drive(path: str) -> bool:
+    """Whether *path* lives on a mounted Google Drive."""
+    return os.path.abspath(path).startswith("/content/drive")
+
+
 def use_drive(
     base: str = "/content/drive/MyDrive/redaa",
-    hf_cache: bool = True,
+    hf_cache: bool = False,
 ) -> dict[str, str]:
-    """Point outputs, the fold cache and model downloads at Google Drive.
+    """Point outputs and the fold cache at Google Drive.
 
-    Call this *after* mounting Drive.  Surviving a disconnect is the whole
-    point: completed replicates are checkpointed and every fold is cached, so
-    a reconnected session resumes instead of starting over.
+    Call this *after* mounting Drive.  Surviving a disconnect is the point:
+    completed replicates are checkpointed and every fold is cached, so a
+    reconnected session resumes instead of starting over.
+
+    Model weights deliberately do **not** go to Drive.  safetensors reads
+    weights by memory-mapping them, and Drive's FUSE mount supports neither
+    mmap nor reliable multi-gigabyte writes, so a model cached there fails to
+    load with ``SafetensorError: Error while deserializing header: header too
+    large`` -- the first eight bytes come back as garbage.  Re-downloading a
+    few gigabytes after a restart is the cheaper problem, so ``hf_cache``
+    defaults to False and should stay there.
     """
     if not os.path.isdir(os.path.dirname(base.rstrip("/"))):
         raise RuntimeError(
@@ -182,10 +205,134 @@ def use_drive(
     }
     if hf_cache:
         env["HF_HOME"] = os.path.join(base, "hf")
+        print(
+            "WARNING: hf_cache=True puts model weights on Drive, where "
+            "safetensors cannot mmap them. Expect "
+            "'SafetensorError: header too large' at load time."
+        )
+    elif on_drive(hf_cache_dir()):
+        # A previous session may have pointed it at Drive; undo that, because
+        # anything already cached there is unreadable.
+        env["HF_HOME"] = "/content/hf"
+        print(
+            "Model cache was pointing at Drive, which cannot serve "
+            "memory-mapped weights -- moved it to /content/hf.\n"
+            "Run Step 8 with REPAIR_HF_CACHE if a model fails to load."
+        )
     for path in (env["OUTPUT_ROOT"], env.get("HF_HOME", "")):
         if path:
             os.makedirs(path, exist_ok=True)
     return apply_env(env, override=True)
+
+
+# ---------------------------------------------------------------------------
+# Model cache integrity
+# ---------------------------------------------------------------------------
+
+_SAFETENSORS_HEADER_MAX = 512 * 1024 * 1024   # no real header is this big
+
+
+def check_safetensors(path: str) -> tuple[bool, str]:
+    """Validate a ``.safetensors`` file's header without loading it.
+
+    The format is an 8-byte little-endian header length, then that many bytes
+    of JSON, then the tensor data.  A truncated or FUSE-mangled file shows up
+    immediately as a header length that cannot fit in the file -- which is
+    exactly the "header too large" that safetensors reports, except here we
+    can say which file and why.
+    """
+    import json
+    import struct
+
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return False, f"unreadable: {exc}"
+    if size < 9:
+        return False, f"only {size} bytes -- download never started"
+
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8)
+            if len(raw) < 8:
+                return False, "could not read the 8-byte header length"
+            (header_len,) = struct.unpack("<Q", raw)
+            if header_len == 0:
+                return False, "header length is zero"
+            if header_len > _SAFETENSORS_HEADER_MAX or header_len + 8 > size:
+                return False, (
+                    f"header claims {header_len} bytes but the file is {size} "
+                    "-- truncated, or read through a mount that cannot serve it"
+                )
+            header = fh.read(header_len)
+            if len(header) < header_len:
+                return False, "header is shorter than it claims"
+            json.loads(header.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return False, f"header does not parse: {exc}"
+    return True, "ok"
+
+
+def scan_hf_cache(cache_dir: str | None = None) -> list[tuple[str, str]]:
+    """Return ``(path, reason)`` for every broken weight file in the cache."""
+    cache_dir = cache_dir or hf_cache_dir()
+    broken: list[tuple[str, str]] = []
+    if not os.path.isdir(cache_dir):
+        return broken
+    for root, _dirs, names in os.walk(cache_dir):
+        for name in names:
+            if not name.endswith(".safetensors"):
+                continue
+            path = os.path.join(root, name)
+            if os.path.islink(path) and not os.path.exists(path):
+                broken.append((path, "dangling symlink"))
+                continue
+            ok, reason = check_safetensors(path)
+            if not ok:
+                broken.append((path, reason))
+    return broken
+
+
+def repair_hf_cache(
+    model_id: str | None = None, cache_dir: str | None = None
+) -> list[str]:
+    """Delete cached entries so the next load re-downloads them.
+
+    With *model_id*, removes just that model's directory; otherwise removes
+    every model directory containing a broken weight file.  Returns what was
+    removed.
+    """
+    cache_dir = cache_dir or hf_cache_dir()
+    if not os.path.isdir(cache_dir):
+        return []
+
+    removed: list[str] = []
+    if model_id:
+        slug = "models--" + model_id.replace("/", "--")
+        target = os.path.join(cache_dir, slug)
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(target)
+        return removed
+
+    for path, _reason in scan_hf_cache(cache_dir):
+        # Walk up to the models--owner--name directory and drop the lot; a
+        # partially repaired snapshot is worse than no snapshot.
+        current = path
+        while current.startswith(cache_dir) and not os.path.basename(
+            current
+        ).startswith("models--"):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        target = current if os.path.basename(current).startswith("models--") else path
+        if target not in removed and os.path.exists(target):
+            shutil.rmtree(target, ignore_errors=True) if os.path.isdir(
+                target
+            ) else os.remove(target)
+            removed.append(target)
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +674,29 @@ def diagnose(try_model_load: bool = False) -> dict:
         )
     else:
         ok("MPNN checkpoint %.0f MB" % (os.path.getsize(ckpt) / 1e6))
+
+    # -- model weight cache ------------------------------------------------
+    cache = hf_cache_dir()
+    info("hf_cache", cache)
+    if on_drive(cache):
+        problem(
+            "The model cache is on Google Drive (%s). safetensors reads "
+            "weights by memory-mapping them and Drive's FUSE mount cannot "
+            "serve that, which fails as 'SafetensorError: header too large'. "
+            "Re-run Step 3 to move it to /content/hf, then Step 8 with "
+            "REPAIR_HF_CACHE to clear what was cached there." % cache
+        )
+    broken = scan_hf_cache(cache)
+    info("hf_cache_broken", [b[0] for b in broken])
+    if broken:
+        for path, reason in broken[:5]:
+            problem("corrupt weight file %s -- %s" % (path, reason))
+        problem(
+            "Run Step 8 with REPAIR_HF_CACHE to delete the broken entries so "
+            "the next load re-downloads them."
+        )
+    elif os.path.isdir(cache):
+        ok("model cache at %s has no corrupt weight files" % cache)
 
     # -- run configuration -------------------------------------------------
     from .config import ENV_VARS

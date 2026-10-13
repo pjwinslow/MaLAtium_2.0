@@ -105,6 +105,13 @@ What it handles that the batch job does not need to:
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
   checkpointed and every fold is cached, so re-running after a disconnect
   resumes; without Drive it starts over.
+- **Model weights are kept off Drive on purpose.** safetensors reads weights
+  by memory-mapping them, and Drive's FUSE mount serves neither mmap nor
+  reliable multi-gigabyte writes, so a model cached there fails to load with
+  `SafetensorError: Error while deserializing header: header too large`.
+  Only outputs and the fold cache go to Drive; re-downloading weights after a
+  restart is the cheaper problem. Step 8's `REPAIR_HF_CACHE` validates every
+  cached weight file's header and deletes the broken ones.
 - **Changing the GPU type restarts the runtime**, so switching T4 → A100 wipes
   `/content` like any other restart and Step 1 has to run again. Step 8 of the
   notebook (`rc.print_diagnosis()`) reports the environment, every package
@@ -301,7 +308,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all six suites, 98 tests
+python run_redaa.py --self-test  # all six suites, 107 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

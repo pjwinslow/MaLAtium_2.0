@@ -61,10 +61,12 @@ def _write_reference(path, seq=NATIVE):
 class StubMPNN:
     """Deterministic sequence sampler over the allowed alphabet."""
 
-    def __init__(self, length=len(NATIVE), cfg=None):
+    def __init__(self, length=len(NATIVE), cfg=None, loaded=True):
         self.length = length
         self.calls = 0
         self.cfg = cfg
+        # Stands in for a loaded checkpoint; None means load() never ran.
+        self.model = object() if loaded else None
 
     def load(self):
         pass
@@ -92,12 +94,14 @@ class StubMPNN:
 class StubFolder:
     """Folds to the reference when the alphabet is sufficient, else garbage."""
 
-    def __init__(self, ref_xyz, cfg=None):
+    def __init__(self, ref_xyz, cfg=None, loaded=True):
         self.ref = ref_xyz
         self.calls = 0
         self.seen: list[str] = []
         self.cfg = cfg
         self.cache = None
+        # Stands in for a loaded model; None means load() never ran.
+        self.model = object() if loaded else None
 
     def load(self):
         pass
@@ -406,6 +410,50 @@ def test_setup_reuses_injected_engines_when_the_models_match():
         # stale one from the previous run.
         assert pipe.folder.cache is pipe.cache
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_setup_does_not_reuse_an_engine_whose_load_failed():
+    """A failed run leaves its engine behind; it must not be treated as loaded.
+
+    Observed on Colab: a run died inside the ESMFold2 load, the half-built
+    engine was cached for the next run, and setup announced "reusing the model
+    already in memory" and skipped load() -- so the real error resurfaced much
+    later, from inside the first fold, instead of at setup.
+    """
+    import redaa.pipeline as P
+
+    tmp = tempfile.mkdtemp(prefix="redaa_deadengine_")
+    built = []
+
+    class _Sentinel:
+        def __init__(self, cfg, cache=None):
+            built.append(type(self).__name__)
+            self.cfg = cfg
+            self.cache = cache
+            self.model = object()
+
+        def load(self):
+            pass
+
+    real_fold, real_mpnn = P.FoldEngine, P.MPNNEngine
+    try:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        _write_reference(os.path.join(tmp, "inputs", "testdomA00.pdb"))
+        cfg = _make_config(tmp)
+
+        P.FoldEngine = _Sentinel
+        P.MPNNEngine = _Sentinel
+        dead_folder = StubFolder(_helix(len(NATIVE)), cfg=cfg, loaded=False)
+        dead_mpnn = StubMPNN(cfg=cfg, loaded=False)
+        pipe = Pipeline(cfg, folder=dead_folder, mpnn=dead_mpnn)
+        pipe.setup()
+
+        assert pipe.folder is not dead_folder
+        assert pipe.mpnn is not dead_mpnn
+        assert len(built) == 2, built
+    finally:
+        P.FoldEngine, P.MPNNEngine = real_fold, real_mpnn
         shutil.rmtree(tmp, ignore_errors=True)
 
 

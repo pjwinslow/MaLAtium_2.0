@@ -152,8 +152,17 @@ class Pipeline:
         if self.cache.enabled:
             print(f"Fold cache: {cache_path}")
 
+        # An injected engine is only reusable if it actually holds a loaded
+        # model.  A run whose model load failed still leaves its engine behind
+        # for the next run to pick up; without the `model is not None` check,
+        # setup would announce a reuse that had not happened, skip load(), and
+        # let the real failure surface later from inside the first fold.
         reuse = self._injected_folder
-        if reuse is not None and reuse.cfg.fold_model_id == cfg.fold_model_id:
+        if (
+            reuse is not None
+            and getattr(reuse, "model", None) is not None
+            and reuse.cfg.fold_model_id == cfg.fold_model_id
+        ):
             reuse.cfg = cfg            # pick up this run's step counts etc.
             reuse.cache = self.cache   # but point at this run's cache
             self.folder = reuse
@@ -165,6 +174,7 @@ class Pipeline:
         reuse_mpnn = self._injected_mpnn
         if (
             reuse_mpnn is not None
+            and getattr(reuse_mpnn, "model", None) is not None
             and reuse_mpnn.cfg.mpnn_checkpoint == cfg.mpnn_checkpoint
             and reuse_mpnn.cfg.mpnn_model_type == cfg.mpnn_model_type
         ):
