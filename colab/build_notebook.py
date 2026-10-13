@@ -28,6 +28,67 @@ def code(text: str) -> None:
     CELLS.append(("code", text.strip("\n")))
 
 
+# A Colab runtime restart wipes /content, which leaves every later cell
+# importing a package that is no longer on disk -- the symptom is a bare
+# "No module named 'redaa'" from a cell that worked ten minutes earlier.
+# Each cell below therefore re-establishes its own footing before doing
+# anything, so cells are runnable in any order and after any restart.
+BOOTSTRAP = """
+# --- bootstrap: re-establish the repo, sys.path and env (safe to re-run) ---
+import os, subprocess, sys
+
+_REPO = "/content/MaLAtium_2.0"
+_MPNN = "/content/LigandMPNN"
+_CKPT = os.path.join(_MPNN, "model_params", "proteinmpnn_v_48_020.pt")
+
+if not os.path.exists(os.path.join(_REPO, "redaa", "__init__.py")):
+    print("Repository is not on disk -- the Colab runtime was restarted,")
+    print("which wipes /content. Re-cloning it now.")
+    subprocess.run(["rm", "-rf", _REPO], check=False)
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", "--branch",
+         globals().get("BRANCH", "__BRANCH__"),
+         globals().get("REPO_URL", "__REPO_URL__"), _REPO],
+        check=True,
+    )
+    print("Re-cloned. If a later cell fails on a missing package or model,")
+    print("re-run Step 1 -- pip installs and the checkpoint were wiped too.")
+
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+os.chdir(_REPO)
+os.environ.setdefault("MPNN_REPO", _MPNN)
+os.environ.setdefault("MPNN_CHECKPOINT", _CKPT)
+
+import redaa.colab as rc
+# -------------------------------------------------------------------------
+"""
+
+
+def code_with_bootstrap(text: str) -> None:
+    """Emit a code cell whose #@title and #@param block stays on top.
+
+    Colab only renders form widgets for #@param lines that precede other
+    statements, so the bootstrap is spliced in after the parameter block
+    rather than at the very top of the cell.
+    """
+    text = text.strip("\n")
+    lines = text.splitlines()
+    cut = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if (
+            stripped.startswith(("#@", "#"))
+            or "#@param" in line
+            or not stripped
+        ):
+            cut = i + 1
+        else:
+            break
+    head, tail = lines[:cut], lines[cut:]
+    code("\n".join(head + BOOTSTRAP.strip("\n").splitlines() + [""] + tail))
+
+
 # ---------------------------------------------------------------------------
 
 md(
@@ -71,11 +132,22 @@ def sh(cmd):
     subprocess.run(cmd, shell=True, check=True)
 
 # --- this repository -------------------------------------------------------
-if os.path.isdir(os.path.join(REPO_DIR, ".git")):
-    sh("git -C " + REPO_DIR + " fetch -q --depth 1 origin " + BRANCH)
-    sh("git -C " + REPO_DIR + " checkout -q FETCH_HEAD")
-else:
+def clone_fresh():
+    sh("rm -rf " + REPO_DIR)
     sh("git clone -q --depth 1 --branch " + BRANCH + " " + REPO_URL + " " + REPO_DIR)
+
+if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    # Updating a shallow clone can fail in several uninteresting ways; a
+    # re-clone is seconds, so do not make the user debug it.
+    try:
+        sh("git -C " + REPO_DIR + " fetch -q --depth 1 origin " + BRANCH)
+        sh("git -C " + REPO_DIR + " reset -q --hard FETCH_HEAD")
+        sh("git -C " + REPO_DIR + " clean -qfd")
+    except subprocess.CalledProcessError:
+        print("In-place update failed -- re-cloning instead.")
+        clone_fresh()
+else:
+    clone_fresh()
 
 # --- python dependencies ---------------------------------------------------
 # Colab already ships torch and numpy. ESMFold2-Fast loads through
@@ -100,21 +172,46 @@ if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 os.chdir(REPO_DIR)
 
-print("\\nInstall complete.")
+# --- verify, so a partial install cannot look like a successful one -------
+import importlib
+
+problems = []
+for module in ("redaa.config", "redaa.colab", "redaa.fetch", "redaa.structure"):
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        problems.append("cannot import %s: %s" % (module, exc))
+if not os.path.exists(os.path.join(MPNN_DIR, "data_utils.py")):
+    problems.append("LigandMPNN data_utils.py missing from " + MPNN_DIR)
+if not os.path.exists(CKPT) or os.path.getsize(CKPT) < 1_000_000:
+    problems.append("MPNN checkpoint missing or truncated: " + CKPT)
+try:
+    import transformers
+except Exception as exc:
+    problems.append("transformers not importable: %s" % exc)
+
+if problems:
+    print("\\nINSTALL INCOMPLETE:")
+    for line in problems:
+        print("  - " + line)
+    raise SystemExit("Fix the above and re-run Step 1.")
+
+print("\\nInstall complete and verified.")
 print("  repo        " + REPO_DIR)
 print("  LigandMPNN  " + MPNN_DIR)
 print("  checkpoint  %s (%.0f MB)" % (CKPT, os.path.getsize(CKPT) / 1e6))
+print("  transformers %s" % transformers.__version__)
+print("\\nNote: a Colab runtime restart wipes /content. Later cells re-clone the")
+print("repo automatically, but pip packages and the checkpoint need this cell again.")
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 2 — Check the GPU, apply matching defaults, self-test
 import importlib, subprocess, sys
-sys.path.insert(0, "/content/MaLAtium_2.0")
 
-import redaa.colab as rc
-importlib.reload(rc)
+importlib.reload(rc)   # pick up any change the bootstrap just pulled down
 
 gpu = rc.detect_gpu()
 rec = rc.recommend(gpu)
@@ -149,7 +246,7 @@ if result.returncode != 0:
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 3 — Mount Google Drive (optional, recommended)
 #@markdown Keeps outputs, the fold cache and model weights across disconnects,
@@ -206,7 +303,7 @@ residues that lack them.
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 4 — Fetch and/or upload inputs
 INPUT_MODE = "fetch" #@param ["fetch", "upload", "drive_folder", "both"]
@@ -251,7 +348,7 @@ os.environ["INPUT_PDB_DIR"] = INPUT_DIR
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 5 — Search settings
 #@markdown Defaults are tuned for a Colab session (hours, not days). Raise
@@ -299,19 +396,25 @@ for key in ENV_VARS:
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 6 — Run the search
 #@markdown Safe to re-run: finished replicates are skipped, cached folds are
 #@markdown free, and the loaded models stay in memory between runs.
-import importlib, sys, time
+import importlib, os, sys, time
 
 import redaa.config, redaa.pipeline
 importlib.reload(redaa.config)
 importlib.reload(redaa.pipeline)
 
+if "INPUT_PDB_DIR" not in os.environ:
+    raise SystemExit(
+        "INPUT_PDB_DIR is not set -- run Step 4 (inputs) and Step 5 (settings) "
+        "first. A runtime restart clears them."
+    )
+
 cfg = redaa.config.RedAAConfig()
-if TEST_MODE:
+if bool(globals().get("TEST_MODE", False)):
     cfg.apply_test_mode()
     print("*** TEST MODE: one domain, one replicate, reduced budgets ***\\n")
 
@@ -339,7 +442,7 @@ print("Run directory: " + str(RUN_DIR))
 """
 )
 
-code(
+code_with_bootstrap(
     """
 #@title Step 7 — Results
 DOWNLOAD_ZIP = True #@param {type:"boolean"}

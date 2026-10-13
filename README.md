@@ -105,6 +105,14 @@ What it handles that the batch job does not need to:
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
   checkpointed and every fold is cached, so re-running after a disconnect
   resumes; without Drive it starts over.
+- **Runtime restarts, which wipe `/content`.** Every cell after the installer
+  starts by re-establishing the checkout, `sys.path` and the environment, and
+  re-clones the repo if it has vanished — so a restart produces a cell that
+  says what happened and keeps going, not a bare
+  `ModuleNotFoundError: No module named 'redaa'`. pip packages and the MPNN
+  checkpoint go with `/content` too, so the message points back at Step 1;
+  Step 1 itself verifies imports, the checkpoint size and `transformers`
+  before reporting success, so a partial install cannot look like a good one.
 - **Hours, not days.** Defaults drop to 3 replicates and 5 final folds. The
   gate is unchanged, so the answers mean the same thing — there are just fewer
   replicates behind them. `TEST_MODE` runs one domain first.
@@ -288,12 +296,13 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all five suites, 81 tests
+python run_redaa.py --self-test  # all six suites, 92 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
 python tests/test_fetch.py       # spec parsing, download ladder, mmCIF, cleaning
 python tests/test_colab.py       # GPU recommendations, input gathering, results
+python tests/test_notebook.py    # notebook structure, forms, restart bootstrap
 python tests/test_pipeline.py    # full orchestration against stub engines
 ```
 

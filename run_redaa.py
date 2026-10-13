@@ -97,6 +97,7 @@ def main(argv=None) -> int:
         from tests import (
             test_colab,
             test_fetch,
+            test_notebook,
             test_pipeline,
             test_search,
             test_structure,
@@ -108,6 +109,7 @@ def main(argv=None) -> int:
             ("search and chemistry", test_search),
             ("fetching and input prep", test_fetch),
             ("colab helpers", test_colab),
+            ("colab notebook", test_notebook),
             ("pipeline orchestration", test_pipeline),
         ):
             print(f"\n=== {label} ===")
