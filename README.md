@@ -105,6 +105,13 @@ What it handles that the batch job does not need to:
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
   checkpointed and every fold is cached, so re-running after a disconnect
   resumes; without Drive it starts over.
+- **Every run leaves one attachable report.** Step 6 tees its output to
+  `<outputs>/../logs/run_*.log` and writes `report_*.txt` beside it — whether
+  the run finishes or crashes, with the traceback included. That file carries
+  the environment, the resolved settings, the results so far and the console
+  log, so it is the one thing worth attaching when asking about a failure.
+  Colab truncates long cell output and loses it on a disconnect; the file does
+  not. `rc.capture_run_log()` and `rc.write_report()` are the API.
 - **Model weights are kept off Drive on purpose.** safetensors reads weights
   by memory-mapping them, and Drive's FUSE mount serves neither mmap nor
   reliable multi-gigabyte writes, so a model cached there fails to load with
@@ -308,7 +315,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all six suites, 107 tests
+python run_redaa.py --self-test  # all six suites, 114 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

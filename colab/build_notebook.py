@@ -486,13 +486,20 @@ pipe = redaa.pipeline.Pipeline(
     cfg, folder=_cached.get("folder"), mpnn=_cached.get("mpnn")
 )
 
+# Everything the run prints is teed to a file as well as to this cell, and a
+# single attachable report is written whether the run finishes or crashes.
+# Colab truncates long output and loses it entirely on a disconnect, and the
+# output you most need is from a run that died.
 _started = time.time()
 exit_code = 1
-try:
-    exit_code = pipe.run()
-finally:
-    _REDAA_ENGINES = {"folder": pipe.folder, "mpnn": pipe.mpnn}
-    RUN_DIR = pipe.run_dir
+with rc.capture_run_log() as runlog:
+    try:
+        exit_code = pipe.run()
+    finally:
+        _REDAA_ENGINES = {"folder": pipe.folder, "mpnn": pipe.mpnn}
+        RUN_DIR = pipe.run_dir
+
+REPORT_PATH = runlog.report_path
 
 print("\\nExit code %d (%s)" % (
     exit_code,
@@ -507,6 +514,10 @@ code_with_bootstrap(
     """
 #@title Step 7 — Results
 DOWNLOAD_ZIP = True #@param {type:"boolean"}
+DOWNLOAD_REPORT = True #@param {type:"boolean"}
+#@markdown `DOWNLOAD_REPORT` grabs the single text file carrying the
+#@markdown environment, the settings, the results and the console log -- the
+#@markdown file to attach when asking about a failure.
 
 import os
 
@@ -541,14 +552,26 @@ if os.path.exists(flagged):
     print("Treat these domains' pass/fail calls with caution.")
     print(open(flagged).read())
 
-if DOWNLOAD_ZIP:
-    path = rc.zip_results(run_dir)
-    print("\\nZipped to %s (%.1f MB)" % (path, os.path.getsize(path) / 1e6))
+def _download(path):
     try:
         from google.colab import files as colab_files
         colab_files.download(path)
     except ImportError:
-        print("(not in Colab — the zip is on disk at the path above)")
+        print("  (not in Colab — the file is on disk at the path above)")
+
+if DOWNLOAD_ZIP:
+    path = rc.zip_results(run_dir)
+    print("\\nZipped to %s (%.1f MB)" % (path, os.path.getsize(path) / 1e6))
+    _download(path)
+
+if DOWNLOAD_REPORT:
+    report = globals().get("REPORT_PATH") or rc.latest_report()
+    if not (report and os.path.exists(report)):
+        report = rc.write_report(run_dir=run_dir)
+        print("\\nNo run report in this session; wrote one from current state.")
+    print("\\nRun report: %s (%.0f KB)"
+          % (report, os.path.getsize(report) / 1024))
+    _download(report)
 """
 )
 
@@ -583,6 +606,11 @@ if REPAIR_HF_CACHE:
         print("Nothing to repair -- no corrupt weight files found.\\n")
 
 report = rc.print_diagnosis(try_model_load=TRY_MODEL_LOAD)
+
+# Leave an attachable copy behind, including the newest run's results.
+_path = rc.write_report(run_dir=rc.latest_run_dir())
+print("\\nWritten to %s -- attach this file when asking about a failure."
+      % _path)
 """
 )
 
@@ -593,6 +621,14 @@ md(
 **Start with Step 8.** It prints the environment, every package version, the
 resolved settings and a pass/fail list, and names the fix for each problem it
 finds. Almost everything below is something Step 8 will tell you directly.
+
+**Every run leaves a report behind.** Step 6 tees its output to
+`<outputs>/../logs/run_*.log` and writes `report_*.txt` beside it — whether the
+run finishes or crashes, with the traceback included. That one text file
+carries the environment, the resolved settings, the results so far and the
+console log, so it is the thing worth attaching when asking about a failure.
+Step 7 downloads it and Step 8 writes a fresh one. Colab truncates long cell
+output and loses it on a disconnect; the file does not.
 
 **Changing the GPU type restarts the runtime**, which wipes `/content` exactly
 like any other restart — so switching from T4 to A100 means Step 1 has to run

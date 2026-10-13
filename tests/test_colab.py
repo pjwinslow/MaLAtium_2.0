@@ -562,6 +562,179 @@ def test_diagnose_flags_a_cache_sitting_on_drive():
             os.environ["HF_HOME"] = saved
 
 
+# ---------------------------------------------------------------------------
+# Run logging
+# ---------------------------------------------------------------------------
+
+
+def _with_output_root(tmp, fn):
+    saved = os.environ.get("OUTPUT_ROOT")
+    os.environ["OUTPUT_ROOT"] = os.path.join(tmp, "outputs")
+    try:
+        return fn()
+    finally:
+        if saved is None:
+            os.environ.pop("OUTPUT_ROOT", None)
+        else:
+            os.environ["OUTPUT_ROOT"] = saved
+
+
+def test_log_dir_sits_beside_the_outputs_so_drive_keeps_it():
+    tmp = tempfile.mkdtemp()
+    try:
+        folder = _with_output_root(tmp, C.log_dir)
+        assert folder == os.path.join(tmp, "logs"), folder
+        assert os.path.isdir(folder)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_capture_tees_output_to_the_cell_and_to_a_file():
+    import contextlib, io
+
+    tmp = tempfile.mkdtemp()
+    try:
+        cell = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(cell):
+                with C.capture_run_log() as log:
+                    print("a line from the run")
+            return log
+
+        log = _with_output_root(tmp, run)
+        # The cell still saw it...
+        assert "a line from the run" in cell.getvalue()
+        # ...and so did the file.
+        assert "a line from the run" in open(log.path).read()
+        assert "=== console ===" in open(log.path).read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_capture_records_a_crash_and_still_re_raises():
+    """The run that dies is the one whose output you most need."""
+    import contextlib, io
+
+    tmp = tempfile.mkdtemp()
+    try:
+        holder = {}
+
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    with C.capture_run_log() as log:
+                        holder["log"] = log
+                        print("got as far as here")
+                        raise RuntimeError("header too large")
+                except RuntimeError as exc:
+                    holder["raised"] = exc
+
+        _with_output_root(tmp, run)
+
+        assert isinstance(holder.get("raised"), RuntimeError), holder
+        body = open(holder["log"].path).read()
+        assert "got as far as here" in body
+        assert "=== traceback ===" in body
+        assert "header too large" in body
+
+        report = open(holder["log"].report_path).read()
+        assert "header too large" in report
+        assert "=== environment ===" in report
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_capture_restores_the_streams_even_on_a_crash():
+    import contextlib, io
+
+    tmp = tempfile.mkdtemp()
+    before = (sys.stdout, sys.stderr)
+    try:
+        def run():
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    with C.capture_run_log():
+                        raise ValueError("boom")
+                except ValueError:
+                    pass
+
+        _with_output_root(tmp, run)
+        assert (sys.stdout, sys.stderr) == before
+    finally:
+        sys.stdout, sys.stderr = before
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_report_includes_the_environment_settings_and_results():
+    tmp = tempfile.mkdtemp()
+    try:
+        run_dir = os.path.join(tmp, "outputs", "batch_chunk0_x")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "BATCH_SUMMARY.csv"), "w") as fh:
+            fh.write("pdb,replicate,pruned_alphabet,best_seq_tm\n"
+                     "6WVS_A,1,GLV,0.72\n")
+        with open(os.path.join(run_dir, "FLAGGED_DOMAINS.csv"), "w") as fh:
+            fh.write("pdb,native_tm,reason\n6WVS_A,0.41,TM=0.410 < 0.5\n")
+
+        log = os.path.join(tmp, "run.log")
+        with open(log, "w") as fh:
+            fh.write("line one\nline two\n")
+
+        path = _with_output_root(
+            tmp, lambda: C.write_report(log_path=log, run_dir=run_dir)
+        )
+        body = open(path).read()
+        assert "=== environment ===" in body
+        assert "=== run configuration" in body
+        assert "BATCH_SUMMARY.csv (1 row(s))" in body
+        assert "pruned_alphabet=GLV" in body
+        assert "FLAGGED_DOMAINS.csv" in body and "TM=0.410" in body
+        assert "line one" in body and "line two" in body
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_report_elides_the_middle_of_a_huge_log_not_the_ends():
+    """A failed run's useful parts are the setup and the traceback."""
+    tmp = tempfile.mkdtemp()
+    try:
+        log = os.path.join(tmp, "run.log")
+        with open(log, "w") as fh:
+            fh.write("FIRST\n")
+            fh.write("".join("filler %d\n" % i for i in range(5000)))
+            fh.write("LAST\n")
+
+        path = _with_output_root(
+            tmp, lambda: C.write_report(log_path=log, max_log_lines=100)
+        )
+        body = open(path).read()
+        assert "FIRST" in body
+        assert "LAST" in body
+        assert "lines elided" in body
+        assert log in body            # points at the complete log
+        assert "filler 2500" not in body
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_latest_report_picks_the_newest():
+    tmp = tempfile.mkdtemp()
+    try:
+        def run():
+            assert C.latest_report() is None
+            older = C.write_report()
+            os.utime(older, (1_600_000_000, 1_600_000_000))
+            newer = C.write_report(out_path=os.path.join(C.log_dir(),
+                                                         "report_newer.txt"))
+            return older, newer, C.latest_report()
+
+        older, newer, latest = _with_output_root(tmp, run)
+        assert latest == newer != older
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

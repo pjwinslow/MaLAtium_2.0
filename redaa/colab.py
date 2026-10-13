@@ -753,3 +753,236 @@ def print_diagnosis(try_model_load: bool = False) -> dict:
     else:
         print("\nNo problems detected.")
     return report
+
+
+# ---------------------------------------------------------------------------
+# Run logging
+# ---------------------------------------------------------------------------
+#
+# Colab truncates long cell output and drops it entirely on a disconnect, so
+# the console is the worst possible place to keep the record of a run. Worse,
+# the output you most need is the output of a run that crashed -- which is
+# exactly when you are least likely to still have the cell contents.
+#
+# capture_run_log() tees everything to a file while still printing live, adds
+# the environment and the traceback, and leaves behind one attachable report.
+
+
+class _Tee:
+    """Write to the real stream and to a file at the same time."""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, data):
+        self._stream.write(data)
+        try:
+            self._handle.write(data)
+        except Exception:
+            pass          # a failed log write must never break the run
+        return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        finally:
+            try:
+                self._handle.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def log_dir() -> str:
+    """Where to keep run logs: beside the outputs, so Drive keeps them."""
+    root = os.environ.get("OUTPUT_ROOT", "/content/redaa_outputs")
+    path = os.path.join(os.path.dirname(root.rstrip("/")) or root, "logs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _env_block() -> list[str]:
+    report = diagnose()
+    lines = ["=== environment ==="]
+    for key, value in report["info"].items():
+        if key in ("env", "hf_cache_broken"):
+            continue
+        lines.append("  %-18s %s" % (key, value))
+
+    env = report["info"].get("env") or {}
+    lines.append("")
+    lines.append("=== run configuration (%d set) ===" % len(env))
+    for key in sorted(env):
+        lines.append("  %-24s %s" % (key, env[key]))
+
+    lines.append("")
+    lines.append("=== checks ===")
+    for line in report["ok"]:
+        lines.append("  ok    " + line)
+    for line in report["problems"]:
+        lines.append("  !!    " + line)
+    return lines
+
+
+def write_report(
+    log_path: str | None = None,
+    run_dir: str | None = None,
+    out_path: str | None = None,
+    max_log_lines: int = 1500,
+) -> str:
+    """Bundle the environment, the console log and the results into one file.
+
+    This is the file to attach to a bug report or drop into a chat.  A very
+    long console log is elided in the middle rather than dropped, because the
+    interesting parts of a failed run are the setup at the top and the
+    traceback at the bottom; the untouched log stays on disk beside it.
+    """
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_path or os.path.join(log_dir(), "report_%s.txt" % stamp)
+
+    parts: list[str] = [
+        "RedAA finder run report",
+        "generated %s" % datetime.now().isoformat(timespec="seconds"),
+        "",
+    ]
+    parts += _env_block()
+
+    run_dir = run_dir or latest_run_dir()
+    if run_dir and os.path.isdir(run_dir):
+        parts += ["", "=== run directory ===", "  " + run_dir]
+        rows = summary_rows(run_dir)
+        parts.append("")
+        parts.append("=== BATCH_SUMMARY.csv (%d row(s)) ===" % len(rows))
+        keep = [
+            "pdb", "replicate", "status", "final_alphabet", "alphabet_size",
+            "pruned_alphabet", "pruned_alphabet_size", "best_seq_tm",
+            "best_seq_rmsd", "best_seq_plddt", "elapsed_seconds",
+        ]
+        for row in rows:
+            parts.append(
+                "  " + "  ".join(
+                    "%s=%s" % (k, row[k]) for k in keep if row.get(k)
+                )
+            )
+        flagged = os.path.join(run_dir, "FLAGGED_DOMAINS.csv")
+        if os.path.exists(flagged):
+            parts += ["", "=== FLAGGED_DOMAINS.csv ==="]
+            with open(flagged) as fh:
+                parts += ["  " + ln.rstrip() for ln in fh]
+
+    if log_path and os.path.exists(log_path):
+        with open(log_path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+        parts += ["", "=== console log: %s (%d lines) ===" % (log_path, len(lines))]
+        if len(lines) <= max_log_lines:
+            parts += lines
+        else:
+            head = max_log_lines // 2
+            tail = max_log_lines - head
+            parts += lines[:head]
+            parts.append(
+                "... %d lines elided; the complete log is at %s ..."
+                % (len(lines) - max_log_lines, log_path)
+            )
+            parts += lines[-tail:]
+
+    with open(out_path, "w") as fh:
+        fh.write("\n".join(parts) + "\n")
+    return out_path
+
+
+class capture_run_log:
+    """Context manager that records a run to disk as well as to the cell.
+
+    On the way out it writes an attachable report whether the block succeeded
+    or raised, and prints where both files went.  A traceback is written into
+    the log *before* being re-raised, so a crash is captured rather than lost.
+    """
+
+    def __init__(self, path: str | None = None, quiet: bool = False):
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = path or os.path.join(log_dir(), "run_%s.log" % stamp)
+        self.report_path: str | None = None
+        self.quiet = quiet
+        self._handle = None
+        self._saved: tuple = ()
+
+    def __enter__(self):
+        from datetime import datetime
+
+        self._handle = open(self.path, "w", buffering=1)
+        self._handle.write(
+            "RedAA run log, started %s\n\n"
+            % datetime.now().isoformat(timespec="seconds")
+        )
+        self._handle.write("\n".join(_env_block()))
+        self._handle.write("\n\n=== console ===\n")
+        self._saved = (sys.stdout, sys.stderr)
+        sys.stdout = _Tee(sys.stdout, self._handle)
+        sys.stderr = _Tee(sys.stderr, self._handle)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import traceback
+
+        if exc is not None and self._handle is not None:
+            try:
+                self._handle.write("\n=== traceback ===\n")
+                self._handle.write(
+                    "".join(traceback.format_exception(exc_type, exc, tb))
+                )
+            except Exception:
+                pass
+
+        if self._saved:
+            sys.stdout, sys.stderr = self._saved
+        if self._handle is not None:
+            try:
+                self._handle.flush()
+                self._handle.close()
+            except Exception:
+                pass
+            self._handle = None
+
+        try:
+            self.report_path = write_report(log_path=self.path)
+        except Exception as report_exc:  # noqa: BLE001
+            print("could not write the report: %r" % (report_exc,))
+
+        if not self.quiet:
+            size = (
+                os.path.getsize(self.report_path) / 1024
+                if self.report_path and os.path.exists(self.report_path)
+                else 0
+            )
+            print("\n" + "-" * 70)
+            if exc is not None:
+                print("The run raised %s -- it is captured in the files below."
+                      % exc_type.__name__)
+            print("Full log : %s" % self.path)
+            print("Report   : %s  (%.0f KB)" % (self.report_path, size))
+            print("Attach the report to a chat or a bug report; it carries the")
+            print("environment, the settings, the results so far and the log.")
+            print("-" * 70)
+        return False   # never swallow the exception
+
+
+def latest_report() -> str | None:
+    """Newest report file written by :func:`write_report`."""
+    folder = log_dir()
+    reports = [
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if name.startswith("report_") and name.endswith(".txt")
+    ]
+    return max(reports, key=os.path.getmtime) if reports else None
