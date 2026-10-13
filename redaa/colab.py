@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import zipfile
 from dataclasses import dataclass, field
 
@@ -353,3 +354,232 @@ def disk_free_gb(path: str = "/content") -> float:
         except OSError:
             continue
     return float("nan")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+# Packages whose version changing under a running kernel breaks things in
+# confusing ways. Colab preinstalls all of them, so a `pip install --upgrade`
+# can swap one out from under code that already imported it; the symptom is
+# never "wrong version", it is an ABI error, a bogus AttributeError or a
+# segfault somewhere unrelated.
+_CORE_PACKAGES = (
+    "numpy", "torch", "transformers", "tokenizers", "accelerate",
+    "huggingface_hub",
+)
+
+
+def stale_imports() -> list[tuple[str, str, str]]:
+    """Packages imported at one version but installed at another.
+
+    Returns ``(name, imported_version, installed_version)`` triples.  A
+    non-empty result means the kernel must be restarted before anything else
+    is believable -- this is the Colab failure mode where ``pip install`` has
+    replaced a package the session had already loaded.
+    """
+    import importlib.metadata as md
+
+    out: list[tuple[str, str, str]] = []
+    for name in _CORE_PACKAGES:
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        imported = getattr(module, "__version__", None)
+        if not imported:
+            continue
+        try:
+            installed = md.version(name)
+        except Exception:
+            continue
+        if installed != imported:
+            out.append((name, imported, installed))
+    return out
+
+
+def diagnose(try_model_load: bool = False) -> dict:
+    """Collect everything needed to explain a failed run, in one place.
+
+    ``try_model_load=True`` additionally attempts to construct both engines,
+    which is the slow part but is what distinguishes "the environment is
+    wrong" from "the model will not load on this GPU".
+    """
+    import importlib
+    import importlib.metadata as md
+    import platform
+
+    report: dict = {"ok": [], "problems": [], "info": {}}
+
+    def info(key, value):
+        report["info"][key] = value
+
+    def ok(line):
+        report["ok"].append(line)
+
+    def problem(line):
+        report["problems"].append(line)
+
+    info("python", platform.python_version())
+    info("platform", platform.platform())
+
+    # -- torch and the GPU ------------------------------------------------
+    try:
+        import torch
+
+        info("torch", torch.__version__)
+        info("torch_cuda_build", getattr(torch.version, "cuda", None))
+        if torch.cuda.is_available():
+            gpu = detect_gpu()
+            info("gpu", gpu.label)
+            info("gpu_name", gpu.name)
+            info("gpu_total_gb", round(gpu.total_gb, 1))
+            info("gpu_capability", "sm_%d%d" % gpu.capability)
+            info("bf16", gpu.bf16)
+            ok("CUDA is available: " + gpu.label)
+            try:
+                free, total = torch.cuda.mem_get_info()
+                info("gpu_free_gb", round(free / 1024**3, 1))
+                if free / total < 0.5:
+                    problem(
+                        "Only %.1f of %.1f GB of VRAM is free -- something else "
+                        "is holding it. Runtime > Restart session."
+                        % (free / 1024**3, total / 1024**3)
+                    )
+            except Exception:
+                pass
+        else:
+            problem(
+                "torch reports no CUDA device. Runtime > Change runtime type > "
+                "GPU, then re-run Step 1."
+            )
+    except Exception as exc:  # noqa: BLE001
+        problem("torch is not importable: %r" % (exc,))
+
+    # -- the rest of the stack --------------------------------------------
+    for name, required in (
+        ("transformers", True),
+        ("accelerate", True),
+        ("huggingface_hub", True),
+        ("numpy", True),
+        ("tmtools", False),
+        ("prody", False),
+        ("ml_collections", False),
+    ):
+        try:
+            info(name, md.version(name.replace("_", "-")))
+            ok("%s %s" % (name, report["info"][name]))
+        except Exception:
+            try:
+                info(name, md.version(name))
+                ok("%s %s" % (name, report["info"][name]))
+            except Exception:
+                (problem if required else ok)(
+                    "%s is not installed%s"
+                    % (name, " -- re-run Step 1" if required else " (optional)")
+                )
+
+    # -- the thing that silently poisons a Colab session -------------------
+    stale = stale_imports()
+    info("stale_imports", stale)
+    if stale:
+        detail = ", ".join(
+            "%s imported %s but installed %s" % t for t in stale
+        )
+        problem(
+            "A package was replaced after this kernel imported it (%s). "
+            "Runtime > Restart session, then re-run from Step 2 -- do NOT "
+            "re-run the pip install." % detail
+        )
+
+    # -- this repository ---------------------------------------------------
+    redaa_ok = True
+    for module in (
+        "redaa.config", "redaa.structure", "redaa.fetch",
+        "redaa.folding", "redaa.mpnn", "redaa.pipeline",
+    ):
+        try:
+            importlib.import_module(module)
+        except Exception as exc:  # noqa: BLE001
+            redaa_ok = False
+            problem("cannot import %s: %r" % (module, exc))
+    if redaa_ok:
+        ok("redaa package imports cleanly")
+
+    # -- LigandMPNN --------------------------------------------------------
+    mpnn_repo = os.environ.get("MPNN_REPO", "")
+    ckpt = os.environ.get("MPNN_CHECKPOINT", "")
+    info("MPNN_REPO", mpnn_repo or "(unset)")
+    info("MPNN_CHECKPOINT", ckpt or "(unset)")
+    if not mpnn_repo or not os.path.exists(os.path.join(mpnn_repo, "data_utils.py")):
+        problem(
+            "LigandMPNN not found at MPNN_REPO=%r -- re-run Step 1"
+            % (mpnn_repo,)
+        )
+    else:
+        ok("LigandMPNN checkout present")
+    if not ckpt or not os.path.exists(ckpt):
+        problem("MPNN checkpoint missing at %r -- re-run Step 1" % (ckpt,))
+    elif os.path.getsize(ckpt) < 1_000_000:
+        problem(
+            "MPNN checkpoint is only %d bytes, so the download was truncated "
+            "-- delete it and re-run Step 1" % os.path.getsize(ckpt)
+        )
+    else:
+        ok("MPNN checkpoint %.0f MB" % (os.path.getsize(ckpt) / 1e6))
+
+    # -- run configuration -------------------------------------------------
+    from .config import ENV_VARS
+
+    info("env", {k: os.environ[k] for k in ENV_VARS if k in os.environ})
+    info("disk_free_gb", round(disk_free_gb("/content"), 1))
+
+    # -- optionally load the models ---------------------------------------
+    if try_model_load:
+        from .config import RedAAConfig
+
+        cfg = RedAAConfig()
+        try:
+            from .mpnn import MPNNEngine
+
+            MPNNEngine(cfg, verbose=False).load()
+            ok("LigandMPNN loads")
+        except Exception as exc:  # noqa: BLE001
+            problem("LigandMPNN failed to load: %r" % (exc,))
+        try:
+            from .folding import FoldEngine
+
+            FoldEngine(cfg, verbose=False).load()
+            ok("%s loads" % cfg.fold_model_id)
+        except Exception as exc:  # noqa: BLE001
+            problem("%s failed to load: %r" % (cfg.fold_model_id, exc))
+
+    return report
+
+
+def print_diagnosis(try_model_load: bool = False) -> dict:
+    """Human-readable :func:`diagnose`, for pasting into a bug report."""
+    report = diagnose(try_model_load=try_model_load)
+
+    print("=== environment ===")
+    for key, value in report["info"].items():
+        if key in ("env", "stale_imports"):
+            continue
+        print("  %-18s %s" % (key, value))
+
+    env = report["info"].get("env") or {}
+    print("\n=== run configuration (%d set) ===" % len(env))
+    for key in sorted(env):
+        print("  %-24s %s" % (key, env[key]))
+
+    print("\n=== checks passed (%d) ===" % len(report["ok"]))
+    for line in report["ok"]:
+        print("  ok    " + line)
+
+    if report["problems"]:
+        print("\n=== PROBLEMS (%d) ===" % len(report["problems"]))
+        for line in report["problems"]:
+            print("  !!    " + line)
+    else:
+        print("\nNo problems detected.")
+    return report

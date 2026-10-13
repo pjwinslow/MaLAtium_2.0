@@ -105,6 +105,11 @@ What it handles that the batch job does not need to:
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
   checkpointed and every fold is cached, so re-running after a disconnect
   resumes; without Drive it starts over.
+- **Changing the GPU type restarts the runtime**, so switching T4 → A100 wipes
+  `/content` like any other restart and Step 1 has to run again. Step 8 of the
+  notebook (`rc.print_diagnosis()`) reports the environment, every package
+  version, the resolved settings and a pass/fail list naming the fix for each
+  problem — start there when a run fails.
 - **Runtime restarts, which wipe `/content`.** Every cell after the installer
   starts by re-establishing the checkout, `sys.path` and the environment, and
   re-clones the repo if it has vanished — so a restart produces a cell that
@@ -296,7 +301,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all six suites, 92 tests
+python run_redaa.py --self-test  # all six suites, 98 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

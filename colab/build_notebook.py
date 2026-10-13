@@ -150,11 +150,42 @@ else:
     clone_fresh()
 
 # --- python dependencies ---------------------------------------------------
-# Colab already ships torch and numpy. ESMFold2-Fast loads through
-# transformers with trust_remote_code=True, which pulls the FastPLMs
-# implementation out of the model repository itself.
-sh("pip install -q --upgrade 'transformers>=4.44' accelerate huggingface_hub")
-sh("pip install -q tmtools ml-collections prody")   # tmtools = exact TM-align
+# Colab already ships torch, numpy and usually transformers. Only install what
+# is actually missing or too old: a blanket `pip install --upgrade` can swap
+# out numpy, tokenizers or torch underneath a kernel that has already imported
+# them, and the resulting failures surface far from the cause. Which packages
+# that hits depends on the runtime image, so it bites on one GPU type and not
+# another.
+import importlib.metadata as _md
+
+
+def installed_version(dist):
+    try:
+        return _md.version(dist)
+    except Exception:
+        return None
+
+
+def at_least(have, want):
+    def parts(v):
+        out = []
+        for chunk in str(v).split(".")[:3]:
+            digits = "".join(c for c in chunk if c.isdigit())
+            out.append(int(digits) if digits else 0)
+        return out
+    return bool(have) and parts(have) >= parts(want)
+
+needed = []
+if not at_least(installed_version("transformers"), "4.44"):
+    needed.append("'transformers>=4.44'")
+for dist in ("accelerate", "huggingface_hub", "tmtools", "ml-collections", "prody"):
+    if installed_version(dist) is None:
+        needed.append(dist)
+
+if needed:
+    sh("pip install -q " + " ".join(needed))
+else:
+    print("$ (python dependencies already satisfied -- nothing to install)")
 
 # --- LigandMPNN ------------------------------------------------------------
 if not os.path.isdir(os.path.join(MPNN_DIR, ".git")):
@@ -171,6 +202,27 @@ os.environ["MPNN_CHECKPOINT"] = CKPT
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 os.chdir(REPO_DIR)
+
+# --- did pip move something out from under this kernel? -------------------
+# Colab's classic failure: a package is replaced on disk while the session
+# still holds the old module object. Nothing reports a version mismatch; you
+# get an ABI error or a nonsense AttributeError somewhere unrelated. The only
+# fix is a kernel restart, so stop here and say so rather than letting later
+# cells fail obscurely.
+import redaa.colab as _rc
+
+_stale = _rc.stale_imports()
+if _stale:
+    print("\\n" + "=" * 70)
+    print("RESTART REQUIRED")
+    print("=" * 70)
+    for _name, _imported, _now in _stale:
+        print("  %s: this session imported %s, but %s is now installed"
+              % (_name, _imported, _now))
+    print("\\n  Runtime > Restart session, then re-run from Step 2.")
+    print("  Do NOT re-run this cell -- the install already succeeded.")
+    print("=" * 70)
+    raise SystemExit("restart the runtime, then continue from Step 2")
 
 # --- verify, so a partial install cannot look like a successful one -------
 import importlib
@@ -491,9 +543,41 @@ if DOWNLOAD_ZIP:
 """
 )
 
+code_with_bootstrap(
+    """
+#@title Step 8 — Diagnose a failure (run this if anything above broke)
+#@markdown Prints the environment, every relevant package version, the
+#@markdown resolved settings and an explicit pass/fail list. Paste the whole
+#@markdown output into a bug report. `TRY_MODEL_LOAD` additionally tries to
+#@markdown load both models -- slow, but it separates "the environment is
+#@markdown wrong" from "this model will not load on this GPU".
+TRY_MODEL_LOAD = False #@param {type:"boolean"}
+
+import importlib
+
+importlib.reload(rc)
+report = rc.print_diagnosis(try_model_load=TRY_MODEL_LOAD)
+"""
+)
+
 md(
     """
 ## Troubleshooting
+
+**Start with Step 8.** It prints the environment, every package version, the
+resolved settings and a pass/fail list, and names the fix for each problem it
+finds. Almost everything below is something Step 8 will tell you directly.
+
+**Changing the GPU type restarts the runtime**, which wipes `/content` exactly
+like any other restart — so switching from T4 to A100 means Step 1 has to run
+again. Steps 2–7 re-clone the repo themselves, but the pip packages and the
+MPNN checkpoint go with `/content` and only Step 1 restores them.
+
+**A nonsense error right after Step 1** (an ABI complaint, an `AttributeError`
+on something that obviously exists, a segfault) usually means `pip` replaced a
+package this kernel had already imported. Step 1 now detects that and stops
+with `RESTART REQUIRED`; if you see it, do Runtime > Restart session and
+continue from Step 2 — do not re-run the install.
 
 **bf16 / `esmc_precision` errors on a T4.** The free-tier T4 is pre-Ampere and
 has no bfloat16. Try `FOLD_PRECISION="fp16"` in step 5, or one of the smaller

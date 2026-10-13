@@ -296,6 +296,104 @@ def test_fetch_only_cli_fails_when_nothing_could_be_prepared():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_reports_a_bare_environment_as_problems_not_a_crash():
+    """The diagnostic must survive the very situation it exists to explain."""
+    report = C.diagnose()
+    assert set(report) == {"ok", "problems", "info"}
+    assert report["info"]["python"]
+    # torch is absent in this test environment, which is a problem, not a crash.
+    assert any("torch" in p for p in report["problems"])
+    assert "redaa package imports cleanly" in report["ok"]
+    assert isinstance(report["info"]["env"], dict)
+
+
+def test_diagnose_names_the_fix_for_each_missing_piece():
+    saved = {k: os.environ.get(k) for k in ("MPNN_REPO", "MPNN_CHECKPOINT")}
+    try:
+        os.environ["MPNN_REPO"] = "/nope"
+        os.environ["MPNN_CHECKPOINT"] = "/nope/ckpt.pt"
+        report = C.diagnose()
+        mpnn = [p for p in report["problems"] if "LigandMPNN" in p]
+        ckpt = [p for p in report["problems"] if "checkpoint" in p]
+        assert mpnn and "Step 1" in mpnn[0], mpnn
+        assert ckpt and "Step 1" in ckpt[0], ckpt
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_diagnose_flags_a_truncated_checkpoint_separately_from_a_missing_one():
+    tmp = tempfile.mkdtemp()
+    saved = os.environ.get("MPNN_CHECKPOINT")
+    try:
+        path = os.path.join(tmp, "proteinmpnn_v_48_020.pt")
+        with open(path, "wb") as fh:
+            fh.write(b"\x00" * 128)      # a failed download, not a model
+        os.environ["MPNN_CHECKPOINT"] = path
+        report = C.diagnose()
+        hit = [p for p in report["problems"] if "truncated" in p]
+        assert hit, report["problems"]
+        assert "delete it" in hit[0]
+    finally:
+        if saved is None:
+            os.environ.pop("MPNN_CHECKPOINT", None)
+        else:
+            os.environ["MPNN_CHECKPOINT"] = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_stale_imports_is_empty_for_a_consistent_session():
+    assert C.stale_imports() == []
+
+
+def test_stale_imports_catches_a_package_swapped_under_the_kernel():
+    """The Colab failure mode where pip replaces an already-imported package.
+
+    Nothing reports a version mismatch at the time; you get an ABI error or a
+    nonsense AttributeError somewhere unrelated. Detecting it is the only way
+    to tell the user to restart rather than keep debugging.
+    """
+    import numpy
+
+    real = numpy.__version__
+    try:
+        numpy.__version__ = "0.0.1-not-what-is-installed"
+        stale = C.stale_imports()
+        names = [t[0] for t in stale]
+        assert "numpy" in names, stale
+        entry = next(t for t in stale if t[0] == "numpy")
+        assert entry[1] == "0.0.1-not-what-is-installed"
+        assert entry[2] == real
+
+        report = C.diagnose()
+        hit = [p for p in report["problems"] if "Restart session" in p]
+        assert hit, report["problems"]
+        assert "do NOT" in hit[0] or "Do NOT" in hit[0]
+    finally:
+        numpy.__version__ = real
+
+
+def test_print_diagnosis_emits_every_section():
+    import contextlib, io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        C.print_diagnosis()
+    out = buf.getvalue()
+    for section in ("=== environment ===", "run configuration",
+                    "checks passed", "PROBLEMS"):
+        assert section in out, section
+    assert "python" in out
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
