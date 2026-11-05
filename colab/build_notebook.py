@@ -12,9 +12,49 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 REPO_URL = "https://github.com/pjwinslow/MaLAtium_2.0"
-BRANCH = "claude/esm-fold2-mpnn-optimization-brhedz"
+
+
+def _current_branch() -> str:
+    """The branch this checkout is on, which is the branch to clone in Colab.
+
+    This used to be a hardcoded constant, and it went stale exactly the way a
+    hardcoded constant does: the notebook kept pointing at the branch it was
+    first built on, so Step 1 cloned code that did not match the cells around
+    it -- a notebook showing a functional-site step while importing a `redaa`
+    that had never heard of one. Deriving it means the generated notebook
+    always clones the branch it was generated from.
+
+    ``REDAA_BRANCH`` overrides, for building a notebook aimed at a branch
+    other than the current one (a release notebook pinned to ``main``).
+    """
+    override = os.environ.get("REDAA_BRANCH", "").strip()
+    if override:
+        return override
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=10,
+        )
+        name = out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name or name == "HEAD":
+        # Detached HEAD, or no git at all. "main" is wrong often enough that
+        # guessing silently would just recreate the original bug.
+        raise SystemExit(
+            "Cannot tell which branch to bake into the notebook: this is not a "
+            "git checkout, or HEAD is detached.\n"
+            "Set REDAA_BRANCH to the branch Colab should clone, e.g.\n"
+            "  REDAA_BRANCH=main python colab/build_notebook.py"
+        )
+    return name
+
+
+BRANCH = _current_branch()
 
 CELLS: list[tuple[str, str]] = []
 
@@ -127,27 +167,98 @@ REPO_DIR = "/content/MaLAtium_2.0"
 MPNN_DIR = "/content/LigandMPNN"
 MPNN_CKPT_URL = "https://files.ipd.uw.edu/pub/ligandmpnn/proteinmpnn_v_48_020.pt"
 
-def sh(cmd):
-    print("$ " + cmd)
+def sh(cmd, quiet_cmd=None):
+    # quiet_cmd is what gets printed when the real command carries a token.
+    print("$ " + (quiet_cmd or cmd))
     subprocess.run(cmd, shell=True, check=True)
+
+# --- credentials, if this repository is private -----------------------------
+# A private repo cannot be cloned anonymously. Colab's secret store (the key
+# icon in the left sidebar) is the only safe place to put a token in a
+# notebook: it is not saved in the .ipynb and not shared when the notebook is.
+# Add a secret named GITHUB_TOKEN, enable it for this notebook, and use a
+# fine-grained token scoped to this repository with Contents: Read.
+GH_TOKEN = None
+try:
+    from google.colab import userdata
+    GH_TOKEN = userdata.get("GITHUB_TOKEN")
+except Exception:
+    pass
+
+def auth_url():
+    # REPO_URL with the token spliced in, or unchanged if there is none.
+    # (A docstring here would end the generator's own triple-quoted cell.)
+    if GH_TOKEN and REPO_URL.startswith("https://"):
+        return REPO_URL.replace(
+            "https://", "https://x-access-token:" + GH_TOKEN + "@", 1
+        )
+    return REPO_URL
+
+def scrub(text):
+    return text.replace(GH_TOKEN, "***") if GH_TOKEN else text
 
 # --- this repository -------------------------------------------------------
 def clone_fresh():
     sh("rm -rf " + REPO_DIR)
-    sh("git clone -q --depth 1 --branch " + BRANCH + " " + REPO_URL + " " + REPO_DIR)
+    sh(
+        "git clone -q --depth 1 --branch " + BRANCH + " " + auth_url()
+        + " " + REPO_DIR,
+        quiet_cmd="git clone -q --depth 1 --branch " + BRANCH + " "
+        + REPO_URL + " " + REPO_DIR,
+    )
 
-if os.path.isdir(os.path.join(REPO_DIR, ".git")):
-    # Updating a shallow clone can fail in several uninteresting ways; a
-    # re-clone is seconds, so do not make the user debug it.
-    try:
-        sh("git -C " + REPO_DIR + " fetch -q --depth 1 origin " + BRANCH)
-        sh("git -C " + REPO_DIR + " reset -q --hard FETCH_HEAD")
-        sh("git -C " + REPO_DIR + " clean -qfd")
-    except subprocess.CalledProcessError:
-        print("In-place update failed -- re-cloning instead.")
-        clone_fresh()
-else:
+def update_or_clone():
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        # Updating a shallow clone can fail in several uninteresting ways; a
+        # re-clone is seconds, so do not make the user debug it.
+        try:
+            sh(
+                "git -C " + REPO_DIR + " fetch -q --depth 1 " + auth_url()
+                + " " + BRANCH,
+                quiet_cmd="git -C " + REPO_DIR + " fetch -q --depth 1 origin "
+                + BRANCH,
+            )
+            sh("git -C " + REPO_DIR + " reset -q --hard FETCH_HEAD")
+            sh("git -C " + REPO_DIR + " clean -qfd")
+            return
+        except subprocess.CalledProcessError:
+            print("In-place update failed -- re-cloning instead.")
     clone_fresh()
+
+try:
+    update_or_clone()
+except subprocess.CalledProcessError as exc:
+    # The overwhelmingly likely cause is a private repository with no token,
+    # and the raw git error ("could not read Username", or a bare 128) does
+    # not say so. Name the actual fix.
+    print()
+    print("=" * 70)
+    print("Could not get " + REPO_URL + " (branch " + BRANCH + ")")
+    print("=" * 70)
+    if not GH_TOKEN:
+        print(
+            "No GITHUB_TOKEN secret is set. If this repository is private,\\n"
+            "that is why: an anonymous clone of a private repo fails.\\n"
+            "\\n"
+            "  1. GitHub > Settings > Developer settings > Personal access\\n"
+            "     tokens > Fine-grained. Scope it to this one repository,\\n"
+            "     Contents: Read. Give it a short expiry.\\n"
+            "  2. In Colab, click the key icon in the left sidebar, add a\\n"
+            "     secret named GITHUB_TOKEN, paste the value, and switch on\\n"
+            "     'Notebook access'.\\n"
+            "  3. Re-run this cell.\\n"
+            "\\n"
+            "The secret is not stored in the .ipynb and is not shared with\\n"
+            "anyone you share the notebook with."
+        )
+    else:
+        print(
+            "A GITHUB_TOKEN secret is set, so the token itself is probably\\n"
+            "the problem: check it has not expired, that it is scoped to\\n"
+            "this repository, and that it grants Contents: Read.\\n"
+            "Also check BRANCH above names a branch that exists."
+        )
+    raise SystemExit(scrub(str(exc)))
 
 # --- python dependencies ---------------------------------------------------
 # Colab already ships torch, numpy and usually transformers. Only install what

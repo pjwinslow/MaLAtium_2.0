@@ -333,6 +333,57 @@ def test_report_push_cell_never_leaks_the_token():
     assert "_report_push" in cell
 
 
+def test_baked_branch_matches_this_checkout():
+    """The notebook must clone the branch it was generated from.
+
+    This is the bug that made the committed notebook unusable once: a
+    hardcoded BRANCH kept pointing at the branch it was first built on, so
+    Step 1 cloned a `redaa` that did not match the cells around it -- the
+    notebook offered a functional-site step and the import had never heard of
+    one. The failure is invisible until someone runs it in Colab, so it is
+    worth a test.
+    """
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    branch = out.stdout.strip()
+    if out.returncode != 0 or not branch or branch == "HEAD":
+        return  # not a usable git checkout; nothing to compare against
+
+    boot = next(c for c in _code_cells() if "Step 1" in c)
+    assert f'BRANCH   = "{branch}"' in boot, (
+        f"notebook clones a different branch than this checkout ({branch}); "
+        "re-run colab/build_notebook.py"
+    )
+
+
+def test_step1_can_clone_a_private_repo_without_leaking_the_token():
+    """The repository is private, so an anonymous clone cannot work.
+
+    Step 1 is the first thing anyone runs, and a bare git failure here
+    ("could not read Username", or exit 128) says nothing about the cause.
+    """
+    boot = next(c for c in _code_cells() if "Step 1" in c)
+    # Token comes from Colab's secret store, never a literal.
+    assert 'userdata.get("GITHUB_TOKEN")' in boot
+    assert "ghp_" not in boot and "github_pat_" not in boot
+    assert "x-access-token" in boot
+    # The clone command is echoed, so it must be echoed without the token.
+    assert "quiet_cmd" in boot
+    assert "print(GH_TOKEN" not in boot
+    assert "scrub(" in boot
+    # A failure explains the likely cause and the fix rather than the raw
+    # git error.
+    assert "GITHUB_TOKEN secret is set" in boot
+    assert "Contents: Read" in boot
+    # Works unauthenticated too, for when the repo is public.
+    assert "if GH_TOKEN and REPO_URL.startswith" in boot
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
