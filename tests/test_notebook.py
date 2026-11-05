@@ -312,6 +312,27 @@ def test_steps_are_numbered_consecutively_from_one():
     assert numbers == list(range(1, len(numbers) + 1)), numbers
 
 
+def test_report_push_cell_never_leaks_the_token():
+    """The optional push cell handles a credential, so it gets its own checks."""
+    cell = next(c for c in _code_cells() if "Step 10" in c)
+    # Read from Colab's secret store, never a literal in the notebook.
+    assert 'userdata.get("GITHUB_TOKEN")' in cell
+    assert "ghp_" not in cell and "github_pat_" not in cell
+    # Never printed, and scrubbed out of any error text that is.
+    assert "print(token" not in cell
+    assert 'replace(token, "***")' in cell
+    # Absent secret is a no-op with an explanation, not a crash.
+    assert "if not token:" in cell
+    assert "nothing was pushed" in cell
+    # Only the small text artefacts leave the session.
+    assert "BATCH_SUMMARY.csv" in cell
+    assert "fold_cache" not in cell
+    # A separate branch and a throwaway clone, so code cannot be touched.
+    assert "REPORTS_BRANCH" in cell
+    assert "--orphan" in cell
+    assert "_report_push" in cell
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

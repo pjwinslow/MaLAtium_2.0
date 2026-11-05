@@ -800,6 +800,139 @@ print("\\nWritten to %s -- attach this file when asking about a failure."
 
 md(
     """
+## Step 10 — Hand a run back for debugging (optional)
+
+There is no way for anything outside your browser to attach to a running Colab
+kernel: the kernel has no public inbound address, and Colab exposes no API for
+it. So a session cannot be driven from elsewhere, and this step is the next
+best thing — it makes the round trip cheap instead of impossible.
+
+**Without any setup.** Step 8 already downloads one text file carrying the
+environment, every package version, the resolved settings, the results so far
+and the full console log — including the traceback if the run crashed. Attach
+that file to the conversation. It is the single most useful thing to send,
+because Colab truncates long cell output and loses it entirely on a
+disconnect, while the file does not.
+
+**With about two minutes of setup**, the cell below removes the manual step by
+pushing that same report into this repository, where it can be read directly:
+
+1. Make a **fine-grained** GitHub personal access token
+   (Settings → Developer settings → Personal access tokens → Fine-grained).
+   Scope it to **this repository only**, with **Contents: Read and write**.
+   Nothing else. Give it a short expiry.
+2. In Colab, open the key icon in the left sidebar (Secrets), add
+   `GITHUB_TOKEN` with that value, and enable it for this notebook.
+3. Run the cell. It commits only the report and the summary CSVs — never the
+   fold cache, the weights or the structures — to a `colab-reports/` path on a
+   separate branch, so it cannot touch code.
+
+The token is read from Colab's secret store and never printed, never written
+to the notebook, and never committed. If the secret is absent the cell says so
+and does nothing.
+
+Then the loop is: you run, the cell pushes, a fix is pushed back, and you
+re-run **Step 1** (which re-clones) and **Step 7**. Finished replicates are
+skipped and cached folds cost nothing, so resuming is cheap.
+"""
+)
+
+code_with_bootstrap(
+    """
+#@title Step 10 — Push this run's report to GitHub (optional)
+REPORTS_BRANCH = "colab-reports" #@param {type:"string"}
+NOTE = "" #@param {type:"string"}
+#@markdown `NOTE` is a one-line description of what you were trying — it goes
+#@markdown into the commit message, which is usually the fastest way to say
+#@markdown what you expected to happen.
+
+import os, shutil, subprocess, time
+
+def _run(cmd, **kw):
+    return subprocess.run(cmd, shell=True, text=True, capture_output=True, **kw)
+
+token = None
+try:
+    from google.colab import userdata
+    token = userdata.get("GITHUB_TOKEN")
+except Exception as exc:
+    print("No Colab secret available (%s)." % type(exc).__name__)
+
+if not token:
+    print(
+        "GITHUB_TOKEN is not set as a Colab secret, so nothing was pushed.\\n"
+        "Use Step 8's DOWNLOAD_REPORT and attach the file instead, or add the\\n"
+        "secret as described above and re-run this cell."
+    )
+else:
+    run_dir = globals().get("RUN_DIR") or rc.latest_run_dir()
+    if not run_dir:
+        raise SystemExit("No run directory found — run step 7 first.")
+
+    report = globals().get("REPORT_PATH") or rc.latest_report()
+    if not (report and os.path.exists(report)):
+        report = rc.write_report(run_dir=run_dir)
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    work = "/content/_report_push"
+    shutil.rmtree(work, ignore_errors=True)
+
+    # A fresh shallow clone, so nothing here can disturb the working checkout
+    # in /content/MaLAtium_2.0 that the rest of the notebook imports from.
+    url = REPO_URL.replace("https://", "https://x-access-token:%s@" % token)
+    out = _run("git clone --depth 1 --branch %s %s %s"
+               % (REPORTS_BRANCH, url, work))
+    if out.returncode != 0:
+        # The branch does not exist yet: start it with no history, so the
+        # reports branch never carries a copy of the code.
+        out = _run("git clone --depth 1 %s %s" % (url, work))
+        if out.returncode != 0:
+            raise SystemExit("clone failed: " + (out.stderr or "")[-800:])
+        _run("git checkout --orphan %s" % REPORTS_BRANCH, cwd=work)
+        _run("git rm -rf --quiet . || true", cwd=work)
+
+    dest = os.path.join(work, "colab-reports", stamp)
+    os.makedirs(dest, exist_ok=True)
+    shutil.copy2(report, os.path.join(dest, os.path.basename(report)))
+
+    # Only the small text artefacts. Never the fold cache (large, binary, and
+    # pointless outside its own session), never weights, never structures.
+    copied = [os.path.basename(report)]
+    for name in ("BATCH_SUMMARY.csv", "FLAGGED_DOMAINS.csv"):
+        src = os.path.join(run_dir, name)
+        if os.path.exists(src) and os.path.getsize(src) < 2_000_000:
+            shutil.copy2(src, os.path.join(dest, name))
+            copied.append(name)
+
+    message = "Colab run report %s" % stamp
+    if NOTE.strip():
+        message += "\\n\\n" + NOTE.strip()
+
+    _run("git config user.email colab@example.invalid", cwd=work)
+    _run("git config user.name 'Colab run'", cwd=work)
+    _run("git add colab-reports", cwd=work)
+    commit = _run("git commit -m %s" % repr(message), cwd=work)
+    if commit.returncode != 0 and "nothing to commit" not in (commit.stdout or ""):
+        raise SystemExit("commit failed: " + (commit.stderr or commit.stdout)[-800:])
+
+    push = _run("git push -u origin %s" % REPORTS_BRANCH, cwd=work)
+    if push.returncode != 0:
+        # Never echo the command: it carries the token.
+        raise SystemExit(
+            "push failed. Check the token is fine-grained for this repo with "
+            "Contents: Read and write.\\n"
+            + (push.stderr or "").replace(token, "***")[-800:]
+        )
+
+    print("Pushed %s to %s:colab-reports/%s"
+          % (", ".join(copied), REPORTS_BRANCH, stamp))
+    print("Share that branch and path; nothing else was uploaded.")
+    shutil.rmtree(work, ignore_errors=True)
+"""
+)
+
+md(
+    """
 ## Troubleshooting
 
 **Start with Step 9.** It prints the environment, every package version, the
