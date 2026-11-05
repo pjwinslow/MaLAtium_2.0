@@ -261,6 +261,22 @@ except subprocess.CalledProcessError as exc:
         )
     raise SystemExit(scrub(str(exc)))
 
+# The repo is on disk now, so make it importable *here* -- before any later
+# part of this cell imports from it. (It used to be set up further down, after
+# a `from redaa.mpnn import ...`, which simply failed with
+# "No module named 'redaa'".)
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
+os.chdir(REPO_DIR)
+
+# Re-running this cell re-cloned the repo underneath any redaa modules this
+# kernel already imported, and those cached module objects point at files that
+# no longer exist. Drop them so imports below pick up the fresh checkout.
+import importlib
+importlib.invalidate_caches()
+for _stale in [m for m in list(sys.modules) if m == "redaa" or m.startswith("redaa.")]:
+    del sys.modules[_stale]
+
 # --- python dependencies ---------------------------------------------------
 # Colab already ships torch, numpy and usually transformers. Only install what
 # is actually missing or too old: a blanket `pip install --upgrade` can swap
@@ -324,9 +340,6 @@ os.environ["MPNN_REPO"] = MPNN_DIR
 # Left unset on purpose, so the engine resolves the checkpoint from
 # MPNN_MODEL_TYPE. Set it only to use a checkpoint of your own.
 os.environ.pop("MPNN_CHECKPOINT", None)
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-os.chdir(REPO_DIR)
 
 # --- did pip move something out from under this kernel? -------------------
 # Colab's classic failure: a package is replaced on disk while the session

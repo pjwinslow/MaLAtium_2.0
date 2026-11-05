@@ -25,6 +25,31 @@ import sys
 import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _snapshot_redaa_modules() -> dict:
+    """Remember which redaa modules are loaded, and from where.
+
+    Several tests exec the notebook's bootstrap against a throwaway copy of
+    the package, which caches `redaa` with its __path__ inside a temp
+    directory that is then deleted. Restoring sys.path and cwd is not enough:
+    a stale package entry makes a later `import redaa.<anything>` in an
+    unrelated test fail with ModuleNotFoundError, so the suite's result starts
+    depending on the order tests happen to run in.
+    """
+    return {
+        name: mod for name, mod in sys.modules.items()
+        if name == "redaa" or name.startswith("redaa.")
+    }
+
+
+def _restore_redaa_modules(saved: dict) -> None:
+    for name in [
+        n for n in list(sys.modules)
+        if n == "redaa" or n.startswith("redaa.")
+    ]:
+        del sys.modules[name]
+    sys.modules.update(saved)
 sys.path.insert(0, REPO_ROOT)
 
 NOTEBOOK = os.path.join(REPO_ROOT, "colab", "RedAA_Colab.ipynb")
@@ -154,6 +179,7 @@ def test_bootstrap_repairs_path_cwd_and_env_when_the_checkout_exists():
     tmp = tempfile.mkdtemp(prefix="redaa_nb_")
     cwd = os.getcwd()
     saved = {k: os.environ.get(k) for k in ("MPNN_REPO", "MPNN_CHECKPOINT")}
+    saved_modules = _snapshot_redaa_modules()
     try:
         repo = os.path.join(tmp, "MaLAtium_2.0")
         shutil.copytree(os.path.join(REPO_ROOT, "redaa"), os.path.join(repo, "redaa"))
@@ -186,6 +212,7 @@ def test_bootstrap_repairs_path_cwd_and_env_when_the_checkout_exists():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        _restore_redaa_modules(saved_modules)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -194,6 +221,7 @@ def test_bootstrap_does_not_overwrite_env_the_install_cell_set():
     tmp = tempfile.mkdtemp(prefix="redaa_nb_env_")
     cwd = os.getcwd()
     saved = os.environ.get("MPNN_REPO")
+    saved_modules = _snapshot_redaa_modules()
     try:
         repo = os.path.join(tmp, "MaLAtium_2.0")
         shutil.copytree(os.path.join(REPO_ROOT, "redaa"), os.path.join(repo, "redaa"))
@@ -208,6 +236,7 @@ def test_bootstrap_does_not_overwrite_env_the_install_cell_set():
             os.environ.pop("MPNN_REPO", None)
         else:
             os.environ["MPNN_REPO"] = saved
+        _restore_redaa_modules(saved_modules)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -230,6 +259,7 @@ def test_bootstrap_detects_a_wiped_runtime_and_reclones():
         return real_run([sys.executable, "-c", ""], capture_output=True)
 
     printed: list[str] = []
+    saved_modules = _snapshot_redaa_modules()
     try:
         subprocess.run = fake_run
         scope = {"print": lambda *a, **k: printed.append(" ".join(map(str, a)))}
@@ -247,6 +277,7 @@ def test_bootstrap_detects_a_wiped_runtime_and_reclones():
         os.chdir(cwd)
         while repo in sys.path:
             sys.path.remove(repo)
+        _restore_redaa_modules(saved_modules)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -403,6 +434,132 @@ def test_step1_installs_a_checkpoint_for_every_model_type():
     # And it must not pin one, or the model type cannot choose.
     assert 'os.environ.pop("MPNN_CHECKPOINT"' in boot
     assert len(set(DEFAULT_CHECKPOINTS.values())) >= 2
+
+
+def test_step1_makes_the_repo_importable_before_importing_from_it():
+    """Ordering bug that only ever shows up in Colab.
+
+    Step 1 clones the repo and later imports from it. If the sys.path setup
+    comes after that import, the cell dies with
+    "ModuleNotFoundError: No module named 'redaa'" -- and nothing in a local
+    test run notices, because locally the repo is already importable.
+    """
+    boot = next(c for c in _code_cells() if "#@title Step 1" in c)
+    lines = boot.splitlines()
+
+    def first(pred):
+        return next((i for i, l in enumerate(lines) if pred(l)), None)
+
+    path_at = first(lambda l: "sys.path.insert(0, REPO_DIR)" in l)
+    chdir_at = first(lambda l: "os.chdir(REPO_DIR)" in l)
+    import_at = first(
+        lambda l: l.startswith("from redaa") or l.startswith("import redaa")
+    )
+    assert path_at is not None, "Step 1 never puts the checkout on sys.path"
+    assert import_at is not None, "expected Step 1 to import from redaa"
+    assert path_at < import_at, (
+        f"sys.path set at line {path_at} but redaa imported at line "
+        f"{import_at}; the cell would fail with ModuleNotFoundError"
+    )
+    assert chdir_at is None or chdir_at < import_at
+
+    # A re-run re-clones under already-imported modules, so stale entries
+    # must be dropped or the import silently uses deleted files.
+    stale_at = first(lambda l: "del sys.modules[_stale]" in l)
+    assert stale_at is not None and stale_at < import_at
+
+
+def test_no_cell_imports_redaa_before_the_bootstrap_runs():
+    """Every later cell gets the checkout back after a runtime restart.
+
+    A restart wipes /content, so each cell re-establishes the checkout and
+    sys.path first. An import placed above that bootstrap would fail on
+    exactly the restart the bootstrap exists to survive.
+    """
+    for cell in _code_cells():
+        if "#@title Step 1" in cell:
+            continue  # covered by the test above
+        lines = cell.splitlines()
+        import_at = next(
+            (i for i, l in enumerate(lines)
+             if l.startswith("from redaa") or l.startswith("import redaa")),
+            None,
+        )
+        if import_at is None:
+            continue
+        boot_at = next(
+            (i for i, l in enumerate(lines) if "sys.path.insert(0, _REPO)" in l),
+            None,
+        )
+        assert boot_at is not None, (
+            f"cell imports redaa at line {import_at} with no bootstrap: "
+            + lines[0]
+        )
+        assert boot_at < import_at, lines[0]
+
+
+def test_step1_runs_up_to_the_checkpoint_block_from_a_clean_interpreter():
+    """Execute Step 1 the way Colab does, with nothing importable up front.
+
+    The structural tests above check the order of lines; this one runs the
+    cell. It is the only test that does, and it is here because the ordering
+    bug it catches reproduced exactly as reported --
+    "ModuleNotFoundError: No module named 'redaa'" -- while every other test
+    passed, since locally the package is importable before the cell starts.
+
+    The clone, pip and wget calls are stubbed; the cell is cut off at the
+    checkpoint download, which is as far as it can go without the network.
+    """
+    src = next(c for c in _code_cells() if "#@title Step 1" in c)
+    cut = src.index("CKPT_DIR = os.path.join")
+    src = src[:cut]
+
+    tmp = tempfile.mkdtemp(prefix="redaa_nb_step1_")
+    repo = os.path.join(tmp, "MaLAtium_2.0")
+    mpnn = os.path.join(tmp, "LigandMPNN")
+    src = src.replace('REPO_DIR = "/content/MaLAtium_2.0"', f"REPO_DIR = {repo!r}")
+    src = src.replace('MPNN_DIR = "/content/LigandMPNN"', f"MPNN_DIR = {mpnn!r}")
+
+    cwd = os.getcwd()
+    saved_modules = _snapshot_redaa_modules()
+    saved_path = list(sys.path)
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        text = str(cmd)
+        if "clone" in text and "MaLAtium" in text:
+            shutil.copytree(
+                os.path.join(REPO_ROOT, "redaa"), os.path.join(repo, "redaa")
+            )
+        elif "clone" in text:
+            os.makedirs(mpnn, exist_ok=True)
+            open(os.path.join(mpnn, "data_utils.py"), "w").close()
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    try:
+        subprocess.run = fake_run
+        # The whole point: redaa must not be importable when the cell starts.
+        _restore_redaa_modules({})
+        scope: dict = {"print": lambda *a, **k: None}
+        exec(src, scope)
+
+        # It got past the import that used to fail, and the values are the
+        # ones the engine will resolve against.
+        assert "DEFAULT_CHECKPOINTS" in scope
+        assert len(set(scope["DEFAULT_CHECKPOINTS"].values())) >= 2
+        assert repo in sys.path
+    finally:
+        subprocess.run = real_run
+        os.chdir(cwd)
+        sys.path[:] = saved_path
+        _restore_redaa_modules(saved_modules)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
