@@ -80,6 +80,26 @@ def main(argv=None) -> int:
         help="with --fetch, chain to use for any spec that does not name one",
     )
     parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="describe the verified functional-site test cases and exit",
+    )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        metavar="KEY",
+        help="configure a site test case by key (see --list-presets). Sets the "
+        "site spec, the ligands to keep and the MPNN model type, and supplies "
+        "the structure to --fetch when none is given.",
+    )
+    parser.add_argument(
+        "--preview-site",
+        action="store_true",
+        help="resolve the configured site against every prepared input, print "
+        "it and exit. Worth doing before any long run: a site spec is the one "
+        "setting that can be wrong without the run noticing.",
+    )
+    parser.add_argument(
         "--chunk-index",
         type=int,
         default=None,
@@ -92,6 +112,18 @@ def main(argv=None) -> int:
         "--replicates", type=int, default=None, help="override NUM_REPLICATES"
     )
     args = parser.parse_args(argv)
+
+    if args.list_presets:
+        from redaa.sites import describe_presets
+
+        print("Verified functional-site test cases:\n")
+        print(describe_presets())
+        print(
+            "\nUse one with, for example:\n"
+            "  python run_redaa.py --preset tev --fetch-only\n"
+            "  SEARCH_MODE=site_aware python run_redaa.py --preset tev\n"
+        )
+        return 0
 
     if args.self_test:
         from tests import (
@@ -139,12 +171,40 @@ def main(argv=None) -> int:
         cfg.apply_test_mode()
         print("\n*** TEST MODE: first domain, 1 replicate, reduced budgets ***\n")
 
+    # A preset supplies the site, its ligands and the MPNN model type, and
+    # the structure to fetch when none was named. Anything set explicitly on
+    # the command line or in the environment still wins.
+    keep_ligands = cfg.keep_ligand_tuple
+    if args.preset:
+        from redaa.sites import preset as _load_preset
+
+        chosen = _load_preset(args.preset)
+        print(chosen.describe())
+        print()
+        cfg.site_preset = chosen.key
+        if not cfg.site_spec:
+            cfg.site_spec = chosen.site_spec
+        if not keep_ligands:
+            keep_ligands = chosen.keep_ligands
+            cfg.site_keep_ligands = ",".join(chosen.keep_ligands)
+        if "MPNN_MODEL_TYPE" not in os.environ:
+            cfg.mpnn_model_type = chosen.mpnn_model_type
+        if args.fetch is None:
+            args.fetch = chosen.fetch_spec
+        if cfg.search_mode == "alphabet_only":
+            print(
+                "NOTE: SEARCH_MODE is alphabet_only, so the site would be "
+                "ignored.\n      Set SEARCH_MODE=site_aware or "
+                "SEARCH_MODE=scaffold_then_site to use it.\n"
+            )
+
     if args.fetch:
         from redaa.colab import describe_inputs, gather_inputs
 
         print(f"Preparing inputs in {cfg.input_pdb_dir}\n")
         reports = gather_inputs(
-            specs=args.fetch, input_dir=cfg.input_pdb_dir, chain=args.chain
+            specs=args.fetch, input_dir=cfg.input_pdb_dir, chain=args.chain,
+            keep_ligands=keep_ligands or None,
         )
         if not reports:
             print("\nNo inputs could be prepared.")
@@ -155,6 +215,28 @@ def main(argv=None) -> int:
         print()
     elif args.fetch_only:
         parser.error("--fetch-only requires --fetch")
+
+    if args.preview_site:
+        from redaa.colab import preview_sites
+
+        if not cfg.site_spec:
+            parser.error("--preview-site needs SITE_SPEC or --preset")
+        print(f"Resolving {cfg.site_spec!r} against {cfg.input_pdb_dir}\n")
+        print(
+            preview_sites(
+                cfg.input_pdb_dir, cfg.site_spec,
+                chain=cfg.site_chain or None,
+                contact_max=cfg.site_contact_max,
+            )
+        )
+        return 0
+
+    problems = cfg.validate()
+    if problems:
+        print("Configuration problems:")
+        for line in problems:
+            print(f"  - {line}")
+        return 1
 
     if args.print_config:
         print("Resolved configuration:")

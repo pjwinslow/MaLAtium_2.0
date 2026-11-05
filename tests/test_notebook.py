@@ -256,11 +256,60 @@ def test_bootstrap_clone_uses_the_pinned_branch_by_default():
 
 
 def test_run_cell_refuses_to_start_without_inputs_configured():
-    run_cell = next(c for c in _code_cells() if "Step 6" in c)
+    # Found by title, not step number: inserting a step renumbers the rest and
+    # a number-keyed lookup would silently start checking the wrong cell.
+    run_cell = next(c for c in _code_cells() if "Run the search" in c)
     assert "INPUT_PDB_DIR" in run_cell
     assert "raise SystemExit" in run_cell
     # TEST_MODE comes from the settings cell; a restart clears it.
     assert 'globals().get("TEST_MODE"' in run_cell
+
+
+def test_site_step_precedes_the_run_and_offers_both_modes():
+    cells = _code_cells()
+    site_idx = next(
+        i for i, c in enumerate(cells) if "Mode and functional site" in c
+    )
+    run_idx = next(i for i, c in enumerate(cells) if "Run the search" in c)
+    assert site_idx < run_idx, "the site must be configured before the run"
+
+    site = cells[site_idx]
+    # Every mode reachable from the form, and the presets offered by name.
+    for mode in ("alphabet_only", "site_aware", "scaffold_then_site"):
+        assert mode in site, mode
+    for key in ("atp", "tev"):
+        assert f'"{key}"' in site, key
+    assert "rc.configure_site(" in site
+    # The site is resolved and shown against the real inputs before any GPU
+    # time is spent, which is the point of having the step at all.
+    assert "rc.preview_sites(" in site
+
+
+def test_inputs_step_can_keep_ligands_and_load_a_preset():
+    inputs = next(c for c in _code_cells() if "Fetch and/or upload inputs" in c)
+    assert "KEEP_LIGANDS" in inputs
+    assert "keep_ligands=" in inputs
+    assert "rc.preset(" in inputs
+
+
+def test_results_step_shows_site_columns_only_in_a_site_run():
+    results = next(c for c in _code_cells() if "Step 8" in c)
+    assert "search_mode" in results
+    assert "best_seq_site_bb_rmsd" in results
+    assert "graft_final_alphabet" in results
+    assert "rc.describe_site_results(" in results
+
+
+def test_steps_are_numbered_consecutively_from_one():
+    import re as _re
+
+    numbers = []
+    for cell in _code_cells():
+        m = _re.search(r"#@title Step (\d+)", cell)
+        if m:
+            numbers.append(int(m.group(1)))
+    assert numbers == sorted(numbers), numbers
+    assert numbers == list(range(1, len(numbers) + 1)), numbers
 
 
 def main():

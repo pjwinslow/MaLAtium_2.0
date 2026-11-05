@@ -26,6 +26,8 @@ import zipfile
 from dataclasses import dataclass, field
 
 from . import fetch as F
+from . import sites as S
+from . import structure as ST
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +349,7 @@ def gather_inputs(
     chain: str | None = None,
     cache_dir: str | None = None,
     verbose: bool = True,
+    keep_ligands: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Turn accessions and/or local files into pipeline-ready input PDBs.
 
@@ -357,6 +360,12 @@ def gather_inputs(
 
     *chain* overrides the chain for every spec that does not name one itself,
     which is what you want for a list of entries you know are homodimers.
+
+    *keep_ligands* names heteroatom components to retain -- ``("ATP",)``.
+    Without it every ligand is stripped, which is right for a pure folding
+    search and wrong for a ligand-binding one: LigandMPNN would design
+    against a bare backbone and a pocket could not be derived from
+    coordinates at all.
 
     Returns one report dict per prepared input; failures are reported and
     skipped rather than aborting the batch, so one dead accession in a list of
@@ -394,7 +403,9 @@ def gather_inputs(
     reports: list[dict] = []
     for spec in parsed:
         try:
-            report = F.fetch_and_prepare(spec, input_dir, cache_dir=cache_dir)
+            report = F.fetch_and_prepare(
+                spec, input_dir, cache_dir=cache_dir, keep_ligands=keep_ligands
+            )
         except (F.FetchError, ValueError) as exc:
             errors.append(f"{spec.raw}: {exc}")
             if verbose:
@@ -407,11 +418,18 @@ def gather_inputs(
                 extra.append(f"{report['dropped_incomplete']} incomplete dropped")
             if report["gaps"]:
                 extra.append(f"{report['gaps']} chain gap(s)")
+            for comp, n_atoms in report.get("ligands_kept") or []:
+                extra.append(f"{comp} kept ({n_atoms} atoms)")
             suffix = f"  [{', '.join(extra)}]" if extra else ""
             print(
                 f"  ok    {report['name']}: chain {report['chain']}, "
                 f"{report['n_residues']} residues{suffix}"
             )
+            # A requested ligand that is absent, or a copy rejected for being
+            # too far away, decides whether there is a site to find at all --
+            # so it is said out loud here rather than left in the report.
+            for note in report.get("ligand_notes") or []:
+                print(f"        ligand: {note}")
 
     if verbose:
         print(f"\n{len(reports)} input(s) ready in {input_dir}")
@@ -426,12 +444,18 @@ def describe_inputs(reports: list[dict]) -> str:
     """A small fixed-width table of prepared inputs, for a notebook cell."""
     if not reports:
         return "no inputs prepared"
-    rows = [("name", "source", "chain", "residues", "dropped", "gaps")]
+    rows = [
+        ("name", "source", "chain", "residues", "dropped", "gaps", "ligands")
+    ]
     for r in reports:
+        ligands = ", ".join(
+            f"{c}({n})" for c, n in (r.get("ligands_kept") or [])
+        ) or "-"
         rows.append(
             (
                 r["name"], r["source"], r["chain"],
                 str(r["n_residues"]), str(r["dropped_incomplete"]), str(r["gaps"]),
+                ligands,
             )
         )
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
@@ -440,6 +464,324 @@ def describe_inputs(reports: list[dict]) -> str:
         out.append("  ".join(cell.ljust(widths[j]) for j, cell in enumerate(row)))
         if i == 0:
             out.append("  ".join("-" * w for w in widths))
+    return "\n".join(out)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Functional sites
+# ---------------------------------------------------------------------------
+
+
+MODE_HELP = """\
+alphabet_only       The original search. Smallest alphabet that folds. No site.
+
+site_aware          The site is fixed and gated from the first round, so every
+                    candidate alphabet is judged on fold *and* site together.
+                    Answers: what is the minimal alphabet for a protein that
+                    still has this site?
+
+scaffold_then_site  Search blind to the site first, then graft the site back
+                    on; if that breaks the fold, grow the alphabet until it
+                    holds. Answers: is the minimal folding alphabet compatible
+                    with this site, and if not, what did the site cost?
+
+The two site modes can disagree, and that is the interesting result: a blind
+search may spend the site's positions on folding, and grafting then fails
+where site_aware would have routed around it.
+"""
+
+
+def site_preset_choices() -> list[str]:
+    """Preset keys for a notebook dropdown, with "" meaning none."""
+    return [""] + sorted(S.PRESETS)
+
+
+def preset(key: str) -> "S.SitePreset":
+    """One verified test case by key ("atp", "tev")."""
+    return S.preset(key)
+
+
+def describe_presets() -> str:
+    return S.describe_presets()
+
+
+def configure_site(
+    mode: str = "alphabet_only",
+    spec: str = "",
+    preset: str = "",
+    chain: str = "",
+    keep_ligands: str = "",
+    contact_max: int = 0,
+    policy: str = "exempt",
+    gate: bool = True,
+    max_bb_rmsd: float = 1.5,
+    max_local_rmsd: float = 1.0,
+    max_cb_dev: float = 1.5,
+    require_identity: bool = True,
+    mpnn_model_type: str = "",
+) -> dict:
+    """Write the mode and site settings into the environment.
+
+    A preset fills in whatever the caller left blank -- its site spec, the
+    ligands to keep and the MPNN model type -- so picking "atp" and typing
+    nothing else is a complete configuration, while anything typed explicitly
+    still wins.
+
+    Returns the values actually set, which is what the notebook prints; the
+    run then reads them from the environment like any other setting.
+    """
+    mode = (mode or "alphabet_only").strip()
+    if mode not in ("alphabet_only", "site_aware", "scaffold_then_site"):
+        raise ValueError(
+            f"mode must be alphabet_only, site_aware or scaffold_then_site, "
+            f"not {mode!r}"
+        )
+
+    chosen = None
+    if preset.strip():
+        chosen = S.preset(preset)
+        spec = spec.strip() or chosen.site_spec
+        keep_ligands = keep_ligands.strip() or ",".join(chosen.keep_ligands)
+        mpnn_model_type = mpnn_model_type.strip() or chosen.mpnn_model_type
+
+    if policy not in ("exempt", "in_alphabet"):
+        raise ValueError(f"policy must be exempt or in_alphabet, not {policy!r}")
+
+    settings = {
+        "SEARCH_MODE": mode,
+        "SITE_SPEC": spec.strip(),
+        "SITE_PRESET": preset.strip(),
+        "SITE_CHAIN": chain.strip(),
+        "SITE_KEEP_LIGANDS": keep_ligands.strip(),
+        "SITE_CONTACT_MAX": str(int(contact_max)),
+        "SITE_RESIDUE_POLICY": policy,
+        "SITE_GATE": "1" if gate else "0",
+        "SITE_MAX_BB_RMSD": str(float(max_bb_rmsd)),
+        "SITE_MAX_LOCAL_RMSD": str(float(max_local_rmsd)),
+        "SITE_MAX_CB_DEV": str(float(max_cb_dev)),
+        "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
+    }
+    if mpnn_model_type.strip():
+        settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()
+
+    for key, value in settings.items():
+        os.environ[key] = value
+
+    if mode != "alphabet_only" and not settings["SITE_SPEC"]:
+        print(
+            "  WARNING: no site spec. Set SITE_SPEC or pick a preset, or the "
+            "run will skip every domain."
+        )
+    if chosen is not None:
+        print(f"  preset: {chosen.title}")
+        print(f"    structure to fetch: {chosen.fetch_spec}")
+        print(f"    {chosen.notes}")
+    return settings
+
+
+def preview_site(
+    pdb_path: str,
+    spec: str,
+    chain: str | None = None,
+    contact_max: int = 0,
+) -> str:
+    """Resolve a site against a prepared input and describe it, before running.
+
+    Worth doing every time.  A site spec is the one setting that can be
+    wrong in a way the run does not notice -- right numbering for a different
+    entry, a ligand that was stripped during preparation, a contact shell that
+    swallowed half the protein -- and every one of those is visible here in a
+    second, against the actual file, rather than after an hour of GPU time.
+    """
+    if not os.path.isfile(pdb_path):
+        return f"no such file: {pdb_path}"
+    try:
+        parsed = S.parse_site_spec(spec, default_chain=chain or None)
+    except S.SiteError as exc:
+        return f"cannot parse site spec: {exc}"
+    if not parsed:
+        return "empty site spec"
+
+    records = ST.parse_residues_from_file(
+        pdb_path, atom_names=None, include_hetatm=True
+    )
+    try:
+        site = S.resolve_site(parsed, records, contact_max=contact_max)
+    except S.SiteError as exc:
+        return f"cannot resolve site: {exc}"
+
+    poly = [r for r in records if not r.is_hetatm]
+    lines = [
+        f"{os.path.basename(pdb_path)}: {len(poly)} residues",
+        f"  spec     : {site.spec_text}",
+        f"  resolved : {len(site)} position(s) -- {site.describe()}",
+    ]
+    if site.positions:
+        lines.append("  residues :")
+        for pos in site.positions:
+            dist = (
+                f"  {pos.min_distance:.2f} A from ligand"
+                if pos.min_distance is not None else ""
+            )
+            lines.append(
+                f"      index {pos.index:>4d}  {pos.chain}/{pos.label:<7s} "
+                f"{pos.role}{dist}"
+            )
+        lines.append(f"  types    : {''.join(sorted(site.residue_types))}")
+        frac = 100.0 * len(site) / max(1, len(poly))
+        lines.append(f"  coverage : {frac:.0f}% of the chain")
+
+    het = [r for r in records if r.is_hetatm]
+    if het:
+        counts: dict[str, int] = {}
+        for r in het:
+            counts[r.resname] = counts.get(r.resname, 0) + len(r.atoms)
+        lines.append(
+            "  ligands in file: "
+            + ", ".join(f"{k} ({v} atoms)" for k, v in sorted(counts.items()))
+        )
+    else:
+        lines.append(
+            "  ligands in file: none (set SITE_KEEP_LIGANDS before fetching "
+            "if the site needs one)"
+        )
+
+    fatal = [w for w in site.warnings if w.startswith("NUMBERING MISMATCH")]
+    other = [w for w in site.warnings if w not in fatal]
+    for w in fatal:
+        lines.append(f"  ERROR    : {w}")
+    for w in other:
+        lines.append(f"  warning  : {w}")
+    if fatal:
+        lines.append(
+            "  -> the run will refuse this domain. Check the numbering against "
+            "the entry you actually fetched."
+        )
+    elif not site.positions:
+        lines.append("  -> the run will skip this domain: nothing to preserve.")
+    else:
+        lines.append("  -> looks usable.")
+    return "\n".join(lines)
+
+
+def preview_sites(
+    input_dir: str,
+    spec: str,
+    chain: str | None = None,
+    contact_max: int = 0,
+) -> str:
+    """:func:`preview_site` over every prepared input in a directory."""
+    import glob as _glob
+
+    paths = sorted(_glob.glob(os.path.join(input_dir, "*.pdb")))
+    if not paths:
+        return f"no prepared inputs in {input_dir}"
+    return "\n\n".join(
+        preview_site(p, spec, chain=chain, contact_max=contact_max)
+        for p in paths
+    )
+
+
+def describe_site_results(rows: list[dict]) -> str:
+    """Say in words what a site run found.
+
+    The CSV has the numbers; this says what they mean, because the one thing
+    worth reading off a site run is easy to get wrong from a table: how many
+    letters the alphabet really has, how many positions were exempted from it,
+    and -- in scaffold_then_site -- whether the site cost anything.
+    """
+    if not rows:
+        return ""
+    mode = (rows[0].get("search_mode") or "alphabet_only")
+    if mode == "alphabet_only":
+        return ""
+
+    def num(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    out: list[str] = ["=== site preservation ==="]
+    by_domain: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("pruned_alphabet") or row.get("final_alphabet"):
+            by_domain.setdefault(row.get("pdb", "?"), []).append(row)
+
+    if not by_domain:
+        return "=== site preservation ===\n  no completed replicate to report"
+
+    for domain, reps in sorted(by_domain.items()):
+        out.append(f"\n{domain}:")
+        n_site = reps[0].get("site_n_positions") or "0"
+        types = reps[0].get("site_residue_types") or ""
+        policy = reps[0].get("site_policy") or "exempt"
+        out.append(
+            f"  site: {n_site} position(s) [{reps[0].get('site_residues', '')}]"
+        )
+        alphabets = sorted(
+            {r.get("pruned_alphabet") or r.get("final_alphabet") for r in reps}
+        )
+        sizes = [len(a) for a in alphabets if a]
+        if sizes:
+            span = (
+                f"{min(sizes)}" if min(sizes) == max(sizes)
+                else f"{min(sizes)}-{max(sizes)}"
+            )
+            if policy == "exempt":
+                out.append(
+                    f"  alphabet: {span} letter(s) {', '.join(alphabets)} "
+                    f"PLUS {n_site} exempt position(s) held at native identity "
+                    f"({types})"
+                )
+                out.append(
+                    "    the exempt positions are not alphabet letters -- a "
+                    "real protein would still need their residue types, so "
+                    "compare with a SITE_RESIDUE_POLICY=in_alphabet run"
+                )
+            else:
+                out.append(
+                    f"  alphabet: {span} letter(s) {', '.join(alphabets)}, "
+                    f"the site's {types} included"
+                )
+
+        ok = [r.get("best_seq_site_ok") for r in reps]
+        n_ok = sum(1 for v in ok if str(v) == "1")
+        out.append(f"  site preserved in {n_ok}/{len(reps)} replicate(s)")
+        bb = [num(r.get("best_seq_site_bb_rmsd")) for r in reps]
+        bb = [v for v in bb if v is not None]
+        if bb:
+            out.append(
+                f"  best site backbone RMSD: {min(bb):.2f} A "
+                f"(worst {max(bb):.2f} A)"
+            )
+
+        if mode == "scaffold_then_site":
+            direct = sum(1 for r in reps if str(r.get("graft_direct_pass")) == "1")
+            added = [r.get("graft_added_aas") or "" for r in reps]
+            grown = [a for a in added if a]
+            passed = sum(1 for r in reps if str(r.get("graft_passed")) == "1")
+            out.append(
+                f"  graft: the folding alphabet carried the site unchanged in "
+                f"{direct}/{len(reps)} replicate(s)"
+            )
+            if grown:
+                out.append(
+                    f"  the site cost extra letters in "
+                    f"{len(grown)}/{len(reps)}: "
+                    + ", ".join(sorted(set(grown)))
+                )
+            out.append(
+                f"  after growth the site is satisfied in {passed}/{len(reps)}"
+            )
+            if direct < len(reps):
+                out.append(
+                    "    a site-blind search spends the site's positions on "
+                    "folding; run SEARCH_MODE=site_aware to see what the "
+                    "minimum is when it cannot"
+                )
     return "\n".join(out)
 
 
