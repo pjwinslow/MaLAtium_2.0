@@ -79,7 +79,6 @@ import os, subprocess, sys
 
 _REPO = "/content/MaLAtium_2.0"
 _MPNN = "/content/LigandMPNN"
-_CKPT = os.path.join(_MPNN, "model_params", "proteinmpnn_v_48_020.pt")
 
 if not os.path.exists(os.path.join(_REPO, "redaa", "__init__.py")):
     print("Repository is not on disk -- the Colab runtime was restarted,")
@@ -98,7 +97,9 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 os.chdir(_REPO)
 os.environ.setdefault("MPNN_REPO", _MPNN)
-os.environ.setdefault("MPNN_CHECKPOINT", _CKPT)
+# MPNN_CHECKPOINT is deliberately left unset: the engine picks the checkpoint
+# that matches MPNN_MODEL_TYPE, and pinning one here would silently hand a
+# ligand_mpnn run the ProteinMPNN weights.
 
 import redaa.colab as rc
 # -------------------------------------------------------------------------
@@ -165,7 +166,7 @@ import os, subprocess, sys
 
 REPO_DIR = "/content/MaLAtium_2.0"
 MPNN_DIR = "/content/LigandMPNN"
-MPNN_CKPT_URL = "https://files.ipd.uw.edu/pub/ligandmpnn/proteinmpnn_v_48_020.pt"
+MPNN_CKPT_BASE = "https://files.ipd.uw.edu/pub/ligandmpnn"
 
 def sh(cmd, quiet_cmd=None):
     # quiet_cmd is what gets printed when the real command carries a token.
@@ -302,14 +303,27 @@ else:
 if not os.path.isdir(os.path.join(MPNN_DIR, ".git")):
     sh("git clone -q --depth 1 https://github.com/dauparas/LigandMPNN " + MPNN_DIR)
 
-# LigandMPNN's get_model_params.sh pulls ~15 checkpoints; we need exactly one.
-CKPT = os.path.join(MPNN_DIR, "model_params", "proteinmpnn_v_48_020.pt")
-os.makedirs(os.path.dirname(CKPT), exist_ok=True)
-if not os.path.exists(CKPT):
-    sh("wget -q -O " + CKPT + " " + MPNN_CKPT_URL)
+# LigandMPNN's get_model_params.sh pulls ~15 checkpoints. We need the ones
+# the three usable model types resolve to -- and we need more than one: a
+# ligand-binding search runs MPNN_MODEL_TYPE=ligand_mpnn, whose weights are a
+# different file with a different atom_context_num. Handing it the ProteinMPNN
+# checkpoint fails at load with a tensor-shape error that says nothing about
+# the real mistake.
+from redaa.mpnn import DEFAULT_CHECKPOINTS
+
+CKPT_DIR = os.path.join(MPNN_DIR, "model_params")
+os.makedirs(CKPT_DIR, exist_ok=True)
+for _name in sorted(set(DEFAULT_CHECKPOINTS.values())):
+    _path = os.path.join(CKPT_DIR, _name)
+    if os.path.exists(_path) and os.path.getsize(_path) > 1_000_000:
+        print("  have " + _name)
+        continue
+    sh("wget -q -O " + _path + " " + MPNN_CKPT_BASE + "/" + _name)
 
 os.environ["MPNN_REPO"] = MPNN_DIR
-os.environ["MPNN_CHECKPOINT"] = CKPT
+# Left unset on purpose, so the engine resolves the checkpoint from
+# MPNN_MODEL_TYPE. Set it only to use a checkpoint of your own.
+os.environ.pop("MPNN_CHECKPOINT", None)
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 os.chdir(REPO_DIR)
@@ -346,8 +360,10 @@ for module in ("redaa.config", "redaa.colab", "redaa.fetch", "redaa.structure"):
         problems.append("cannot import %s: %s" % (module, exc))
 if not os.path.exists(os.path.join(MPNN_DIR, "data_utils.py")):
     problems.append("LigandMPNN data_utils.py missing from " + MPNN_DIR)
-if not os.path.exists(CKPT) or os.path.getsize(CKPT) < 1_000_000:
-    problems.append("MPNN checkpoint missing or truncated: " + CKPT)
+for _name in sorted(set(DEFAULT_CHECKPOINTS.values())):
+    _path = os.path.join(CKPT_DIR, _name)
+    if not os.path.exists(_path) or os.path.getsize(_path) < 1_000_000:
+        problems.append("MPNN checkpoint missing or truncated: " + _path)
 try:
     import transformers
 except Exception as exc:
@@ -362,7 +378,10 @@ if problems:
 print("\\nInstall complete and verified.")
 print("  repo        " + REPO_DIR)
 print("  LigandMPNN  " + MPNN_DIR)
-print("  checkpoint  %s (%.0f MB)" % (CKPT, os.path.getsize(CKPT) / 1e6))
+for _type, _name in sorted(DEFAULT_CHECKPOINTS.items()):
+    _path = os.path.join(CKPT_DIR, _name)
+    print("  checkpoint  %-13s %s (%.0f MB)"
+          % (_type, _name, os.path.getsize(_path) / 1e6))
 print("  transformers %s" % transformers.__version__)
 print("\\nNote: a Colab runtime restart wipes /content. Later cells re-clone the")
 print("repo automatically, but pip packages and the checkpoint need this cell again.")

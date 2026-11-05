@@ -258,6 +258,38 @@ def test_detects_cis_proline_and_ignores_trans():
         os.remove(path)
 
 
+# ---------------------------------------------------------------------------
+# MPNN checkpoint resolution
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_name_is_per_model_type():
+    from redaa.mpnn import DEFAULT_CHECKPOINTS, checkpoint_name
+
+    # Exact names, taken from LigandMPNN's run.py argparse defaults. Pinned
+    # rather than pattern-matched because the upstream spelling is not what
+    # you would guess: model_type "soluble_mpnn" loads "solublempnn_...",
+    # with no underscore. A prefix assertion let that typo through once.
+    assert checkpoint_name("protein_mpnn") == "proteinmpnn_v_48_020.pt"
+    assert checkpoint_name("ligand_mpnn") == "ligandmpnn_v_32_010_25.pt"
+    assert checkpoint_name("soluble_mpnn") == "solublempnn_v_48_020.pt"
+    # Each type maps to a distinct file; they are not interchangeable.
+    assert len(set(DEFAULT_CHECKPOINTS.values())) == len(DEFAULT_CHECKPOINTS)
+    # An unknown type falls back rather than crashing.
+    assert checkpoint_name("something_else") == "proteinmpnn_v_48_020.pt"
+
+
+def test_default_checkpoint_path_follows_the_model_type():
+    import os as _os
+
+    from redaa.mpnn import _default_checkpoint
+
+    p_protein = _default_checkpoint("/repo", "protein_mpnn")
+    p_ligand = _default_checkpoint("/repo", "ligand_mpnn")
+    assert p_protein != p_ligand
+    assert _os.path.dirname(p_protein).endswith("model_params")
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

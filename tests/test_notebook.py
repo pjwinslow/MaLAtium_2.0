@@ -171,7 +171,11 @@ def test_bootstrap_repairs_path_cwd_and_env_when_the_checkout_exists():
         assert repo in sys.path
         assert os.path.realpath(os.getcwd()) == os.path.realpath(repo)
         assert os.environ["MPNN_REPO"] == os.path.join(tmp, "LigandMPNN")
-        assert os.environ["MPNN_CHECKPOINT"].endswith("proteinmpnn_v_48_020.pt")
+        # MPNN_CHECKPOINT must stay unset: the engine resolves the checkpoint
+        # from MPNN_MODEL_TYPE, and pinning one here would hand a ligand_mpnn
+        # run the ProteinMPNN weights -- which fails at load with a
+        # tensor-shape error that says nothing about the real mistake.
+        assert "MPNN_CHECKPOINT" not in os.environ
         assert hasattr(scope["rc"], "detect_gpu")
     finally:
         os.chdir(cwd)
@@ -382,6 +386,23 @@ def test_step1_can_clone_a_private_repo_without_leaking_the_token():
     assert "Contents: Read" in boot
     # Works unauthenticated too, for when the repo is public.
     assert "if GH_TOKEN and REPO_URL.startswith" in boot
+
+
+def test_step1_installs_a_checkpoint_for_every_model_type():
+    """A ligand-binding run needs ligand weights, not the ProteinMPNN file.
+
+    The ATP preset sets MPNN_MODEL_TYPE=ligand_mpnn. Those are different
+    weights with a different atom_context_num, so if Step 1 only fetched
+    proteinmpnn_v_48_020.pt the ATP case would die at load_state_dict with a
+    tensor-shape error that never mentions the checkpoint.
+    """
+    from redaa.mpnn import DEFAULT_CHECKPOINTS
+
+    boot = next(c for c in _code_cells() if "Step 1" in c)
+    assert "DEFAULT_CHECKPOINTS" in boot, "Step 1 should fetch every default"
+    # And it must not pin one, or the model type cannot choose.
+    assert 'os.environ.pop("MPNN_CHECKPOINT"' in boot
+    assert len(set(DEFAULT_CHECKPOINTS.values())) >= 2
 
 
 def main():

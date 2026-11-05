@@ -150,6 +150,15 @@ re-run it rather than hand-editing the JSON.
 pip install -r requirements.txt
 ```
 
+**Checkpoints are per model type and are not interchangeable.** `protein_mpnn`
+loads `proteinmpnn_v_48_020.pt`, `ligand_mpnn` loads
+`ligandmpnn_v_32_010_25.pt` and `soluble_mpnn` loads `solublempnn_v_48_020.pt`
+(no underscore before `mpnn` — that is upstream's spelling). Leave
+`MPNN_CHECKPOINT` unset and the engine picks the right one from
+`MPNN_MODEL_TYPE`; pointing a `ligand_mpnn` run at the ProteinMPNN file fails
+at load with a tensor-shape error that never mentions the checkpoint, so that
+case is detected and named explicitly.
+
 `tmtools` is optional but recommended: it provides exact TM-align. Without it
 the pipeline falls back to its own seed-refined TM-score, which agrees closely
 but is slower per comparison. LigandMPNN is used as a source checkout, not a
@@ -470,7 +479,8 @@ resolved values. The ones you are most likely to touch:
 | `OUTPUT_ROOT` | `outputs` | Where run directories are created |
 | `MPNN_REPO` | — | LigandMPNN checkout (needs `data_utils.py`, `model_utils.py`) |
 | `MPNN_CHECKPOINT` | `$MPNN_REPO/model_params/proteinmpnn_v_48_020.pt` | Weights |
-| `MPNN_MODEL_TYPE` | `protein_mpnn` | Also `soluble_mpnn`, `ligand_mpnn` |
+| `MPNN_MODEL_TYPE` | `protein_mpnn` | Also `soluble_mpnn`, `ligand_mpnn`; selects the checkpoint |
+| `MPNN_CHECKPOINT` | by model type | Override only to use your own weights |
 | `SEARCH_MODE` | `alphabet_only` | Also `site_aware`, `scaffold_then_site` |
 | `SITE_PRESET` | — | `atp` or `tev`; fills in spec, ligands and model type |
 | `SITE_SPEC` | — | Site in author numbering, e.g. `H46 D81 C151` or `ligand:ATP@4.5` |
@@ -506,7 +516,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all seven suites, 178 tests
+python run_redaa.py --self-test  # all seven suites, 183 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

@@ -67,8 +67,33 @@ def _enforce_fixed(seq: str, fixed: dict[int, str]) -> tuple[str, int]:
     return "".join(chars), moved
 
 
-def _default_checkpoint(repo: str) -> str:
-    return os.path.join(repo, "model_params", "proteinmpnn_v_48_020.pt")
+# Which checkpoint each model type needs.  These are not interchangeable:
+# a ligand_mpnn run loads different weights with a different atom_context_num,
+# so pointing it at the ProteinMPNN file fails at load_state_dict -- and the
+# error ("size mismatch for ...") does not say "wrong checkpoint for this
+# model type", which is the thing you actually need to be told.
+#
+# Taken from LigandMPNN's own run.py argparse defaults, not from memory. Note
+# "solublempnn", with no underscore before mpnn, while its model_type *is*
+# "soluble_mpnn" -- the inconsistency is upstream's and is exactly the sort of
+# thing that gets mistyped.
+DEFAULT_CHECKPOINTS = {
+    "protein_mpnn": "proteinmpnn_v_48_020.pt",
+    "ligand_mpnn": "ligandmpnn_v_32_010_25.pt",
+    "soluble_mpnn": "solublempnn_v_48_020.pt",
+}
+CHECKPOINT_BASE_URL = "https://files.ipd.uw.edu/pub/ligandmpnn"
+
+
+def checkpoint_name(model_type: str) -> str:
+    """Default checkpoint filename for *model_type*."""
+    return DEFAULT_CHECKPOINTS.get(
+        str(model_type).strip(), DEFAULT_CHECKPOINTS["protein_mpnn"]
+    )
+
+
+def _default_checkpoint(repo: str, model_type: str = "protein_mpnn") -> str:
+    return os.path.join(repo, "model_params", checkpoint_name(model_type))
 
 
 class MPNNEngine:
@@ -115,11 +140,34 @@ class MPNNEngine:
 
         self._mods = {"data_utils": data_utils, "model_utils": model_utils}
 
-        ckpt_path = self.cfg.mpnn_checkpoint or _default_checkpoint(repo or ".")
+        model_type = self.cfg.mpnn_model_type
+        ckpt_path = self.cfg.mpnn_checkpoint or _default_checkpoint(
+            repo or ".", model_type
+        )
         if not os.path.isfile(ckpt_path):
             raise RuntimeError(
-                f"LigandMPNN checkpoint not found: {ckpt_path}\n"
-                "Set MPNN_CHECKPOINT, or run LigandMPNN's get_model_params.sh."
+                f"MPNN checkpoint not found: {ckpt_path}\n"
+                f"MPNN_MODEL_TYPE={model_type} needs "
+                f"{checkpoint_name(model_type)}. Download it with\n"
+                f"  wget -O {ckpt_path} "
+                f"{CHECKPOINT_BASE_URL}/{checkpoint_name(model_type)}\n"
+                "or run LigandMPNN's get_model_params.sh, or set "
+                "MPNN_CHECKPOINT explicitly."
+            )
+
+        # A checkpoint whose filename belongs to a different model type is
+        # almost always a mix-up, and the torch error it produces is about
+        # tensor shapes rather than about the mistake. Say so first.
+        expected = checkpoint_name(model_type)
+        basename = os.path.basename(ckpt_path)
+        others = {v for k, v in DEFAULT_CHECKPOINTS.items() if v != expected}
+        if basename in others:
+            raise RuntimeError(
+                f"MPNN_MODEL_TYPE={model_type} needs {expected}, but "
+                f"MPNN_CHECKPOINT points at {basename}, which is another "
+                "model type's weights. These are not interchangeable.\n"
+                f"  wget -O {os.path.join(os.path.dirname(ckpt_path), expected)} "
+                f"{CHECKPOINT_BASE_URL}/{expected}"
             )
 
         self.device = torch.device(
@@ -135,7 +183,6 @@ class MPNNEngine:
         except TypeError:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
 
-        model_type = self.cfg.mpnn_model_type
         self._atom_context_num = int(checkpoint.get("atom_context_num", 1) or 1)
 
         self.model = model_utils.ProteinMPNN(
@@ -347,12 +394,16 @@ class MPNNEngine:
         Those positions are excluded from design three ways over: the chain
         mask tells the model not to redesign them, the bias forbids anything
         else there, and the sampled string is checked and corrected afterwards.
-        The belt-and-braces is deliberate -- ``chain_mask`` semantics have
-        moved between LigandMPNN revisions, and this pipeline cannot verify
-        which one is installed until it runs. If the correction ever has work
-        to do, that is reported once rather than passing silently, because it
-        means the installed revision does not honour the mask as assumed and
-        every score in the run is computed over the wrong set of positions.
+        The convention was checked against LigandMPNN's own source rather
+        than assumed: ``model_utils.py`` decodes
+        ``S_t = S_t * chain_mask_t + S_true_t * (1 - chain_mask_t)``, so 0
+        means "keep the native residue" and 1 means "design here", and
+        ``run.py`` builds its ``--fixed_residues`` mask the same way. The
+        belt-and-braces stays anyway, because that is one revision and the
+        semantics have moved before. If the correction ever has work to do,
+        that is reported once rather than passing silently, because it means
+        the installed revision does not honour the mask as assumed and every
+        score in the run is computed over the wrong set of positions.
 
         Note that scores with *fixed* positions are means over the **designed**
         positions only, since the fixed ones are not predictions. That is the
