@@ -498,11 +498,111 @@ def list_chains(text: str) -> list[ChainInfo]:
     return sorted(infos, key=lambda c: (-c.n_residues, c.chain))
 
 
+
+def _atom_xyz(line: str) -> tuple[float, float, float] | None:
+    try:
+        return (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+    except ValueError:
+        return None
+
+
+def _collect_ligands(
+    text: str,
+    chosen_chain: str,
+    kept_protein_lines: list[str],
+    keep_ligands: tuple[str, ...] | None,
+    cutoff: float,
+) -> tuple[list[str], list[tuple[str, int]], list[str]]:
+    """Pick out the HETATM records worth keeping.
+
+    Returns ``(lines, [(comp_id, n_atoms), ...], notes)``.  Notes name
+    components that were asked for and not found, and copies rejected for
+    sitting too far from the chosen chain -- both are the kind of thing that
+    otherwise shows up much later as an empty binding site.
+    """
+    if not keep_ligands:
+        return [], [], []
+
+    wanted = {c.strip().upper() for c in keep_ligands if c and c.strip()}
+    if not wanted:
+        return [], [], []
+
+    prot_xyz = [
+        xyz for xyz in (_atom_xyz(l) for l in kept_protein_lines) if xyz is not None
+    ]
+
+    groups: dict[tuple[str, str, int, str], list[str]] = {}
+    order: list[tuple[str, str, int, str]] = []
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not line.startswith("HETATM") or len(line) < 54:
+            continue
+        if line[16] not in _OK_ALTLOC:
+            continue
+        resname = line[17:20].strip().upper()
+        if resname not in wanted:
+            continue
+        try:
+            resseq = int(line[22:26])
+        except ValueError:
+            continue
+        key = (resname, line[21], resseq, line[26])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(line.rstrip("\n"))
+
+    cut2 = cutoff * cutoff
+    lines: list[str] = []
+    counts: dict[str, int] = {}
+    notes: list[str] = []
+    rejected: dict[str, int] = {}
+
+    for key in order:
+        resname, chain, resseq, icode = key
+        group = groups[key]
+        if chain != chosen_chain:
+            # A copy on another chain counts only if it actually touches this
+            # one.
+            near = False
+            for line in group:
+                xyz = _atom_xyz(line)
+                if xyz is None:
+                    continue
+                for p in prot_xyz:
+                    dx = xyz[0] - p[0]
+                    dy = xyz[1] - p[1]
+                    dz = xyz[2] - p[2]
+                    if dx * dx + dy * dy + dz * dz <= cut2:
+                        near = True
+                        break
+                if near:
+                    break
+            if not near:
+                rejected[resname] = rejected.get(resname, 0) + 1
+                continue
+        lines.extend(group)
+        counts[resname] = counts.get(resname, 0) + len(group)
+
+    for name, n in sorted(rejected.items()):
+        notes.append(
+            f"{name}: {n} cop{'y' if n == 1 else 'ies'} ignored, further than "
+            f"{cutoff:g} A from chain {chosen_chain}"
+        )
+    for name in sorted(wanted - set(counts)):
+        notes.append(f"{name}: requested but not present in this entry")
+
+    return lines, sorted(counts.items()), notes
+
+
 def prepare(
     text: str,
     out_path: str,
     chain: str | None = None,
     resid_range: tuple[int, int] | None = None,
+    keep_ligands: tuple[str, ...] | None = None,
+    ligand_contact_cutoff: float = 6.0,
 ) -> dict:
     """Write a single-chain, pipeline-ready PDB and report what was dropped.
 
@@ -512,6 +612,19 @@ def prepare(
     any of them is dropped rather than left to produce garbage features.  The
     pre-processed CATH files the MSI runs use were already clean, which is why
     V9 could skip all of this.
+
+    ``keep_ligands`` names heteroatom components to retain -- ``("ATP",)`` and
+    so on.  Everything else, waters included, is still dropped.  Retention is
+    opt-in because a ligand in the file changes what the pipeline does: it is
+    what lets LigandMPNN design against the actual bound molecule instead of a
+    bare backbone, and what lets a binding site be derived from coordinates
+    rather than transcribed by hand.
+
+    A named component is kept if it sits on the chosen chain *or* has any atom
+    within ``ligand_contact_cutoff`` of a kept protein atom.  Both tests are
+    needed: deposition practice puts a bound ligand sometimes on its
+    protein's chain and sometimes on its own, and a copy bound to a different
+    chain of the crystal is not part of this chain's site.
     """
     chains = list_chains(text)
     if not chains:
@@ -570,10 +683,19 @@ def prepare(
     lines: list[str] = []
     for key in complete:
         lines.extend(residues[key])
+
+    ligand_lines, ligands_kept, ligand_notes = _collect_ligands(
+        text, chosen, lines, keep_ligands, ligand_contact_cutoff
+    )
+
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     with open(out_path, "w") as fh:
         fh.write("\n".join(lines))
-        fh.write("\nTER\nEND\n")
+        fh.write("\nTER\n")
+        if ligand_lines:
+            fh.write("\n".join(ligand_lines))
+            fh.write("\n")
+        fh.write("END\n")
 
     # A gap means consecutive kept residues are not consecutive in numbering.
     numbers = [key[0] for key in complete]
@@ -586,6 +708,8 @@ def prepare(
         "dropped_incomplete": dropped,
         "gaps": gaps,
         "chains_available": [(c.chain, c.n_residues) for c in chains],
+        "ligands_kept": ligands_kept,
+        "ligand_notes": ligand_notes,
     }
 
 
@@ -593,6 +717,7 @@ def fetch_and_prepare(
     spec: str | StructureSpec,
     out_dir: str,
     cache_dir: str | None = None,
+    keep_ligands: tuple[str, ...] | None = None,
 ) -> dict:
     """Resolve one spec all the way to a pipeline-ready PDB in *out_dir*.
 
@@ -603,7 +728,10 @@ def fetch_and_prepare(
     raw_path = download(parsed, cache_dir)
     text = read_structure_text(raw_path)
     out_path = os.path.join(out_dir, f"{parsed.name}.pdb")
-    report = prepare(text, out_path, parsed.chain, parsed.resid_range)
+    report = prepare(
+        text, out_path, parsed.chain, parsed.resid_range,
+        keep_ligands=keep_ligands,
+    )
     report["name"] = parsed.name
     report["source"] = parsed.source
     report["spec"] = parsed.raw

@@ -34,7 +34,23 @@ from itertools import combinations
 
 import numpy as np
 
+from . import sites as sitemod
 from . import structure as st
+
+
+def in_alphabet(seq: str, allowed: set[str], exempt: frozenset[int]) -> bool:
+    """Whether every *designable* position of *seq* is inside *allowed*.
+
+    Exempt functional-site positions are skipped. They hold native residues
+    that are usually outside the restricted alphabet -- that is the point of
+    exempting them -- so checking them would reject every design the
+    site-aware search produces.
+    """
+    if not exempt:
+        return set(seq) <= allowed
+    return all(
+        c in allowed for i, c in enumerate(seq) if i not in exempt
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +157,21 @@ class Metrics:
     num_pass_all: int = 0
     successful_folds: int = 0
     total_attempted: int = 0
+    # Site preservation, taken from the best-preserving fold in the set.
+    site_active: bool = False
+    site_bb_rmsd: float | None = None
+    site_local_rmsd: float | None = None
+    site_cb_dev: float | None = None
+    num_site_pass: int = 0
 
-    def rank_key(self) -> tuple[float, float]:
-        """Sort key: highest TM first, then lowest RMSD."""
+    def rank_key(self) -> tuple[float, float, float]:
+        """Sort key: site-preserving candidates first, then TM, then RMSD.
+
+        The leading term is 0 for every candidate when no site is configured,
+        so the ordering is exactly what it was before sites existed.
+        """
         return (
+            float(self.num_site_pass > 0) if self.site_active else 0.0,
             self.max_tm if self.max_tm is not None else -999.0,
             -self.min_rmsd if self.min_rmsd is not None else -999.0,
         )
@@ -157,9 +184,14 @@ class BestSequence:
     rmsd: float | None = None
     tm: float | None = None
     plddt: float | None = None
+    site_bb_rmsd: float | None = None
+    site_local_rmsd: float | None = None
+    site_cb_dev: float | None = None
+    site_ok: bool | None = None
 
-    def rank_key(self) -> tuple[float, float]:
+    def rank_key(self) -> tuple[float, float, float]:
         return (
+            float(bool(self.site_ok)) if self.site_ok is not None else 0.0,
             self.tm if self.tm is not None else 0.0,
             -(self.rmsd if self.rmsd is not None else 999.0),
         )
@@ -178,11 +210,40 @@ class Validation:
 class Validator:
     """Folds candidate sequences and scores them against one reference."""
 
-    def __init__(self, cfg, fold_engine, ref_xyz: np.ndarray, ref_seq: str):
+    def __init__(
+        self,
+        cfg,
+        fold_engine,
+        ref_xyz: np.ndarray,
+        ref_seq: str,
+        site: "sitemod.ResolvedSite | None" = None,
+        ref_frames: np.ndarray | None = None,
+    ):
         self.cfg = cfg
         self.folder = fold_engine
         self.ref_xyz = ref_xyz
         self.ref_seq = ref_seq
+        # When a site is set, every fold additionally gets site geometry
+        # measured against ref_frames, and -- if SITE_GATE is on -- has to
+        # satisfy the site thresholds as well as the TM gate.
+        self.site = site if (site and len(site)) else None
+        self.ref_frames = ref_frames
+        self.exempt: frozenset[int] = frozenset()
+        if self.site is not None and cfg.site_residue_policy == "exempt":
+            self.exempt = frozenset(self.site.indices)
+
+    @property
+    def site_active(self) -> bool:
+        return self.site is not None and self.ref_frames is not None
+
+    def measure(self, seq: str, result) -> "sitemod.SiteMetrics | None":
+        """Site metrics for one fold, or None when no site is configured."""
+        if not self.site_active:
+            return None
+        frames = getattr(result, "site_frames", None)
+        if frames is None:
+            return sitemod.SiteMetrics(n_positions=len(self.site))
+        return sitemod.measure_site(self.site, self.ref_frames, frames, seq)
 
     def validate(
         self,
@@ -209,7 +270,7 @@ class Validator:
         usable = [
             (sc, sq)
             for sc, sq in pairs
-            if sq and sq != native_seq and set(sq) <= allowed
+            if sq and sq != native_seq and in_alphabet(sq, allowed, self.exempt)
         ]
         if not usable:
             if not quiet:
@@ -229,6 +290,7 @@ class Validator:
         tms: list[float] = []
         plddts: list[float] = []
         folded: list[tuple[str, float | None, float | None, float | None]] = []
+        site_metrics: list["sitemod.SiteMetrics | None"] = []
 
         results = self.folder.fold_many(chosen, steps=steps)
         for seq, res in zip(chosen, results):
@@ -242,6 +304,7 @@ class Validator:
             if res.plddt is not None:
                 plddts.append(res.plddt)
             folded.append((seq, rmsd, tm, res.plddt))
+            site_metrics.append(self.measure(seq, res))
 
         if not folded:
             return Validation()
@@ -255,27 +318,72 @@ class Validator:
             max_plddt=max(plddts) if plddts else None,
             successful_folds=len(folded),
             total_attempted=len(chosen),
+            site_active=self.site_active,
         )
 
+        if self.site_active:
+            measured = [m for m in site_metrics if m is not None]
+            bb = [m.bb_rmsd for m in measured if m.bb_rmsd is not None]
+            loc = [m.local_rmsd for m in measured if m.local_rmsd is not None]
+            cb = [m.cb_max_dev for m in measured if m.cb_max_dev is not None]
+            # The best-preserving fold in the set, matching how max_tm and
+            # min_rmsd already report the best rather than the mean.
+            metrics.site_bb_rmsd = min(bb) if bb else None
+            metrics.site_local_rmsd = min(loc) if loc else None
+            metrics.site_cb_dev = min(cb) if cb else None
+
         passed = False
-        for _seq, _rmsd, tm, plddt in folded:
+        site_ok_flags: list[bool | None] = []
+        for idx, (_seq, _rmsd, tm, plddt) in enumerate(folded):
             ok_tm = tm is not None and tm >= self.cfg.min_tm_score
             ok_plddt = True
             if self.cfg.use_plddt_gate:
                 ok_plddt = plddt is None or plddt >= self.cfg.min_plddt_disorder
-            if ok_tm and ok_plddt:
+
+            sm = site_metrics[idx] if idx < len(site_metrics) else None
+            if sm is None:
+                ok_site: bool | None = None
+            else:
+                ok_site = sm.passed(
+                    self.cfg.site_max_bb_rmsd,
+                    self.cfg.site_max_local_rmsd,
+                    self.cfg.site_max_cb_dev,
+                    require_identity=self.cfg.site_require_identity,
+                )
+                if ok_site:
+                    metrics.num_site_pass += 1
+            site_ok_flags.append(ok_site)
+
+            # The site is a gate only when asked for; otherwise the numbers
+            # are recorded and the fold gate alone decides, so a run can be
+            # told "what would the site have done" without changing what the
+            # search accepts.
+            gate_site = True
+            if self.site_active and self.cfg.site_gate:
+                gate_site = bool(ok_site)
+
+            if ok_tm and ok_plddt and gate_site:
                 metrics.num_pass_all += 1
                 passed = True
 
-        top = max(
-            folded,
-            key=lambda item: (
-                item[2] if item[2] is not None else -999.0,
-                -item[1] if item[1] is not None else -999.0,
+        ranked = sorted(
+            range(len(folded)),
+            key=lambda i: (
+                float(bool(site_ok_flags[i])) if self.site_active else 0.0,
+                folded[i][2] if folded[i][2] is not None else -999.0,
+                -folded[i][1] if folded[i][1] is not None else -999.0,
             ),
+            reverse=True,
         )
+        pick = ranked[0]
+        top = folded[pick]
+        sm = site_metrics[pick] if pick < len(site_metrics) else None
         best = BestSequence(
-            sequence=top[0], rmsd=top[1], tm=top[2], plddt=top[3]
+            sequence=top[0], rmsd=top[1], tm=top[2], plddt=top[3],
+            site_bb_rmsd=sm.bb_rmsd if sm else None,
+            site_local_rmsd=sm.local_rmsd if sm else None,
+            site_cb_dev=sm.cb_max_dev if sm else None,
+            site_ok=site_ok_flags[pick],
         )
         return Validation(passed=passed, metrics=metrics, best=best, folded=folded)
 

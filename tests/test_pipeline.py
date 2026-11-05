@@ -39,20 +39,53 @@ def _helix(n):
     return np.stack([2.3 * np.cos(ang), 2.3 * np.sin(ang), 1.5 * t], axis=1)
 
 
-def _write_reference(path, seq=NATIVE):
-    aa1_to_3 = {
-        "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
-        "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
-        "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
-        "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR",
-    }
-    xyz = _helix(len(seq))
+AA1_TO_3 = {
+    "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
+    "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
+    "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
+    "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR",
+}
+
+
+def _backbone(n):
+    """N, CA and C for a synthetic helix.
+
+    The site metrics need a real backbone frame, not just a CA trace, so the
+    reference carries all three.  The CA positions are unchanged from the
+    CA-only version this replaced, which is why the pre-existing fold tests
+    see exactly the same geometry.
+    """
+    ca = _helix(n)
+    nxt = np.vstack([ca[1:], ca[-1] + (ca[-1] - ca[-2])])
+    prv = np.vstack([ca[0] - (ca[1] - ca[0]), ca[:-1]])
+    # Place N towards the previous CA and C towards the next one, at
+    # bond-length scale, so the derived virtual CB points somewhere sensible.
+    n_xyz = ca + 0.46 * (prv - ca) / np.linalg.norm(prv - ca, axis=1, keepdims=True) * 3.2
+    c_xyz = ca + 0.48 * (nxt - ca) / np.linalg.norm(nxt - ca, axis=1, keepdims=True) * 3.2
+    return n_xyz, ca, c_xyz
+
+
+def _write_reference(path, seq=NATIVE, ligand=None):
+    n_xyz, ca, c_xyz = _backbone(len(seq))
     lines = []
-    for i, (aa, (x, y, z)) in enumerate(zip(seq, xyz), start=1):
-        lines.append(
-            f"ATOM  {i:>5d}  CA  {aa1_to_3[aa]} A{i:>4d}    "
-            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00"
-        )
+    serial = 1
+    for i, aa in enumerate(seq):
+        for name, xyz in (("N", n_xyz[i]), ("CA", ca[i]), ("C", c_xyz[i])):
+            lines.append(
+                f"ATOM  {serial:>5d}  {name:<3s} {AA1_TO_3[aa]} A{i + 1:>4d}    "
+                f"{xyz[0]:>8.3f}{xyz[1]:>8.3f}{xyz[2]:>8.3f}  1.00  0.00"
+            )
+            serial += 1
+    lines.append("TER")
+    if ligand:
+        comp, centre, n_atoms = ligand
+        for k in range(n_atoms):
+            xyz = np.asarray(centre) + np.array([0.9 * k, 0.0, 0.0])
+            lines.append(
+                f"HETATM{serial:>5d}  C{k:<2d} {comp:>3s} A{900:>4d}    "
+                f"{xyz[0]:>8.3f}{xyz[1]:>8.3f}{xyz[2]:>8.3f}  1.00  0.00"
+            )
+            serial += 1
     lines.append("END")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -65,6 +98,8 @@ class StubMPNN:
         self.length = length
         self.calls = 0
         self.cfg = cfg
+        self.fixed_seen: list[dict] = []
+        self.ligand_atoms = 0
         # Stands in for a loaded checkpoint; None means load() never ran.
         self.model = object() if loaded else None
 
@@ -77,15 +112,32 @@ class StubMPNN:
     def stats(self):
         return f"{self.calls} stub calls"
 
-    def design(self, _pdb, allowed, num_seq=None, temperature=None, seed=None):
+    def native_sequence(self, _pdb):
+        return NATIVE[: self.length]
+
+    def ligand_atom_count(self, _pdb):
+        return self.ligand_atoms
+
+    def design(
+        self, _pdb, allowed, num_seq=None, temperature=None, seed=None,
+        fixed=None,
+    ):
         self.calls += 1
+        self.fixed_seen.append(dict(fixed or {}))
         allowed = sorted(set(allowed))
         rng = np.random.default_rng(abs(hash(("".join(allowed), seed))) % 2**32)
         n = num_seq or 25
         pairs = []
         for i in range(n):
-            seq = "".join(rng.choice(allowed, size=self.length))
-            pairs.append((1.0 + i * 0.02, seq))
+            chars = list(rng.choice(allowed, size=self.length))
+            # A real LigandMPNN run keeps the native residue wherever the
+            # chain mask says not to design; the stub does the same so the
+            # pipeline's fixed-position handling is exercised rather than
+            # merely called.
+            for pos, aa in (fixed or {}).items():
+                if 0 <= pos < len(chars):
+                    chars[pos] = aa
+            pairs.append((1.0 + i * 0.02, "".join(chars)))
         # Monotone in alphabet size so the baseline-tolerance stop behaves.
         mean = 3.0 - 0.1 * len(allowed)
         return MPNNDesigns(mean, sorted(pairs))
@@ -94,12 +146,20 @@ class StubMPNN:
 class StubFolder:
     """Folds to the reference when the alphabet is sufficient, else garbage."""
 
-    def __init__(self, ref_xyz, cfg=None, loaded=True):
+    def __init__(self, ref_xyz, cfg=None, loaded=True, ref_frames=None,
+                 want_frames=False):
         self.ref = ref_xyz
         self.calls = 0
         self.seen: list[str] = []
         self.cfg = cfg
         self.cache = None
+        # (L, 3, 3) N/CA/C of the reference, so a "correct" fold can hand back
+        # a backbone frame and the site metrics have something to measure.
+        self.ref_frames = ref_frames
+        self.want_frames = want_frames
+        # Sequences the stub should fold correctly in every respect except the
+        # site, used to prove the site gate rejects on its own.
+        self.break_site_for: set[str] = set()
         # Stands in for a loaded model; None means load() never ran.
         self.model = object() if loaded else None
 
@@ -109,21 +169,36 @@ class StubFolder:
     def stats(self):
         return f"{self.calls} stub folds ({len(set(self.seen))} unique)"
 
-    def fold(self, sequence, steps=None):
+    def _frames(self, scale, seed, break_site=False):
+        if self.ref_frames is None or not self.want_frames:
+            return None
+        rng = np.random.default_rng(seed)
+        out = self.ref_frames + rng.normal(scale=scale, size=self.ref_frames.shape)
+        if break_site:
+            # Move a handful of residues a long way without touching the rest,
+            # which is exactly the failure the site gate exists to catch: the
+            # global fold still superposes well, the site does not.
+            out[1:8] += 7.0
+        return out
+
+    def fold(self, sequence, steps=None, want_frames=None):
         self.calls += 1
         self.seen.append(sequence)
         if sequence == NATIVE or REQUIRED <= set(sequence):
             rng = np.random.default_rng(len(sequence))
+            break_site = sequence in self.break_site_for
             return FoldResult(
                 sequence, 88.0, 0.9,
                 self.ref + rng.normal(scale=0.2, size=self.ref.shape),
                 pdb_text="ATOM\nEND\n",
+                frames=self._frames(0.2, len(sequence), break_site),
             )
         rng = np.random.default_rng(abs(hash(sequence)) % 2**32)
         return FoldResult(
             sequence, 42.0, 0.2,
             rng.normal(scale=25.0, size=self.ref.shape),
             pdb_text="ATOM\nEND\n",
+            frames=self._frames(25.0, abs(hash(sequence)) % 2**32),
         )
 
     def fold_many(self, sequences, steps=None):
@@ -144,9 +219,15 @@ class StubPipeline(Pipeline):
         self.run_dir = self.resolve_run_dir()
         os.makedirs(self.run_dir, exist_ok=True)
         self.cache = FoldCache(None, enabled=False)
-        ref_xyz, _ = st.parse_ca_from_file(self.ref_path)
-        self.folder = StubFolder(np.array(ref_xyz))
-        self.mpnn = StubMPNN()
+        ref_xyz, ref_seq = st.parse_ca_from_file(self.ref_path)
+        records = st.parse_residues_from_file(self.ref_path)
+        frames, _valid = st.frames_from_records(records)
+        self.folder = StubFolder(
+            np.array(ref_xyz),
+            ref_frames=frames[:, :3, :],
+            want_frames=self.cfg.site_enabled,
+        )
+        self.mpnn = StubMPNN(length=len(ref_seq))
 
 
 def _make_config(tmp, **over):
@@ -166,10 +247,10 @@ def _make_config(tmp, **over):
     return cfg
 
 
-def _run(tmp, **over):
+def _run(tmp, ligand=None, **over):
     os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
     ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
-    _write_reference(ref)
+    _write_reference(ref, ligand=ligand)
     cfg = _make_config(tmp, **over)
     pipe = StubPipeline(cfg)
     pipe.ref_path = ref
@@ -243,7 +324,11 @@ def test_run_writes_all_expected_artifacts():
             "Mean_TM", "Max_TM", "Mean_pLDDT", "Max_pLDDT",
             "Num_Pass_All", "Successful_Folds", "Total_Attempted",
             "Validation_Status",
+            "Site_BB_RMSD", "Site_Local_RMSD", "Site_CB_Dev", "Num_Site_Pass",
         ]
+        # An alphabet_only run still writes the site columns, left blank, so
+        # one reader handles every mode.
+        assert all(r["Num_Site_Pass"] == "" for r in val)
         assert any(r["Stage"] == "FULL_VALIDATION" for r in val)
         assert any(r["Validation_Status"] == "PASSED" for r in val)
 
@@ -427,7 +512,7 @@ def test_setup_does_not_reuse_an_engine_whose_load_failed():
     built = []
 
     class _Sentinel:
-        def __init__(self, cfg, cache=None):
+        def __init__(self, cfg, cache=None, want_frames=False):
             built.append(type(self).__name__)
             self.cfg = cfg
             self.cache = cache
@@ -465,7 +550,7 @@ def test_setup_reloads_when_the_requested_model_changed():
     built = []
 
     class _Sentinel:
-        def __init__(self, cfg, cache=None):
+        def __init__(self, cfg, cache=None, want_frames=False):
             built.append(cfg.fold_model_id)
             self.cfg = cfg
             self.cache = cache
@@ -503,6 +588,302 @@ def test_plddt_is_rescaled_to_the_zero_to_hundred_convention():
     assert normalise_plddt(87.0) == 87.0
     assert normalise_plddt(1.0) == 100.0
     assert normalise_plddt(None) is None
+
+
+
+
+# ---------------------------------------------------------------------------
+# Functional-site modes
+# ---------------------------------------------------------------------------
+#
+# NATIVE is "ACDEFGHIKLMNPQRSTVWY" repeated, numbered from 1, so residue 2 is
+# C, residue 3 is D and residue 7 is H -- three residues whose identities are
+# all outside the GVL folding alphabet this synthetic problem resolves to.
+# That is the interesting case: the site can only survive if its positions are
+# genuinely exempt from the alphabet restriction.
+
+SITE = "C2 D3 H7"
+SITE_INDICES = {1: "C", 2: "D", 6: "H"}
+
+
+def test_site_aware_mode_holds_the_site_fixed_throughout():
+    with tempfile.TemporaryDirectory(prefix="redaa_siteaware_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        assert code == 0
+
+        # Every MPNN call in a site_aware run carries the fixed positions --
+        # including the 20-residue baseline, so its score is computed over the
+        # same designed positions as the restricted alphabets it is compared
+        # against.
+        assert pipe.mpnn.fixed_seen, "no MPNN calls recorded"
+        assert all(f == SITE_INDICES for f in pipe.mpnn.fixed_seen), (
+            [f for f in pipe.mpnn.fixed_seen if f != SITE_INDICES][:3]
+        )
+
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["search_mode"] == "site_aware"
+        assert row["site_residues"] == "C2+D3+H7"
+        assert row["site_residue_types"] == "CDH"
+        assert row["site_n_positions"] == "3"
+        assert row["site_policy"] == "exempt"
+
+        # The winning sequence really does carry the native site residues.
+        seq = row["best_sequence"]
+        assert seq, "no best sequence"
+        for idx, aa in SITE_INDICES.items():
+            assert seq[idx] == aa, (idx, seq[idx], aa)
+
+        # And the site was measured, not merely declared.
+        assert row["best_seq_site_bb_rmsd"] not in ("", "N/A")
+        assert row["best_seq_site_ok"] == "1"
+
+        val = _read_csv(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/esmfold_validation_log.csv")
+        )
+        measured = [r for r in val if r["Site_BB_RMSD"] not in ("", "N/A")]
+        assert measured, "no site geometry recorded in the validation log"
+
+
+def test_exempt_policy_keeps_site_residues_out_of_the_alphabet():
+    with tempfile.TemporaryDirectory(prefix="redaa_exempt_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="exempt", num_seqs_to_fold=3, prune_folds=1,
+        )
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        # The site's C, D and H are held at their positions without being
+        # letters of the alphabet: the reported alphabet describes the
+        # designable positions only.
+        assert set(row["pruned_alphabet"]) & set("CDH") == set(), row
+        # The folding alphabet is still the one this synthetic problem needs.
+        assert row["pruned_alphabet"] == "GLV", row["pruned_alphabet"]
+
+
+def test_in_alphabet_policy_protects_the_site_residue_types():
+    with tempfile.TemporaryDirectory(prefix="redaa_inalpha_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="in_alphabet", num_seqs_to_fold=3,
+            prune_folds=1,
+        )
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["site_policy"] == "in_alphabet"
+        # Under this policy the alphabet has to be one a real protein could be
+        # written in, so the site's residue types are in it and survive
+        # pruning.
+        for aa in "CDH":
+            assert aa in row["final_alphabet"], (aa, row["final_alphabet"])
+            assert aa in row["pruned_alphabet"], (aa, row["pruned_alphabet"])
+
+
+def test_scaffold_then_site_searches_blind_then_grafts():
+    with tempfile.TemporaryDirectory(prefix="redaa_graft_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="scaffold_then_site", site_spec=SITE,
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        assert code == 0
+
+        # The search itself was blind to the site; only the graft phase fixes
+        # positions. Both facts have to hold, or the mode is not what it says.
+        assert any(f == {} for f in pipe.mpnn.fixed_seen), "search was not blind"
+        assert any(f == SITE_INDICES for f in pipe.mpnn.fixed_seen), (
+            "graft phase never fixed the site"
+        )
+        # Blind calls come first.
+        first_fixed = next(
+            i for i, f in enumerate(pipe.mpnn.fixed_seen) if f
+        )
+        assert all(f == {} for f in pipe.mpnn.fixed_seen[:first_fixed])
+
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["search_mode"] == "scaffold_then_site"
+        assert row["graft_start_alphabet"], row
+        assert row["graft_final_alphabet"], row
+        assert row["graft_passed"] in ("0", "1")
+        assert row["graft_direct_pass"] in ("0", "1")
+        assert int(row["graft_final_size"]) >= int(row["graft_start_size"])
+
+        val = _read_csv(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/esmfold_validation_log.csv")
+        )
+        assert any(r["Stage"].startswith("GRAFT") for r in val), (
+            sorted({r["Stage"] for r in val})
+        )
+        build = _read_csv(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/alphabet_building_log.csv")
+        )
+        assert any(r["Stage"] == "GRAFT" for r in build)
+
+
+def test_alphabet_only_mode_is_unchanged_by_the_site_machinery():
+    with tempfile.TemporaryDirectory(prefix="redaa_blind_") as tmp:
+        pipe, code = _run(tmp)
+        assert code == 0
+        assert all(f == {} for f in pipe.mpnn.fixed_seen)
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["search_mode"] == "alphabet_only"
+        assert row["site_residues"] == ""
+        assert row["best_seq_site_ok"] == ""
+        assert row["pruned_alphabet"] == "GLV"
+
+
+def test_site_gate_rejects_a_fold_that_folds_but_breaks_the_site():
+    """The gate has to be able to fail on site geometry alone.
+
+    The stub folds these sequences correctly in every global sense -- the CA
+    trace still superposes on the reference -- while displacing the site
+    residues. Only a site-specific check can tell the difference, which is
+    the entire reason the site metrics exist.
+    """
+    from redaa import sites as sitemod
+    from redaa import structure as st
+    from redaa.search import Validator
+
+    with tempfile.TemporaryDirectory(prefix="redaa_gate_") as tmp:
+        ref = os.path.join(tmp, "ref.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+        ref_xyz, ref_seq = st.parse_ca_from_file(ref)
+        records = st.parse_residues_from_file(ref, atom_names=None,
+                                              include_hetatm=True)
+        frames, _ = st.frames_from_records(records)
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+        assert site.indices == (1, 2, 6)
+
+        folder = StubFolder(
+            np.array(ref_xyz), ref_frames=frames[:, :3, :], want_frames=True
+        )
+        good = "G" * len(ref_seq)
+        design = list(good)
+        for idx, aa in SITE_INDICES.items():
+            design[idx] = aa
+        for i, aa in enumerate("VL"):
+            design[50 + i] = aa          # satisfy the folder's GVL rule
+        design = "".join(design)
+        pairs = [(1.0, design)]
+
+        v = Validator(cfg, folder, np.array(ref_xyz), ref_seq,
+                      site=site, ref_frames=frames)
+
+        # Site intact -> passes.
+        ok = v.validate(set("GVL"), pairs, 1)
+        assert ok.passed, ok.metrics
+        assert ok.metrics.num_site_pass == 1
+        assert ok.best.site_ok is True
+
+        # Same fold, site displaced -> fails, and fails on the site.
+        folder.break_site_for = {design}
+        folder.cache = None
+        bad = v.validate(set("GVL"), pairs, 1)
+        assert not bad.passed, bad.metrics
+        assert bad.metrics.num_site_pass == 0
+        assert bad.metrics.max_tm is not None and bad.metrics.max_tm > 0.4, (
+            "the global fold should still look fine; that is the point"
+        )
+        assert bad.metrics.site_bb_rmsd > cfg.site_max_bb_rmsd
+
+        # With the gate switched off the same fold is accepted, and the site
+        # numbers are still recorded.
+        cfg.site_gate = False
+        reported = v.validate(set("GVL"), pairs, 1)
+        assert reported.passed
+        assert reported.metrics.site_bb_rmsd is not None
+
+
+def test_exempt_positions_do_not_make_designs_look_out_of_alphabet():
+    """Without this, every site-aware design would be discarded.
+
+    The in-alphabet filter rejects sequences containing residues outside the
+    current alphabet. A site held at its native identity is outside it by
+    construction, so the filter has to skip exempt positions.
+    """
+    from redaa.search import in_alphabet
+
+    seq = "GGCGGGG"
+    assert not in_alphabet(seq, set("G"), frozenset())
+    assert in_alphabet(seq, set("G"), frozenset({2}))
+    assert not in_alphabet(seq, set("G"), frozenset({3}))
+
+
+def test_numbering_mismatch_aborts_the_domain_instead_of_guessing():
+    with tempfile.TemporaryDirectory(prefix="redaa_mismatch_") as tmp:
+        # Residue 2 is C, not H.
+        pipe, code = _run(tmp, search_mode="site_aware", site_spec="H2")
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"].startswith("skipped_site_unresolved"), row["status"]
+        assert "numbering" in row["status"].lower()
+        # No replicate ran.
+        assert not os.path.exists(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/COMPLETED")
+        )
+
+
+def test_site_that_resolves_to_nothing_is_skipped():
+    with tempfile.TemporaryDirectory(prefix="redaa_empty_") as tmp:
+        pipe, code = _run(tmp, search_mode="site_aware", site_spec="999")
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"] == "skipped_site_empty", row["status"]
+
+
+def test_mpnn_residue_order_disagreement_is_fatal():
+    """A silent index mismatch here would fix the wrong residues.
+
+    The site layer and MPNN parse the same file independently. If they
+    disagree about residue order, every fixed position is wrong and the run
+    still completes, so the pipeline compares the two sequences up front.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_order_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+
+        class ReorderedMPNN(StubMPNN):
+            def native_sequence(self, _pdb):
+                base = NATIVE[: self.length]
+                return base[::-1]
+
+        class P(StubPipeline):
+            def setup(self):
+                super().setup()
+                self.mpnn = ReorderedMPNN(length=len(NATIVE))
+
+        pipe = P(cfg)
+        pipe.ref_path = ref
+        code = pipe.run()
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"].startswith("skipped_site_unresolved"), row["status"]
+        assert "orders this structure's residues differently" in row["status"]
+
+
+def test_ligand_derived_site_resolves_through_the_pipeline():
+    with tempfile.TemporaryDirectory(prefix="redaa_lig_") as tmp:
+        # A ligand parked beside the helix at the residue-3 end.
+        n_xyz, ca, c_xyz = _backbone(len(NATIVE))
+        centre = tuple(ca[2] + np.array([0.0, 2.2, 0.0]))
+        pipe, code = _run(
+            tmp, ligand=("ATP", centre, 4),
+            search_mode="site_aware", site_spec="ligand:ATP@5.0",
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"] not in ("skipped_site_empty",), row["status"]
+        assert int(row["site_n_positions"]) >= 1, row
+        assert "ligand:ATP@5" in row["site_spec"], row["site_spec"]
+        # Whatever the shell turned out to be, those positions were fixed.
+        fixed = [f for f in pipe.mpnn.fixed_seen if f]
+        assert fixed, "ligand-derived site never reached MPNN"
+        assert all(f == fixed[0] for f in fixed)
 
 
 def main():

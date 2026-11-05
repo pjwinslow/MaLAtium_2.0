@@ -100,6 +100,7 @@ def main(argv=None) -> int:
             test_notebook,
             test_pipeline,
             test_search,
+            test_sites,
             test_structure,
         )
 
@@ -108,6 +109,7 @@ def main(argv=None) -> int:
             ("structural metrics", test_structure),
             ("search and chemistry", test_search),
             ("fetching and input prep", test_fetch),
+            ("functional sites", test_sites),
             ("colab helpers", test_colab),
             ("colab notebook", test_notebook),
             ("pipeline orchestration", test_pipeline),

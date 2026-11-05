@@ -13,6 +13,44 @@ from dataclasses import dataclass, field, fields
 
 ALL_AAS = tuple("ACDEFGHIKLMNPQRSTVWY")
 
+# How the search treats a functional site.
+#
+#   ALPHABET_ONLY       the original search: fold only, no site.
+#   SCAFFOLD_THEN_SITE  find the minimal folding alphabet first, blind to the
+#                       site, then graft the site in and ask what it cost.
+#                       Answers "is the minimal scaffold alphabet compatible
+#                       with this site at all?"
+#   SITE_AWARE          hold the site fixed from the first round, so every
+#                       alphabet is judged on fold *and* site together.
+#                       Answers "what is the minimal alphabet for a protein
+#                       that still has this site?"
+#
+# They can disagree, and that disagreement is the interesting result: a
+# scaffold alphabet found without the site is free to use the positions the
+# site needs for folding, and grafting the site back then breaks the fold.
+MODE_ALPHABET_ONLY = "alphabet_only"
+MODE_SCAFFOLD_THEN_SITE = "scaffold_then_site"
+MODE_SITE_AWARE = "site_aware"
+SEARCH_MODES = (MODE_ALPHABET_ONLY, MODE_SCAFFOLD_THEN_SITE, MODE_SITE_AWARE)
+
+# Whether the site's residue types have to be inside the reported alphabet.
+#
+#   EXEMPT       site positions are held at native identity and are not
+#                counted as alphabet letters. A result reads "5 letters plus
+#                6 exempt positions". This is the right framing when the
+#                question is about the folding alphabet and the site is
+#                treated as machinery bolted onto it.
+#   IN_ALPHABET  the site's residue types are forced into the alphabet and
+#                protected from pruning, so the reported alphabet is one a
+#                real protein could be written in end to end.
+#
+# EXEMPT is the default because it keeps the folding question clean, but it
+# can flatter a result, so the number of exempt positions and their residue
+# types are always reported alongside the alphabet.
+POLICY_EXEMPT = "exempt"
+POLICY_IN_ALPHABET = "in_alphabet"
+SITE_POLICIES = (POLICY_EXEMPT, POLICY_IN_ALPHABET)
+
 # Every environment variable this module reads. Exported so a caller can
 # report the settings actually in effect without pattern-matching os.environ
 # and picking up unrelated variables.
@@ -30,7 +68,11 @@ ENV_VARS = (
     "NUM_SEQS_TO_FOLD", "OUTPUT_ROOT", "PRUNE_FOLDS",
     "PRUNING_DOWNWARD_CLOSURE", "PRUNING_MIN_SIZE", "RESUME_FROM",
     "RUN_NAME", "SAVE_FOLD_PDBS", "SCREEN_FOLDS_STAGE1",
-    "SCREEN_FOLDS_STAGE2", "SCREEN_STAGE2_KEEP", "USE_FOLD_CACHE",
+    "SCREEN_FOLDS_STAGE2", "SCREEN_STAGE2_KEEP", "SEARCH_MODE",
+    "SITE_CHAIN", "SITE_CONTACT_MAX", "SITE_GATE", "SITE_KEEP_LIGANDS",
+    "SITE_MAX_BB_RMSD", "SITE_MAX_CB_DEV", "SITE_MAX_LOCAL_RMSD",
+    "SITE_PRESET", "SITE_REQUIRE_IDENTITY", "SITE_RESIDUE_POLICY",
+    "SITE_SPEC", "USE_FOLD_CACHE",
     "USE_HYDROPHOBIC_SEEDING", "USE_PLDDT_GATE", "USE_TORCH_COMPILE",
 )
 
@@ -156,6 +198,43 @@ class RedAAConfig:
         default_factory=lambda: _env_float("MAX_IDENTITY_FOR_FOLD", 0.70)
     )
 
+    # ---------------- functional site ----------------
+    search_mode: str = field(
+        default_factory=lambda: _env_str("SEARCH_MODE", MODE_ALPHABET_ONLY)
+    )
+    # A named test case (see redaa.sites.PRESETS): fills in the structure, the
+    # site spec, which ligands to keep and the MPNN model type in one go.
+    site_preset: str = field(default_factory=lambda: _env_str("SITE_PRESET", ""))
+    # Author-numbering site spec, e.g. "H46 D81 C151" or "ligand:ATP@4.5".
+    site_spec: str = field(default_factory=lambda: _env_str("SITE_SPEC", ""))
+    site_chain: str = field(default_factory=lambda: _env_str("SITE_CHAIN", ""))
+    site_keep_ligands: str = field(
+        default_factory=lambda: _env_str("SITE_KEEP_LIGANDS", "")
+    )
+    # Cap on a ligand-derived contact shell, closest residues first. 0 keeps
+    # the whole shell.
+    site_contact_max: int = field(
+        default_factory=lambda: _env_int("SITE_CONTACT_MAX", 0)
+    )
+    site_residue_policy: str = field(
+        default_factory=lambda: _env_str("SITE_RESIDUE_POLICY", POLICY_EXEMPT)
+    )
+    # Site-preservation thresholds, in Angstroms. Set any of them to 0 to
+    # record the number without gating on it.
+    site_gate: bool = field(default_factory=lambda: _env_bool("SITE_GATE", True))
+    site_max_bb_rmsd: float = field(
+        default_factory=lambda: _env_float("SITE_MAX_BB_RMSD", 1.5)
+    )
+    site_max_local_rmsd: float = field(
+        default_factory=lambda: _env_float("SITE_MAX_LOCAL_RMSD", 1.0)
+    )
+    site_max_cb_dev: float = field(
+        default_factory=lambda: _env_float("SITE_MAX_CB_DEV", 1.5)
+    )
+    site_require_identity: bool = field(
+        default_factory=lambda: _env_bool("SITE_REQUIRE_IDENTITY", True)
+    )
+
     # ---------------- acceptance ----------------
     min_tm_score: float = field(default_factory=lambda: _env_float("MIN_TM_SCORE", 0.51))
     use_plddt_gate: bool = field(
@@ -210,6 +289,41 @@ class RedAAConfig:
         default_factory=lambda: _env_int("MAX_WALL_SECONDS", 0)
     )
     test_mode: bool = False
+
+    # -- derived -------------------------------------------------------
+    @property
+    def site_enabled(self) -> bool:
+        return self.search_mode in (MODE_SCAFFOLD_THEN_SITE, MODE_SITE_AWARE)
+
+    @property
+    def keep_ligand_tuple(self) -> tuple[str, ...]:
+        raw = (self.site_keep_ligands or "").replace(",", " ").split()
+        return tuple(dict.fromkeys(x.strip().upper() for x in raw if x.strip()))
+
+    def validate(self) -> list[str]:
+        """Return a list of configuration problems, empty if all is well."""
+        problems: list[str] = []
+        if self.search_mode not in SEARCH_MODES:
+            problems.append(
+                f"SEARCH_MODE={self.search_mode!r} is not one of "
+                f"{', '.join(SEARCH_MODES)}"
+            )
+        if self.site_residue_policy not in SITE_POLICIES:
+            problems.append(
+                f"SITE_RESIDUE_POLICY={self.site_residue_policy!r} is not one "
+                f"of {', '.join(SITE_POLICIES)}"
+            )
+        if self.site_enabled and not (self.site_spec or self.site_preset):
+            problems.append(
+                f"SEARCH_MODE={self.search_mode} needs a site: set SITE_SPEC "
+                "or SITE_PRESET"
+            )
+        if (self.site_spec or self.site_preset) and not self.site_enabled:
+            problems.append(
+                "a site was given but SEARCH_MODE=alphabet_only, so it would "
+                "be ignored; set SEARCH_MODE=site_aware or scaffold_then_site"
+            )
+        return problems
 
     def apply_test_mode(self) -> None:
         """Shrink every budget for a ~5 minute single-domain smoke test."""
