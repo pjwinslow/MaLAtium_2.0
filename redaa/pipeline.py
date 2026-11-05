@@ -1061,6 +1061,25 @@ class Pipeline:
             )
             return
 
+        # A site-aware run measures site geometry from the predicted backbone
+        # frame. If this model's output does not carry one, every site number
+        # for every sequence would be blank and -- with the gate on -- every
+        # candidate would fail for a reason that has nothing to do with the
+        # science. Catch it here, once, on the one fold we already had to do.
+        if site is not None and getattr(native, "frames", None) is None:
+            print(
+                "  SKIPPING: "
+                f"{cfg.fold_model_id} returned no N/CA/C backbone for the "
+                "native sequence, so site geometry cannot be measured.\n"
+                "    Either use a model whose result_to_pdb writes full "
+                "backbone atoms, or run with SEARCH_MODE=alphabet_only."
+            )
+            self.results.append(
+                {"pdb": domain, "replicate": 0,
+                 "status": "skipped_no_backbone_frames_for_site"}
+            )
+            return
+
         nat_rmsd, nat_tm = st.compare(ref_xyz, ref_seq, native.ca, native_seq)
         print(
             f"  native fold: pLDDT={_fmt(native.plddt, '0.1f')} "

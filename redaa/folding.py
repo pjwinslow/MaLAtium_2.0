@@ -110,6 +110,9 @@ class FoldEngine:
         # every fold in the run carries the backbone frame the site metrics
         # need without each caller opting in.
         self.want_frames = bool(want_frames)
+        # Set if the model's output turns out to have no backbone frame, so
+        # the warning is printed once rather than per fold.
+        self.frames_unavailable = False
         self.cache = cache if cache is not None else FoldCache(None, enabled=False)
         self.verbose = verbose
         self.model = None
@@ -337,10 +340,24 @@ class FoldEngine:
             frames = full[:, :3, :]
             ca = full[:, 1, :]
             if not valid.any():
-                print("    ESMFold2 output had no usable backbone frame")
-                return None
-            ca = ca[valid]
-            frames = frames[valid]
+                # The model returned coordinates but no complete N-CA-C for
+                # any residue. Failing every fold from here would bury the
+                # cause under thousands of identical messages, so fall back to
+                # the CA trace -- the fold gate still works -- and say once
+                # that site geometry is not measurable. The pipeline checks
+                # this after the native fold and stops there.
+                if not self.frames_unavailable:
+                    self.frames_unavailable = True
+                    print(
+                        "    WARNING: this model's PDB output carries no "
+                        "N/CA/C backbone, so functional-site geometry cannot "
+                        "be measured from it. Falling back to the CA trace."
+                    )
+                frames = None
+                ca, _ = st.parse_ca_from_text(pdb_text)
+            else:
+                ca = ca[valid]
+                frames = frames[valid]
         else:
             ca, _ = st.parse_ca_from_text(pdb_text)
         if len(ca) < 3:

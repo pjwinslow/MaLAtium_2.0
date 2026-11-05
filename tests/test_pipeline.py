@@ -886,6 +886,39 @@ def test_ligand_derived_site_resolves_through_the_pipeline():
         assert all(f == fixed[0] for f in fixed)
 
 
+def test_site_run_stops_early_if_the_model_has_no_backbone_frames():
+    """One clear failure, not thousands of blank site columns.
+
+    If the folding model's PDB output carries no N/CA/C, site geometry is
+    unmeasurable -- and with the gate on, every candidate would fail for a
+    reason unrelated to the science. The native fold is already paid for, so
+    that is where this gets caught.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_noframes_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+
+        class CaOnlyPipeline(StubPipeline):
+            def setup(self):
+                super().setup()
+                # A model that returns coordinates but no backbone frame.
+                self.folder.ref_frames = None
+                self.folder.want_frames = True
+
+        pipe = CaOnlyPipeline(cfg)
+        pipe.ref_path = ref
+        code = pipe.run()
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"] == "skipped_no_backbone_frames_for_site", row["status"]
+        # It stopped before burning a replicate on it.
+        assert not os.path.exists(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/COMPLETED")
+        )
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
