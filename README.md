@@ -1,7 +1,8 @@
 # RedAA finder — minimal amino-acid alphabet search
 
 Finds the smallest amino-acid alphabet from which MPNN can design sequences
-that fold back onto a reference crystal structure.
+that fold back onto a reference crystal structure — optionally while keeping a
+binding site or catalytic residues intact.
 
 This is a rewrite of `New_V9_619.py` that swaps both model components and
 restructures the search so it runs well on MSI GPUs:
@@ -90,8 +91,9 @@ you can see what the cleaning did.
 
 ## Running on Colab
 
-Open `colab/RedAA_Colab.ipynb` (Runtime → Change runtime type → GPU). Seven
-cells: install, GPU check, Drive, inputs, settings, run, results.
+Open `colab/RedAA_Colab.ipynb` (Runtime → Change runtime type → GPU). Nine
+steps: install, GPU check, Drive, inputs, **mode and site**, settings, run,
+results, diagnose.
 
 What it handles that the batch job does not need to:
 
@@ -105,7 +107,7 @@ What it handles that the batch job does not need to:
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
   checkpointed and every fold is cached, so re-running after a disconnect
   resumes; without Drive it starts over.
-- **Every run leaves one attachable report.** Step 6 tees its output to
+- **Every run leaves one attachable report.** Step 7 tees its output to
   `<outputs>/../logs/run_*.log` and writes `report_*.txt` beside it — whether
   the run finishes or crashes, with the traceback included. That file carries
   the environment, the resolved settings, the results so far and the console
@@ -117,10 +119,10 @@ What it handles that the batch job does not need to:
   reliable multi-gigabyte writes, so a model cached there fails to load with
   `SafetensorError: Error while deserializing header: header too large`.
   Only outputs and the fold cache go to Drive; re-downloading weights after a
-  restart is the cheaper problem. Step 8's `REPAIR_HF_CACHE` validates every
+  restart is the cheaper problem. Step 9's `REPAIR_HF_CACHE` validates every
   cached weight file's header and deletes the broken ones.
 - **Changing the GPU type restarts the runtime**, so switching T4 → A100 wipes
-  `/content` like any other restart and Step 1 has to run again. Step 8 of the
+  `/content` like any other restart and Step 1 has to run again. Step 9 of the
   notebook (`rc.print_diagnosis()`) reports the environment, every package
   version, the resolved settings and a pass/fail list naming the fix for each
   problem — start there when a run fails.
@@ -147,6 +149,15 @@ re-run it rather than hand-editing the JSON.
 ```bash
 pip install -r requirements.txt
 ```
+
+**Checkpoints are per model type and are not interchangeable.** `protein_mpnn`
+loads `proteinmpnn_v_48_020.pt`, `ligand_mpnn` loads
+`ligandmpnn_v_32_010_25.pt` and `soluble_mpnn` loads `solublempnn_v_48_020.pt`
+(no underscore before `mpnn` — that is upstream's spelling). Leave
+`MPNN_CHECKPOINT` unset and the engine picks the right one from
+`MPNN_MODEL_TYPE`; pointing a `ligand_mpnn` run at the ProteinMPNN file fails
+at load with a tensor-shape error that never mentions the checkpoint, so that
+case is detected and named explicitly.
 
 `tmtools` is optional but recommended: it provides exact TM-align. Without it
 the pipeline falls back to its own seed-refined TM-score, which agrees closely
@@ -280,6 +291,183 @@ largest wins and cannot be measured without the real models.
 
 ---
 
+## Preserving binding sites and catalytic residues
+
+A minimal folding alphabet is not a protein. The residues that do the work —
+a catalytic cysteine, the arginines that grip a triphosphate — are exactly the
+ones a five-letter alphabet discards, and a catalytic cysteine has no
+substitute. `SEARCH_MODE` adds the second question: the smallest alphabet that
+folds **and** keeps the site.
+
+### The two modes answer different questions
+
+| `SEARCH_MODE` | question |
+|---|---|
+| `alphabet_only` | What is the smallest alphabet that folds? (the original search) |
+| `site_aware` | What is the smallest alphabet for a protein that *still has this site*? |
+| `scaffold_then_site` | Is the minimal folding alphabet compatible with this site — and if not, what did the site cost? |
+
+`site_aware` fixes the site's positions from round zero, so every candidate
+alphabet is judged on fold and site together. `scaffold_then_site` runs the
+original site-blind search, then grafts the site back on; if that breaks the
+fold it grows the alphabet until it holds, and reports how many letters the
+site cost.
+
+They can disagree, and **the disagreement is the result worth having**: a
+site-blind search is free to spend the site's positions on folding, so the
+graft can fail where `site_aware` would have routed around the problem. Run
+both on the same domain and the difference is a direct measure of how much the
+function constrains the alphabet.
+
+### Writing a site spec
+
+In author (PDB) numbering — the numbering in the paper and in the entry.
+`redaa/sites.py` is the only code that speaks it, and converts once, against
+the *prepared* file, since preparation drops residues with incomplete
+backbones and that shifts every later index.
+
+| token | meaning |
+|---|---|
+| `H46 D81 C151` | those residues, asserted to be His/Asp/Cys |
+| `46` | residue 46, identity not asserted |
+| `A/H46`, `A:46` | an explicit chain |
+| `46A` | an insertion code |
+| `range:148-151` | an inclusive span |
+| `ligand:ATP` | every residue within 4.5 Å of any ATP atom |
+| `ligand:ATP@6.0` | the same at a 6 Å cutoff |
+
+Naming the expected residue is optional and worth doing every time: it turns a
+numbering mismatch into an error instead of a silently wrong run. Naming a
+*ligand* derives the pocket from coordinates, which beats transcribing a list
+and is specific to the structure in hand. A ligand has to survive cleaning
+first — `SITE_KEEP_LIGANDS=ATP`, or `--preset atp`, since everything
+heteroatom is stripped by default.
+
+```bash
+# See the two verified test cases
+python run_redaa.py --list-presets
+
+# Fetch one and look at the site before spending any GPU time
+python run_redaa.py --preset tev --fetch-only --input-dir ./inputs
+python run_redaa.py --preset tev --preview-site --input-dir ./inputs
+
+# Then run it
+SEARCH_MODE=site_aware python run_redaa.py --preset tev --input-dir ./inputs
+SEARCH_MODE=scaffold_then_site python run_redaa.py --preset atp --input-dir ./inputs
+```
+
+`--preview-site` is worth making a habit. A site spec is the one setting that
+can be wrong in a way the run does not notice — right numbering for a
+different entry, a ligand stripped during cleaning, a contact shell that
+swallowed half the protein — and all of it is visible in a second against the
+actual file.
+
+### Do the site's residues count as alphabet letters?
+
+`SITE_RESIDUE_POLICY` decides, and the two answers are both publishable
+framings of different claims:
+
+- **`exempt`** (default) — site positions are held at native identity and are
+  *not* alphabet letters. A result reads "5 letters plus 6 exempt positions".
+  Keeps the folding question clean.
+- **`in_alphabet`** — the site's residue types are forced into the alphabet
+  and protected from pruning, so the reported alphabet is one a real protein
+  could be written in end to end.
+
+`exempt` can flatter a result — a "3-letter alphabet" with twenty exempt
+positions is not a 3-letter protein — so the exempt count and residue types
+are always reported beside the alphabet, and a site covering more than a
+quarter of the chain warns.
+
+### How preservation is measured
+
+On the **backbone frame**, with CB *derived* from N–CA–C rather than read.
+That is deliberate: it works for glycine, it does not depend on a predicted
+rotamer (the least reliable part of any folding model's output) or on which
+altloc a crystal listed first, and it treats reference and prediction
+identically — so a deviation means the backbone moved, not that two side
+chains were modelled differently. It is the convention motif-scaffolding work
+uses, and it is why these numbers are comparable between a crystal structure
+and an ESMFold2 model.
+
+| column | superposition | answers |
+|---|---|---|
+| `Site_BB_RMSD` | whole structure | is the site in the right *place*? |
+| `Site_Local_RMSD` | site only | is the site's internal *geometry* intact? |
+| `Site_CB_Dev` | none | worst error in the site's internal CB–CB distance matrix |
+
+A site can pass one and fail another, and which one fails tells you what
+happened — a correctly-shaped site in the wrong place is a different failure
+from a site that has been pulled apart. All three are rigid-body invariant and
+all three are recorded whether or not they gate (`SITE_GATE=0` records without
+gating).
+
+**These are a necessary condition, not a sufficient one.** They say the
+scaffold puts the functional residues where they belong. Whether the chemistry
+works is a wet-lab question, and nothing here predicts catalysis.
+
+### What LigandMPNN is given
+
+With `MPNN_MODEL_TYPE=ligand_mpnn` and a retained ligand, design is conditioned
+on the actual bound molecule's atoms. Atom context is switched on exactly when
+the checkpoint is a ligand model: enabling it for `protein_mpnn` would ask the
+network for a tensor it was never trained to read, and leaving it off for
+`ligand_mpnn` would load ligand-aware weights and then hide the ligand from
+them — the more insidious mistake, because it still runs. A `ligand_mpnn` run
+on an input with no ligand atoms says so.
+
+Site positions are held fixed three ways over: the chain mask tells the model
+not to redesign them, the bias vector forbids anything else there, and the
+sampled sequence is checked and corrected afterwards. The belt-and-braces is
+deliberate — `chain_mask` semantics have moved between LigandMPNN revisions
+and the installed one cannot be checked until it runs. If the correction ever
+has work to do it is reported rather than passing silently, because it means
+MPNN scores in that run are means over a different position set than intended.
+
+### The verified test cases
+
+Both were checked by computing them from the deposited coordinates, not taken
+from memory.
+
+| preset | structure | site | notes |
+|---|---|---|---|
+| `atp` | `5etn_A` — *E. coli* HPPK, 1.4 Å, 159 residues | `ligand:ATP@4.5` → 17 residues | **Monomeric**, which is the whole reason for this choice |
+| `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
+
+**Why 5ETN and not an obvious small ATP protein.** The small, high-resolution
+single-chain ATP structures that a search turns up first — PII/SbtB, `6MM2`
+and `2XBP` — are **trimers whose ATP pocket sits between subunits**. A
+single-chain design can never reconstitute that site, so they are the wrong
+test case however convenient they look. 5ETN is monomeric, so its pocket is
+complete within the one chain being designed. Its 4.5 Å shell computes to 17
+residues, including the R82/R84/R92/R110/R121 cluster on the triphosphate. The
+entry also holds a pterin analogue (5RX) and Ca/Na — the divalent site is Ca
+here, not the physiological Mg — and none of them are part of the ATP pocket,
+so none are kept.
+
+**TEV numbering.** Chain A of 1LVM runs −8..221; −8..−1 is a `GHHHHHHH`
+purification tag, which would fold as a floppy terminus and drag the native
+round-trip down for no scientific reason, so the preset takes 1–221 (221
+residues, no gaps). In the deposited file His46 ND1–Asp81 OD2 is 3.09 Å and
+His46 NE2–Cys151 SG is 4.02 Å, so the triad is intact and the numbering is the
+one the spec is written against. Chains C/D/E are product peptide, not
+protease.
+
+### What the run refuses to do
+
+Three things are checked before any search starts, because each would
+otherwise produce a run that completes normally and means nothing:
+
+- a spec whose asserted residue identities do not match the structure is
+  **fatal**, not a warning — it means the numbering is not what the spec was
+  written against;
+- MPNN's residue order is compared against the site layer's, since a
+  disagreement would fix the wrong residues at every position;
+- a site position whose reference backbone is incomplete is **unmeasurable**
+  rather than silently passing.
+
+---
+
 ## Configuration
 
 Everything is environment-driven; `python run_redaa.py --print-config` shows
@@ -291,7 +479,20 @@ resolved values. The ones you are most likely to touch:
 | `OUTPUT_ROOT` | `outputs` | Where run directories are created |
 | `MPNN_REPO` | — | LigandMPNN checkout (needs `data_utils.py`, `model_utils.py`) |
 | `MPNN_CHECKPOINT` | `$MPNN_REPO/model_params/proteinmpnn_v_48_020.pt` | Weights |
-| `MPNN_MODEL_TYPE` | `protein_mpnn` | Also `soluble_mpnn`, `ligand_mpnn` |
+| `MPNN_MODEL_TYPE` | `protein_mpnn` | Also `soluble_mpnn`, `ligand_mpnn`; selects the checkpoint |
+| `MPNN_CHECKPOINT` | by model type | Override only to use your own weights |
+| `SEARCH_MODE` | `alphabet_only` | Also `site_aware`, `scaffold_then_site` |
+| `SITE_PRESET` | — | `atp` or `tev`; fills in spec, ligands and model type |
+| `SITE_SPEC` | — | Site in author numbering, e.g. `H46 D81 C151` or `ligand:ATP@4.5` |
+| `SITE_CHAIN` | — | Default chain for spec tokens that do not name one |
+| `SITE_KEEP_LIGANDS` | — | Components to retain through cleaning, e.g. `ATP` |
+| `SITE_CONTACT_MAX` | `0` (all) | Cap a ligand contact shell, closest first |
+| `SITE_RESIDUE_POLICY` | `exempt` | Or `in_alphabet` |
+| `SITE_GATE` | `1` | `0` records site metrics without gating on them |
+| `SITE_MAX_BB_RMSD` | `1.5` | Å, site backbone after global superposition; `0` disables |
+| `SITE_MAX_LOCAL_RMSD` | `1.0` | Å, site backbone after site-only superposition |
+| `SITE_MAX_CB_DEV` | `1.5` | Å, worst site CB–CB distance error |
+| `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
 | `FOLD_STEPS_SCREEN` | `50` | Diffusion steps for screening folds |
 | `FOLD_STEPS_FINAL` | `200` | Diffusion steps for reported folds |
@@ -315,13 +516,15 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all six suites, 114 tests
+python run_redaa.py --self-test  # all eight suites, 200 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
 python tests/test_fetch.py       # spec parsing, download ladder, mmCIF, cleaning
 python tests/test_colab.py       # GPU recommendations, input gathering, results
 python tests/test_notebook.py    # notebook structure, forms, restart bootstrap
+python tests/test_sites.py       # site specs, resolution, metrics, presets
+python tests/test_mpnn.py        # LigandMPNN's featurise contract, fixed positions
 python tests/test_pipeline.py    # full orchestration against stub engines
 ```
 
@@ -335,6 +538,7 @@ run_redaa.py                 entry point (--test, --fetch, --self-test)
 redaa/config.py              environment-driven configuration
 redaa/structure.py           PDB parsing, Kabsch, RMSD, TM-score
 redaa/chemistry.py           disulfide and cis-Pro detection
+redaa/sites.py               functional sites: specs, pockets, metrics, presets
 redaa/fetch.py               RCSB/CATH/AlphaFold fetching, mmCIF, input cleaning
 redaa/folding.py             ESMFold2-Fast engine
 redaa/mpnn.py                in-process LigandMPNN engine
@@ -376,7 +580,25 @@ reference/New_V9_619.py      the original script, for diffing
   system working, but it means a fetched panel needs a look at
   `FLAGGED_DOMAINS.csv` before you trust it. Domain-bounded sources
   (`cath:…`) avoid this.
-- **TM-score is still the only gate.** RMSD is computed for every sequence and
+- **`ligand_mpnn` needs an actual ligand.** It cannot run without one --
+  LigandMPNN looks for nearest neighbours among zero ligand atoms and fails on
+  an empty dimension -- so this is refused up front, at site preview and again
+  before featurising. A catalytic-site case such as `tev` wants
+  `protein_mpnn`.
+- **A preserved site geometry is not a working site.** Every site number here
+  is backbone geometry: it says the scaffold puts the functional residues
+  where they belong, which is necessary and nowhere near sufficient. Nothing
+  in this pipeline predicts catalysis or binding affinity, and a design that
+  passes every gate is a candidate to test, not a result.
+- **Exempt site positions are not alphabet letters.** Under the default
+  `SITE_RESIDUE_POLICY=exempt` a reported alphabet describes the *designable*
+  positions only, and the real protein still needs the exempt residues'
+  types. Compare against an `in_alphabet` run before quoting a number.
+- **Scores are not comparable across modes.** With fixed positions, MPNN
+  scores are means over the designed positions only — the right denominator
+  within a site-aware run, but not the same quantity an `alphabet_only` run
+  reports.
+- **TM-score is still the only fold gate.** RMSD is computed for every sequence and
   ranks candidates that all clear the gate, but a fixed Ångström cutoff across
   a 50–250 residue panel is biased against the longer domains, so it does not
   decide pass/fail. For domains under ~40 residues TM normalisation is

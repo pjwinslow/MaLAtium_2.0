@@ -461,6 +461,133 @@ def test_fetch_and_prepare_end_to_end():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+# ---------------------------------------------------------------------------
+# Ligand retention
+# ---------------------------------------------------------------------------
+#
+# Retention has to be opt-in and precise. A ligand left out means LigandMPNN
+# designs against a bare backbone and a pocket cannot be derived at all; a
+# ligand wrongly kept -- a cryoprotectant, or a copy bound to a different
+# chain of the crystal -- defines a site that is not there.
+
+
+def _ligand_pdb():
+    """Chain A with ATP bound to it, a glycerol, and an ATP on far-off chain B."""
+    lines = []
+    serial = 1
+    for i in range(1, 5):
+        for name, dx in ((" N  ", -0.6), (" CA ", 0.0), (" C  ", 0.7)):
+            lines.append(
+                f"ATOM  {serial:>5d} {name} ALA A{i:>4d}    "
+                f"{3.8 * i + dx:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+            )
+            serial += 1
+    # ATP on chain A, right beside the protein.
+    for k in range(3):
+        lines.append(
+            f"HETATM{serial:>5d}  C{k:<2d} ATP A 900    "
+            f"{7.6 + k:>8.3f}{2.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+        )
+        serial += 1
+    # Glycerol, also close by, but not a ligand anyone asked for.
+    lines.append(
+        f"HETATM{serial:>5d}  C1  GOL A 901    "
+        f"{7.6:>8.3f}{-2.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+    )
+    serial += 1
+    # A second ATP, on chain B and 200 A away: a crystal neighbour, not part
+    # of this chain's site.
+    for k in range(3):
+        lines.append(
+            f"HETATM{serial:>5d}  C{k:<2d} ATP B 902    "
+            f"{200.0 + k:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+        )
+        serial += 1
+    lines.append("HETATM 9999  O   HOH A 950       5.000   5.000   5.000  1.00  0.00")
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def test_prepare_drops_every_ligand_by_default():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_ligand_pdb(), out)
+        body = open(out).read()
+        assert "HETATM" not in body
+        assert report["ligands_kept"] == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_prepare_keeps_a_named_ligand_only():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_ligand_pdb(), out, keep_ligands=("ATP",))
+        body = open(out).read()
+        assert "ATP" in body
+        assert "GOL" not in body          # not asked for
+        assert "HOH" not in body          # never kept
+        # Only the chain-A copy: 3 atoms, not 6.
+        assert report["ligands_kept"] == [("ATP", 3)]
+        assert any("ignored, further than" in n for n in report["ligand_notes"])
+        # The protein still comes first and the file still ends properly.
+        assert body.index("ATOM") < body.index("HETATM")
+        assert body.rstrip().endswith("END")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_prepare_reports_a_ligand_that_is_not_there():
+    tmp = tempfile.mkdtemp()
+    try:
+        report = F.prepare(
+            _ligand_pdb(), os.path.join(tmp, "o.pdb"), keep_ligands=("GTP",)
+        )
+        assert report["ligands_kept"] == []
+        assert any("requested but not present" in n for n in report["ligand_notes"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_prepare_keeps_a_ligand_on_another_chain_when_it_touches_this_one():
+    tmp = tempfile.mkdtemp()
+    try:
+        # Same entry, but the chain-B ATP is moved into contact with chain A.
+        text = _ligand_pdb().replace("     200.000", "       8.000")
+        text = text.replace("     201.000", "       9.000")
+        text = text.replace("     202.000", "      10.000")
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(text, out, chain="A", keep_ligands=("ATP",))
+        # Both copies now count: deposition puts a bound ligand on either
+        # chain, so proximity, not the chain letter, decides.
+        assert report["ligands_kept"] == [("ATP", 6)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_kept_ligand_is_parseable_as_a_site():
+    """The retained ligand has to be usable downstream, not just present."""
+    from redaa import sites as S
+    from redaa import structure as st
+
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        F.prepare(_ligand_pdb(), out, keep_ligands=("ATP",))
+        recs = st.parse_residues_from_file(
+            out, atom_names=None, include_hetatm=True
+        )
+        site = S.resolve_site(S.parse_site_spec("ligand:ATP@4.5"), recs)
+        assert len(site) >= 1, site.warnings
+        assert site.ligand_atom_counts == {"ATP": 3}
+        assert not any("no atoms found" in w for w in site.warnings)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

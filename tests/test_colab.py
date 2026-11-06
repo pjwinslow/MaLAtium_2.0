@@ -735,6 +735,240 @@ def test_latest_report_picks_the_newest():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Functional-site configuration and preview
+# ---------------------------------------------------------------------------
+
+
+def _site_pdb(path, seq="ACDEFGHIK", ligand=None):
+    aa3 = {
+        "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
+        "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
+    }
+    lines = []
+    n = 1
+    for i, aa in enumerate(seq):
+        for name, dx in ((" N  ", -0.6), (" CA ", 0.0), (" C  ", 0.7)):
+            lines.append(
+                f"ATOM  {n:>5d} {name} {aa3[aa]} A{i + 1:>4d}    "
+                f"{3.8 * i + dx:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+            )
+            n += 1
+    lines.append("TER")
+    if ligand:
+        comp, x = ligand
+        lines.append(
+            f"HETATM{n:>5d}  C1  {comp:>3s} A 900    "
+            f"{x:>8.3f}{2.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+        )
+    lines.append("END")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+def _clear_site_env():
+    for key in list(os.environ):
+        if key.startswith("SITE_") or key in ("SEARCH_MODE", "MPNN_MODEL_TYPE"):
+            del os.environ[key]
+
+
+def test_configure_site_sets_the_environment():
+    _clear_site_env()
+    try:
+        applied = C.configure_site(mode="site_aware", spec="H46 D81 C151")
+        assert applied["SEARCH_MODE"] == "site_aware"
+        assert os.environ["SEARCH_MODE"] == "site_aware"
+        assert os.environ["SITE_SPEC"] == "H46 D81 C151"
+        assert os.environ["SITE_RESIDUE_POLICY"] == "exempt"
+        assert os.environ["SITE_GATE"] == "1"
+    finally:
+        _clear_site_env()
+
+
+def test_configure_site_preset_fills_blanks_but_explicit_values_win():
+    _clear_site_env()
+    try:
+        applied = C.configure_site(mode="site_aware", preset="atp")
+        # The preset supplies the spec, its ligand and a ligand-aware model.
+        assert applied["SITE_SPEC"] == C.preset("atp").site_spec
+        assert "ATP" in applied["SITE_KEEP_LIGANDS"]
+        assert applied["MPNN_MODEL_TYPE"] == "ligand_mpnn"
+
+        override = C.configure_site(
+            mode="site_aware", preset="atp", spec="R82 R84",
+            mpnn_model_type="protein_mpnn",
+        )
+        assert override["SITE_SPEC"] == "R82 R84"
+        assert override["MPNN_MODEL_TYPE"] == "protein_mpnn"
+    finally:
+        _clear_site_env()
+
+
+def test_configure_site_rejects_a_bad_mode_or_policy():
+    _clear_site_env()
+    try:
+        for kwargs in ({"mode": "nope"}, {"mode": "site_aware", "policy": "nope"}):
+            try:
+                C.configure_site(**kwargs)
+            except ValueError:
+                continue
+            raise AssertionError(f"{kwargs} should have been rejected")
+    finally:
+        _clear_site_env()
+
+
+def test_preview_site_resolves_against_the_real_file():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"))
+        out = C.preview_site(path, "C2 F5 H7")
+        assert "3 position(s)" in out
+        assert "C2" in out and "F5" in out and "H7" in out
+        assert "looks usable" in out
+        assert "ligands in file: none" in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_site_reports_a_numbering_mismatch_loudly():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"))
+        out = C.preview_site(path, "H2")  # residue 2 is C
+        assert "NUMBERING MISMATCH" in out
+        assert "will refuse this domain" in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_site_reports_an_empty_resolution():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"))
+        out = C.preview_site(path, "A99")
+        assert "will skip this domain" in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_site_shows_a_ligand_derived_pocket_and_its_coverage():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"), ligand=("ATP", 7.6))
+        out = C.preview_site(path, "ligand:ATP@4.5")
+        assert "ATP (1 atoms)" in out
+        assert "A from ligand" in out
+        assert "% of the chain" in out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_site_handles_a_bad_spec_and_a_missing_file():
+    assert "cannot parse" in C.preview_site(__file__, "not-a-spec")
+    assert "no such file" in C.preview_site("/nope/nope.pdb", "H46")
+
+
+def test_preview_sites_covers_every_prepared_input():
+    tmp = tempfile.mkdtemp()
+    try:
+        _site_pdb(os.path.join(tmp, "a.pdb"))
+        _site_pdb(os.path.join(tmp, "b.pdb"))
+        out = C.preview_sites(tmp, "C2")
+        assert "a.pdb" in out and "b.pdb" in out
+        assert "no prepared inputs" in C.preview_sites(
+            os.path.join(tmp, "empty"), "C2"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_describe_site_results_is_silent_for_an_alphabet_only_run():
+    assert C.describe_site_results([{"search_mode": "alphabet_only"}]) == ""
+    assert C.describe_site_results([]) == ""
+
+
+def test_describe_site_results_spells_out_exempt_positions():
+    rows = [{
+        "search_mode": "site_aware", "pdb": "d1",
+        "pruned_alphabet": "GLV", "site_n_positions": "6",
+        "site_residues": "H46+D81", "site_residue_types": "CDH",
+        "site_policy": "exempt", "best_seq_site_ok": "1",
+        "best_seq_site_bb_rmsd": "0.70",
+    }]
+    out = C.describe_site_results(rows)
+    # The headline number has to carry its caveat: 3 letters plus 6 positions
+    # that are not letters is not the same claim as 3 letters.
+    assert "3 letter(s)" in out
+    assert "6 exempt position(s)" in out
+    assert "in_alphabet" in out
+    assert "site preserved in 1/1" in out
+
+
+def test_describe_site_results_reports_what_the_graft_cost():
+    rows = [{
+        "search_mode": "scaffold_then_site", "pdb": "d1",
+        "pruned_alphabet": "GLVR", "site_n_positions": "3",
+        "site_residues": "H46", "site_residue_types": "CDH",
+        "site_policy": "exempt", "best_seq_site_ok": "1",
+        "graft_direct_pass": "0", "graft_added_aas": "R", "graft_passed": "1",
+    }]
+    out = C.describe_site_results(rows)
+    assert "carried the site unchanged in 0/1" in out
+    assert "cost extra letters" in out
+    assert "site_aware" in out
+
+
+def test_configure_site_always_decides_the_model_type():
+    """A notebook's cells get re-run in any order.
+
+    Configuring the ATP preset once leaves MPNN_MODEL_TYPE=ligand_mpnn in the
+    environment. If a later TEV configuration stays silent on it, the ligand
+    model is used for a case with no ligand -- which is exactly the
+    misconfiguration that reached a real run.
+    """
+    _clear_site_env()
+    try:
+        C.configure_site(mode="site_aware", preset="atp")
+        assert os.environ["MPNN_MODEL_TYPE"] == "ligand_mpnn"
+
+        # Same session, now a catalytic-site case with no preset and no
+        # explicit model type: it must not inherit ligand_mpnn.
+        applied = C.configure_site(mode="site_aware", spec="H46 D81 C151")
+        assert applied["MPNN_MODEL_TYPE"] == "protein_mpnn"
+        assert os.environ["MPNN_MODEL_TYPE"] == "protein_mpnn"
+
+        # The TEV preset says so for itself.
+        applied = C.configure_site(mode="site_aware", preset="tev")
+        assert applied["MPNN_MODEL_TYPE"] == "protein_mpnn"
+    finally:
+        _clear_site_env()
+
+
+def test_preview_site_refuses_a_ligand_model_on_a_ligand_free_input():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"))  # no ligand
+        out = C.preview_site(path, "C2 F5", mpnn_model_type="ligand_mpnn")
+        assert "no ligand" in out
+        assert "protein_mpnn" in out
+        assert "will refuse this domain" in out
+
+        # The same input is fine for a protein model.
+        ok = C.preview_site(path, "C2 F5", mpnn_model_type="protein_mpnn")
+        assert "looks usable" in ok
+
+        # And a ligand model is fine once there is a ligand.
+        with_lig = _site_pdb(os.path.join(tmp, "y.pdb"), ligand=("ATP", 7.6))
+        ok2 = C.preview_site(
+            with_lig, "ligand:ATP@4.5", mpnn_model_type="ligand_mpnn"
+        )
+        assert "looks usable" in ok2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

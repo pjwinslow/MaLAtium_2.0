@@ -49,10 +49,22 @@ class FoldResult:
     ptm: float | None
     ca: np.ndarray               # (L, 3) CA coordinates
     pdb_text: str | None = None  # only populated on a cache miss
+    # (L, 3, 3) N/CA/C per residue.  Only parsed and cached when a functional
+    # site is configured, because every fold pays for it and a site-blind run
+    # has no use for it.  None means "not requested or not available", which
+    # the site metrics report as unmeasurable rather than as a failure.
+    frames: np.ndarray | None = None
 
     @property
     def ok(self) -> bool:
         return self.ca is not None and len(self.ca) >= 3
+
+    @property
+    def site_frames(self) -> np.ndarray | None:
+        """``(L, 4, 3)`` N/CA/C plus derived virtual CB, or None."""
+        if self.frames is None:
+            return None
+        return st.frames_with_cb(self.frames)
 
 
 def _to_float(value) -> float | None:
@@ -86,8 +98,21 @@ def normalise_plddt(value: float | None) -> float | None:
 class FoldEngine:
     """Thin, cached wrapper around an ESMFold2-Fast checkpoint."""
 
-    def __init__(self, cfg, cache: FoldCache | None = None, verbose: bool = True):
+    def __init__(
+        self,
+        cfg,
+        cache: FoldCache | None = None,
+        verbose: bool = True,
+        want_frames: bool = False,
+    ):
         self.cfg = cfg
+        # Set once by the pipeline when a functional site is configured, so
+        # every fold in the run carries the backbone frame the site metrics
+        # need without each caller opting in.
+        self.want_frames = bool(want_frames)
+        # Set if the model's output turns out to have no backbone frame, so
+        # the warning is printed once rather than per fold.
+        self.frames_unavailable = False
         self.cache = cache if cache is not None else FoldCache(None, enabled=False)
         self.verbose = verbose
         self.model = None
@@ -238,15 +263,26 @@ class FoldEngine:
         return {self._steps_name: steps}
 
     # -- folding ----------------------------------------------------------
-    def fold(self, sequence: str, steps: int | None = None) -> FoldResult | None:
+    def fold(
+        self,
+        sequence: str,
+        steps: int | None = None,
+        want_frames: bool | None = None,
+    ) -> FoldResult | None:
         """Fold one sequence, consulting the cache first.
 
         Returns ``None`` if the prediction failed outright; the search treats
         that as "no structural model produced", exactly as V9 did.
+
+        ``want_frames`` asks for the backbone frame as well as the CA trace.
+        It defaults to whatever the engine was constructed with, so a
+        site-aware run gets frames everywhere without every call site having
+        to remember to ask.
         """
         if not sequence:
             return None
         steps = self.cfg.fold_steps_screen if steps is None else steps
+        want_frames = self.want_frames if want_frames is None else bool(want_frames)
 
         key = fold_key(
             sequence,
@@ -255,10 +291,10 @@ class FoldEngine:
             self.cfg.fold_loops,
             self.cfg.fold_seed,
         )
-        cached = self.cache.get(key)
+        cached = self.cache.get(key, need_frames=want_frames)
         if cached is not None:
-            plddt, ptm, ca = cached
-            return FoldResult(sequence, plddt, ptm, ca)
+            plddt, ptm, ca, frames = cached
+            return FoldResult(sequence, plddt, ptm, ca, frames=frames)
 
         if len(sequence) > self.cfg.fold_max_residues:
             print(
@@ -295,7 +331,35 @@ class FoldEngine:
             print("    ESMFold2 returned no PDB text for this sequence")
             return None
 
-        ca, _ = st.parse_ca_from_text(pdb_text)
+        frames = None
+        if want_frames:
+            records = st.parse_residues_from_text(pdb_text)
+            full, valid = st.frames_from_records(records)
+            # Store N/CA/C only; CB is reconstructed on read, so the cache
+            # does not carry a derived quantity.
+            frames = full[:, :3, :]
+            ca = full[:, 1, :]
+            if not valid.any():
+                # The model returned coordinates but no complete N-CA-C for
+                # any residue. Failing every fold from here would bury the
+                # cause under thousands of identical messages, so fall back to
+                # the CA trace -- the fold gate still works -- and say once
+                # that site geometry is not measurable. The pipeline checks
+                # this after the native fold and stops there.
+                if not self.frames_unavailable:
+                    self.frames_unavailable = True
+                    print(
+                        "    WARNING: this model's PDB output carries no "
+                        "N/CA/C backbone, so functional-site geometry cannot "
+                        "be measured from it. Falling back to the CA trace."
+                    )
+                frames = None
+                ca, _ = st.parse_ca_from_text(pdb_text)
+            else:
+                ca = ca[valid]
+                frames = frames[valid]
+        else:
+            ca, _ = st.parse_ca_from_text(pdb_text)
         if len(ca) < 3:
             print("    ESMFold2 output had no usable CA trace")
             return None
@@ -303,8 +367,10 @@ class FoldEngine:
         plddt = normalise_plddt(_to_float(getattr(result, "plddt", None)))
         ptm = _to_float(getattr(result, "ptm", None))
 
-        self.cache.put(key, plddt, ptm, ca)
-        return FoldResult(sequence, plddt, ptm, ca, pdb_text=pdb_text)
+        self.cache.put(key, plddt, ptm, ca, frames)
+        return FoldResult(
+            sequence, plddt, ptm, ca, pdb_text=pdb_text, frames=frames
+        )
 
     def _result_pdb_text(self, result) -> str | None:
         try:
