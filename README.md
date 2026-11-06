@@ -516,7 +516,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all seven suites, 186 tests
+python run_redaa.py --self-test  # all eight suites, 200 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
@@ -524,6 +524,7 @@ python tests/test_fetch.py       # spec parsing, download ladder, mmCIF, cleanin
 python tests/test_colab.py       # GPU recommendations, input gathering, results
 python tests/test_notebook.py    # notebook structure, forms, restart bootstrap
 python tests/test_sites.py       # site specs, resolution, metrics, presets
+python tests/test_mpnn.py        # LigandMPNN's featurise contract, fixed positions
 python tests/test_pipeline.py    # full orchestration against stub engines
 ```
 
@@ -579,6 +580,11 @@ reference/New_V9_619.py      the original script, for diffing
   system working, but it means a fetched panel needs a look at
   `FLAGGED_DOMAINS.csv` before you trust it. Domain-bounded sources
   (`cath:…`) avoid this.
+- **`ligand_mpnn` needs an actual ligand.** It cannot run without one --
+  LigandMPNN looks for nearest neighbours among zero ligand atoms and fails on
+  an empty dimension -- so this is refused up front, at site preview and again
+  before featurising. A catalytic-site case such as `tev` wants
+  `protein_mpnn`.
 - **A preserved site geometry is not a working site.** Every site number here
   is backbone geometry: it says the scaffold puts the functional residues
   where they belong, which is necessary and nowhere near sufficient. Nothing

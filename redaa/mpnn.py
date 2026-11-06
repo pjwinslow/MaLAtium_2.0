@@ -214,7 +214,14 @@ class MPNNEngine:
 
         The backbone is fixed for the whole search, so this is the work V9
         repeated on every single MPNN invocation.
+
+        Note that ``parse_PDB`` output is not directly featurisable:
+        ``featurize`` reads a ``chain_mask`` that ``parse_PDB`` never writes,
+        because upstream's ``run.py`` builds it between the two calls. Driving
+        these functions in-process means reproducing that step.
         """
+        import torch
+
         cached = self._features.get(pdb_path)
         if cached is not None:
             return cached
@@ -241,23 +248,53 @@ class MPNNEngine:
         want_ligand = str(self.cfg.mpnn_model_type).strip() == "ligand_mpnn"
 
         n_ligand_atoms = 0
-        for key in ("Y", "ligand_atoms", "xyz_37"):
-            arr = protein_dict.get(key) if hasattr(protein_dict, "get") else None
-            if key == "Y" and arr is not None:
-                try:
-                    n_ligand_atoms = int(arr.shape[0])
-                except Exception:  # noqa: BLE001
-                    n_ligand_atoms = 0
-                break
+        y = protein_dict.get("Y") if hasattr(protein_dict, "get") else None
+        if y is not None:
+            try:
+                n_ligand_atoms = int(y.shape[0])
+            except Exception:  # noqa: BLE001
+                n_ligand_atoms = 0
         self._ligand_atoms[pdb_path] = n_ligand_atoms
 
         if want_ligand and n_ligand_atoms == 0:
-            print(
-                "    WARNING: MPNN_MODEL_TYPE=ligand_mpnn but this input has "
-                "no ligand atoms. Designs will be made against a bare "
-                "backbone. Keep the ligand in the prepared PDB "
-                "(SITE_KEEP_LIGANDS) or use protein_mpnn."
+            # Not a warning: featurize's ligand branch calls
+            # get_nearest_neighbours, which takes L2_AB_nn[:, 0] on a tensor
+            # whose ligand dimension is zero and dies with a bare IndexError
+            # that names none of this.
+            raise RuntimeError(
+                "MPNN_MODEL_TYPE=ligand_mpnn, but this input has no ligand "
+                f"atoms:\n  {pdb_path}\n"
+                "A ligand model cannot run without a ligand.\n"
+                "Either keep the ligand through input preparation -- "
+                "SITE_KEEP_LIGANDS=ATP, or SITE_PRESET=atp, then re-run the "
+                "input step so the PDB is rewritten -- or set "
+                "MPNN_MODEL_TYPE=protein_mpnn.\n"
+                "A catalytic-site run such as SITE_PRESET=tev needs no "
+                "ligand and wants protein_mpnn."
             )
+
+        # featurize() requires chain_mask on the parsed dict, and parse_PDB
+        # does not produce it -- LigandMPNN's own run.py builds it in between
+        # the two, so an in-process caller has to do the same or featurize
+        # raises KeyError: 'chain_mask'. 1 means "design this position".
+        # Per-call fixed positions are applied later, to the featurised copy;
+        # featurize only passes this tensor through, so that stays consistent.
+        if "chain_mask" not in protein_dict:
+            import numpy as _np
+
+            letters = list(protein_dict.get("chain_letters", []) or [])
+            if letters:
+                # Mirror run.py: design every chain present in the file.
+                designing = set(letters)
+                protein_dict["chain_mask"] = torch.tensor(
+                    _np.array([item in designing for item in letters],
+                              dtype=_np.int32),
+                    device=self.device,
+                )
+            else:
+                protein_dict["chain_mask"] = torch.ones_like(
+                    protein_dict["mask"]
+                )
 
         feat_kwargs = {}
         fparams = inspect.signature(data_utils.featurize).parameters

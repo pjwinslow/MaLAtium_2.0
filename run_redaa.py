@@ -129,6 +129,7 @@ def main(argv=None) -> int:
         from tests import (
             test_colab,
             test_fetch,
+            test_mpnn,
             test_notebook,
             test_pipeline,
             test_search,
@@ -142,6 +143,7 @@ def main(argv=None) -> int:
             ("search and chemistry", test_search),
             ("fetching and input prep", test_fetch),
             ("functional sites", test_sites),
+            ("mpnn integration", test_mpnn),
             ("colab helpers", test_colab),
             ("colab notebook", test_notebook),
             ("pipeline orchestration", test_pipeline),

@@ -720,6 +720,7 @@ if _applied["SEARCH_MODE"] != "alphabet_only" and _applied["SITE_SPEC"]:
         _applied["SITE_SPEC"],
         chain=_applied["SITE_CHAIN"] or None,
         contact_max=SITE_CONTACT_MAX,
+        mpnn_model_type=_applied.get("MPNN_MODEL_TYPE", ""),
     ))
 """
 )

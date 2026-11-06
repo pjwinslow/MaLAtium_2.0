@@ -920,6 +920,55 @@ def test_describe_site_results_reports_what_the_graft_cost():
     assert "site_aware" in out
 
 
+def test_configure_site_always_decides_the_model_type():
+    """A notebook's cells get re-run in any order.
+
+    Configuring the ATP preset once leaves MPNN_MODEL_TYPE=ligand_mpnn in the
+    environment. If a later TEV configuration stays silent on it, the ligand
+    model is used for a case with no ligand -- which is exactly the
+    misconfiguration that reached a real run.
+    """
+    _clear_site_env()
+    try:
+        C.configure_site(mode="site_aware", preset="atp")
+        assert os.environ["MPNN_MODEL_TYPE"] == "ligand_mpnn"
+
+        # Same session, now a catalytic-site case with no preset and no
+        # explicit model type: it must not inherit ligand_mpnn.
+        applied = C.configure_site(mode="site_aware", spec="H46 D81 C151")
+        assert applied["MPNN_MODEL_TYPE"] == "protein_mpnn"
+        assert os.environ["MPNN_MODEL_TYPE"] == "protein_mpnn"
+
+        # The TEV preset says so for itself.
+        applied = C.configure_site(mode="site_aware", preset="tev")
+        assert applied["MPNN_MODEL_TYPE"] == "protein_mpnn"
+    finally:
+        _clear_site_env()
+
+
+def test_preview_site_refuses_a_ligand_model_on_a_ligand_free_input():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _site_pdb(os.path.join(tmp, "x.pdb"))  # no ligand
+        out = C.preview_site(path, "C2 F5", mpnn_model_type="ligand_mpnn")
+        assert "no ligand" in out
+        assert "protein_mpnn" in out
+        assert "will refuse this domain" in out
+
+        # The same input is fine for a protein model.
+        ok = C.preview_site(path, "C2 F5", mpnn_model_type="protein_mpnn")
+        assert "looks usable" in ok
+
+        # And a ligand model is fine once there is a ligand.
+        with_lig = _site_pdb(os.path.join(tmp, "y.pdb"), ligand=("ATP", 7.6))
+        ok2 = C.preview_site(
+            with_lig, "ligand:ATP@4.5", mpnn_model_type="ligand_mpnn"
+        )
+        assert "looks usable" in ok2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

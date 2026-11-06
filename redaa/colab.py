@@ -549,6 +549,14 @@ def configure_site(
     if policy not in ("exempt", "in_alphabet"):
         raise ValueError(f"policy must be exempt or in_alphabet, not {policy!r}")
 
+    # Always decide the model type here, rather than only when one is given.
+    # A notebook's cells get re-run in any order: configuring the ATP preset
+    # once leaves MPNN_MODEL_TYPE=ligand_mpnn in the environment, and if a
+    # later TEV configuration stays silent on it, the ligand model is quietly
+    # used for a case with no ligand. Explicit beats sticky.
+    if not mpnn_model_type.strip():
+        mpnn_model_type = "protein_mpnn"
+
     settings = {
         "SEARCH_MODE": mode,
         "SITE_SPEC": spec.strip(),
@@ -563,8 +571,7 @@ def configure_site(
         "SITE_MAX_CB_DEV": str(float(max_cb_dev)),
         "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
     }
-    if mpnn_model_type.strip():
-        settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()
+    settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()
 
     for key, value in settings.items():
         os.environ[key] = value
@@ -586,6 +593,7 @@ def preview_site(
     spec: str,
     chain: str | None = None,
     contact_max: int = 0,
+    mpnn_model_type: str = "",
 ) -> str:
     """Resolve a site against a prepared input and describe it, before running.
 
@@ -648,13 +656,30 @@ def preview_site(
             "if the site needs one)"
         )
 
+    # A ligand model on a ligand-free input cannot run at all: LigandMPNN
+    # looks for nearest neighbours among zero ligand atoms and dies on an
+    # empty dimension. Say so here rather than at the first design call.
+    ligand_model = str(mpnn_model_type).strip() == "ligand_mpnn"
+    if ligand_model and not het:
+        lines.append(
+            "  ERROR    : MPNN_MODEL_TYPE=ligand_mpnn, but this input has no "
+            "ligand. Either keep one (SITE_KEEP_LIGANDS, then re-run the "
+            "input step) or use protein_mpnn -- a catalytic-site case such as "
+            "the TEV preset needs no ligand."
+        )
+
     fatal = [w for w in site.warnings if w.startswith("NUMBERING MISMATCH")]
     other = [w for w in site.warnings if w not in fatal]
     for w in fatal:
         lines.append(f"  ERROR    : {w}")
     for w in other:
         lines.append(f"  warning  : {w}")
-    if fatal:
+    if ligand_model and not het:
+        lines.append(
+            "  -> the run will refuse this domain until the model type and "
+            "the input agree."
+        )
+    elif fatal:
         lines.append(
             "  -> the run will refuse this domain. Check the numbering against "
             "the entry you actually fetched."
@@ -671,6 +696,7 @@ def preview_sites(
     spec: str,
     chain: str | None = None,
     contact_max: int = 0,
+    mpnn_model_type: str = "",
 ) -> str:
     """:func:`preview_site` over every prepared input in a directory."""
     import glob as _glob
@@ -679,7 +705,10 @@ def preview_sites(
     if not paths:
         return f"no prepared inputs in {input_dir}"
     return "\n\n".join(
-        preview_site(p, spec, chain=chain, contact_max=contact_max)
+        preview_site(
+            p, spec, chain=chain, contact_max=contact_max,
+            mpnn_model_type=mpnn_model_type,
+        )
         for p in paths
     )
 
