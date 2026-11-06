@@ -282,8 +282,12 @@ class MPNNEngine:
         if "chain_mask" not in protein_dict:
             import numpy as _np
 
-            letters = list(protein_dict.get("chain_letters", []) or [])
-            if letters:
+            # chain_letters is ProDy's getChids() output -- a numpy array.
+            # `arr or []` asks for its truth value and raises; test it against
+            # None and take its length explicitly.
+            raw_letters = protein_dict.get("chain_letters")
+            letters = [] if raw_letters is None else list(raw_letters)
+            if len(letters):
                 # Mirror run.py: design every chain present in the file.
                 designing = set(letters)
                 protein_dict["chain_mask"] = torch.tensor(

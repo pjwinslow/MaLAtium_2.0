@@ -48,6 +48,14 @@ FEATURIZE_REQUIRES = (
 )
 FEATURIZE_REQUIRES_LIGAND = ("Y", "Y_t", "Y_m")
 
+# Keys ProteinMPNN.sample() reads from the featurised dict, with commented-out
+# lines in its own source excluded -- it opens with a doc block that mentions
+# xyz_37 and Y, neither of which it actually reads.
+SAMPLE_REQUIRES = (
+    "S", "batch_size", "bias", "chain_mask", "mask", "randn",
+    "symmetry_residues", "symmetry_weights", "temperature",
+)
+
 AA = "ACDEFGHIKLMNPQRSTVWY"
 
 
@@ -156,14 +164,20 @@ def _fake_data_utils(n_res: int, n_ligand_atoms: int, chains="A") -> types.Modul
     def parse_PDB(path, device="cpu", parse_all_atoms=False,
                   parse_atoms_with_zero_occupancy=False):
         mod.calls["parse"] += 1
-        letters = [chains[i % len(chains)] for i in range(n_res)]
+        # chain_letters is whatever ProDy's getChids() returns -- a numpy
+        # array of strings, NOT a list. The difference matters: `arr or []`
+        # raises "truth value of an array ... is ambiguous", and a fake using
+        # a plain list hides that whole class of bug.
+        letters = np.array(
+            [chains[i % len(chains)] for i in range(n_res)], dtype="<U1"
+        )
         out = {
             "X": T(np.zeros((n_res, 4, 3))),
             "S": T(np.array(native, dtype=np.int64)),
             "R_idx": T(np.arange(1, n_res + 1)),
             "chain_labels": T(np.zeros(n_res)),
             "chain_letters": letters,
-            "chain_list": sorted(set(letters)),
+            "chain_list": sorted(set(letters.tolist())),
             "mask": T(np.ones(n_res)),
             "mask_c": T(np.ones(n_res)),
             "Y": T(np.zeros((n_ligand_atoms, 3))),
@@ -218,6 +232,40 @@ def _fake_data_utils(n_res: int, n_ligand_atoms: int, chains="A") -> types.Modul
     return mod
 
 
+class _FakeModel:
+    """Stands in for ProteinMPNN, enforcing what sample() really reads."""
+
+    def __init__(self, n_res):
+        self.n_res = n_res
+        self.calls = []
+
+    def sample(self, feature_dict):
+        for key in SAMPLE_REQUIRES:
+            if key not in feature_dict:
+                raise KeyError(key)
+        batch = int(feature_dict["batch_size"])
+        self.calls.append(
+            {
+                "batch_size": batch,
+                "temperature": feature_dict["temperature"],
+                "bias": feature_dict["bias"],
+                "chain_mask": feature_dict["chain_mask"],
+            }
+        )
+        # Sampled sequence honours the bias and the chain mask the way the
+        # real decoder does: argmax of the bias where designable, the native
+        # residue where the mask is 0.
+        bias = feature_dict["bias"].a            # (1, L, 21)
+        native = feature_dict["S"].a[0]          # (L,)
+        mask = feature_dict["chain_mask"].a[0]   # (L,)
+        picked = np.argmax(bias[0], axis=-1)
+        out = np.where(mask > 0, picked, native)
+        return {
+            "S": T(np.tile(out[None, :], (batch, 1))),
+            "log_probs": T(np.zeros((batch, self.n_res, 21))),
+        }
+
+
 def _engine(n_res=12, n_ligand_atoms=0, model_type="protein_mpnn", chains="A"):
     """An MPNNEngine wired to the fakes, with load() bypassed."""
     sys.modules["torch"] = _fake_torch()
@@ -226,7 +274,7 @@ def _engine(n_res=12, n_ligand_atoms=0, model_type="protein_mpnn", chains="A"):
     cfg = RedAAConfig()
     cfg.mpnn_model_type = model_type
     eng = MPNNEngine(cfg, verbose=False)
-    eng.model = object()          # stands in for a loaded checkpoint
+    eng.model = _FakeModel(n_res)
     eng.device = "cpu"
     eng._atom_context_num = 25
     eng._mods = {
@@ -426,6 +474,66 @@ def test_enforce_fixed_reports_when_it_had_to_correct_something():
     assert seq == "GCGGHG" and moved == 2
     seq, moved = _enforce_fixed(seq, {1: "C", 4: "H"})
     assert moved == 0, "already-correct positions must not be counted"
+
+
+# ---------------------------------------------------------------------------
+# design() -> sample()
+# ---------------------------------------------------------------------------
+
+
+def test_design_supplies_every_key_sample_reads():
+    """The next contract after featurize, pinned before it can bite.
+
+    sample() reads nine keys. featurize() provides two of them and design()
+    has to set the other seven; a missing one is a KeyError from inside
+    model_utils, which is where the featurize bug came from too.
+    """
+    try:
+        eng = _engine(n_res=8)
+        designs = eng.design("dom.pdb", ["G", "A", "L", "V"], num_seq=2)
+        assert designs.pairs, "no sequences came back"
+        assert eng.model.calls, "sample() was never called"
+        for seq in designs.sequences:
+            assert len(seq) == 8
+            assert set(seq) <= set("GALV"), seq
+    finally:
+        _cleanup()
+
+
+def test_design_holds_fixed_positions_through_sample():
+    try:
+        eng = _engine(n_res=8)
+        native = eng.native_sequence("dom.pdb")
+        fixed = {2: native[2], 5: native[5]}
+        designs = eng.design(
+            "dom.pdb", ["G"], num_seq=2, fixed=fixed
+        )
+        assert designs.pairs
+        for seq in designs.sequences:
+            # The site residues survive even though they are outside the
+            # one-letter alphabet, and nothing else does.
+            assert seq[2] == native[2] and seq[5] == native[5], seq
+            rest = [c for i, c in enumerate(seq) if i not in fixed]
+            assert set(rest) == {"G"}, seq
+        # No correction was needed, because the mask was honoured.
+        assert eng.n_forced_positions == 0
+    finally:
+        _cleanup()
+
+
+def test_design_scores_only_designed_positions_when_some_are_fixed():
+    try:
+        eng = _engine(n_res=8)
+        eng.design("dom.pdb", ["G"], num_seq=1, fixed={0: "C", 1: "C"})
+        call = eng.model.calls[-1]
+        # score_mask = mask * chain_mask, so fixed positions drop out of the
+        # score. That is the right denominator within a site-aware run, and
+        # the reason its scores are not comparable with a site-blind one.
+        assert call["chain_mask"].a[0, 0] == 0.0
+        assert call["chain_mask"].a[0, 1] == 0.0
+        assert call["chain_mask"].a[0, 2] == 1.0
+    finally:
+        _cleanup()
 
 
 def main():
