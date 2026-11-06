@@ -336,15 +336,27 @@ def test_results_step_shows_site_columns_only_in_a_site_run():
 
 
 def test_steps_are_numbered_consecutively_from_one():
+    """Step numbers must run 1..N in order, allowing lettered sub-steps.
+
+    "6b" is deliberate: the preflight slots between settings and the run
+    without renumbering everything after it (and the troubleshooting prose
+    that refers to those numbers).
+    """
     import re as _re
 
-    numbers = []
+    labels = []
     for cell in _code_cells():
-        m = _re.search(r"#@title Step (\d+)", cell)
+        m = _re.search(r"#@title Step (\d+)([a-z]?)", cell)
         if m:
-            numbers.append(int(m.group(1)))
-    assert numbers == sorted(numbers), numbers
-    assert numbers == list(range(1, len(numbers) + 1)), numbers
+            labels.append((int(m.group(1)), m.group(2)))
+
+    assert labels == sorted(labels), labels
+    majors = [n for n, suffix in labels if not suffix]
+    assert majors == list(range(1, len(majors) + 1)), majors
+    # A sub-step must attach to a major step that exists.
+    for number, suffix in labels:
+        if suffix:
+            assert number in majors, (number, suffix)
 
 
 def test_report_push_cell_never_leaks_the_token():
@@ -560,6 +572,21 @@ def test_step1_runs_up_to_the_checkpoint_block_from_a_clean_interpreter():
         sys.path[:] = saved_path
         _restore_redaa_modules(saved_modules)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preflight_cell_comes_before_the_run_and_reuses_its_models():
+    cells = _code_cells()
+    pre_at = next(i for i, c in enumerate(cells) if "Preflight" in c)
+    run_at = next(i for i, c in enumerate(cells) if "Run the search" in c)
+    assert pre_at < run_at, "preflight must come before the run"
+
+    pre = cells[pre_at]
+    assert ".preflight()" in pre
+    # It must stop the user rather than let them start a long run anyway.
+    assert "raise SystemExit" in pre
+    # And hand the loaded models on, or it would double the model-load cost.
+    assert "_REDAA_ENGINES" in pre
+    assert "_REDAA_ENGINES" in cells[run_at]
 
 
 def main():

@@ -834,6 +834,222 @@ class Pipeline:
         return out
 
     # ------------------------------------------------------------------
+    # Preflight
+    # ------------------------------------------------------------------
+    def preflight(self) -> int:
+        """Exercise every real integration point once, then stop.
+
+        All three bugs that reached a GPU run were contract mismatches at the
+        LigandMPNN or ESMFold2 boundary -- the kind of thing no stub can catch,
+        because a stub agrees with whatever this code believes. They surfaced
+        forty minutes into a run, or not until the first design call.
+
+        This does each of those things exactly once, in the order the real run
+        does them, on the smallest input available, and prints a pass/fail
+        table. A broken integration fails here in about a minute with the step
+        named, instead of after an hour with a traceback from inside someone
+        else's library.
+
+        Returns 0 if every check passed, 1 otherwise.
+        """
+        cfg = self.cfg
+        checks: list[tuple[str, bool, str]] = []
+
+        def record(name, ok, detail=""):
+            checks.append((name, bool(ok), detail))
+            mark = "ok  " if ok else "FAIL"
+            print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
+            return ok
+
+        print("\n" + "=" * 70)
+        print("PREFLIGHT -- one of everything, on the shortest input")
+        print("=" * 70)
+
+        # -- inputs --------------------------------------------------------
+        try:
+            domains = self.discover()
+        except SystemExit as exc:
+            record("find inputs", False, str(exc))
+            return 1
+        if not record(
+            "find inputs", bool(domains),
+            f"{len(domains)} in {cfg.input_pdb_dir}" if domains
+            else f"nothing in {cfg.input_pdb_dir} -- fetch or upload first",
+        ):
+            return 1
+
+        # The shortest one, so folding is as cheap as it can be.
+        def _length(item):
+            try:
+                xyz, _ = st.parse_ca_from_file(item[1])
+                return len(xyz)
+            except Exception:  # noqa: BLE001
+                return 10**6
+
+        domain, pdb_path = min(domains, key=_length)
+        ref_xyz, ref_seq = st.parse_ca_from_file(pdb_path)
+        record("parse reference", len(ref_xyz) >= 15,
+               f"{domain}: {len(ref_xyz)} residues")
+
+        # -- engines -------------------------------------------------------
+        try:
+            self.setup()
+        except Exception as exc:  # noqa: BLE001
+            record("load models", False, f"{type(exc).__name__}: {exc}")
+            self._preflight_summary(checks)
+            return 1
+        record("load models", True,
+               f"{cfg.fold_model_id} + {cfg.mpnn_model_type}")
+
+        # -- the site, if one is configured --------------------------------
+        site = None
+        ref_frames = None
+        if cfg.site_enabled:
+            try:
+                site, ref_frames = self.resolve_domain_site(pdb_path, ref_seq)
+                record("resolve site", bool(site and len(site)),
+                       f"{len(site)} positions: {site.describe()}")
+            except Exception as exc:  # noqa: BLE001
+                record("resolve site", False, f"{type(exc).__name__}: {exc}")
+                self._preflight_summary(checks)
+                return 1
+
+        # -- MPNN: featurise, then design ----------------------------------
+        # This is where KeyError: 'chain_mask' lived: featurize() reads keys
+        # parse_PDB does not write.
+        try:
+            n_res = self.mpnn.length_of(pdb_path)
+            record("featurise backbone", n_res > 0, f"{n_res} residues")
+        except Exception as exc:  # noqa: BLE001
+            record("featurise backbone", False, f"{type(exc).__name__}: {exc}")
+            self._preflight_summary(checks)
+            return 1
+
+        try:
+            mpnn_seq = self.mpnn.native_sequence(pdb_path)
+            agree = (not mpnn_seq) or mpnn_seq == ref_seq
+            record("MPNN residue order matches the reference", agree,
+                   "" if agree else "they disagree -- site positions would be wrong")
+        except Exception as exc:  # noqa: BLE001
+            record("MPNN residue order matches the reference", False, str(exc))
+
+        if cfg.mpnn_model_type == "ligand_mpnn":
+            n_lig = self.mpnn.ligand_atom_count(pdb_path)
+            record("ligand atoms present for ligand_mpnn", n_lig > 0,
+                   f"{n_lig} atoms" if n_lig else
+                   "none -- keep a ligand or use protein_mpnn")
+
+        try:
+            designs = self.mpnn.design(pdb_path, list("AGLV"), num_seq=2)
+            ok = bool(designs.pairs)
+            record("MPNN design", ok,
+                   f"{len(designs.pairs)} sequences, best score "
+                   f"{designs.pairs[0][0]:.3f}" if ok else "returned nothing")
+        except Exception as exc:  # noqa: BLE001
+            record("MPNN design", False, f"{type(exc).__name__}: {exc}")
+            self._preflight_summary(checks)
+            return 1
+
+        # -- fixed positions actually hold ---------------------------------
+        # The sequence folded below comes from *this* call when a site is
+        # configured. Folding an unfixed design instead would make the site
+        # checks meaningless -- it would not carry the site at all.
+        probe = designs.pairs[0][1]
+        if site is not None:
+            fixed = {p.index: p.native_aa for p in site.positions}
+            try:
+                held = self.mpnn.design(
+                    pdb_path, list("AGLV"), num_seq=2, fixed=fixed
+                )
+                bad = [
+                    seq for _sc, seq in held.pairs
+                    if not sitemod.site_identity_kept(site, seq)
+                ]
+                record("fixed site positions hold", not bad,
+                       "every design carries the native site residues"
+                       if not bad else f"{len(bad)} design(s) lost them")
+                if held.pairs:
+                    probe = held.pairs[0][1]
+                forced = getattr(self.mpnn, "n_forced_positions", 0)
+                if forced:
+                    record(
+                        "LigandMPNN honoured the chain mask", False,
+                        f"{forced} positions had to be corrected afterwards; "
+                        "MPNN scores in a real run would cover the wrong "
+                        "position set",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                record("fixed site positions hold", False,
+                       f"{type(exc).__name__}: {exc}")
+
+        # -- folding -------------------------------------------------------
+        try:
+            result = self.folder.fold(probe, steps=cfg.fold_steps_screen)
+            ok = result is not None and result.ok
+            record("ESMFold2 fold", ok,
+                   f"pLDDT {_fmt(result.plddt, '0.1f')}, {len(result.ca)} CA"
+                   if ok else "produced no usable model")
+            if not ok:
+                self._preflight_summary(checks)
+                return 1
+        except Exception as exc:  # noqa: BLE001
+            record("ESMFold2 fold", False, f"{type(exc).__name__}: {exc}")
+            self._preflight_summary(checks)
+            return 1
+
+        try:
+            rmsd, tm = st.compare(ref_xyz, ref_seq, result.ca, probe)
+            record("metrics", tm is not None,
+                   f"TM {_fmt(tm)}, RMSD {_fmt(rmsd, '0.2f')} A "
+                   "(a restricted-alphabet design; the value does not matter "
+                   "here, only that it computed)")
+        except Exception as exc:  # noqa: BLE001
+            record("metrics", False, f"{type(exc).__name__}: {exc}")
+
+        # -- site geometry from a prediction -------------------------------
+        if site is not None:
+            frames = result.site_frames
+            if not record(
+                "predicted backbone frames", frames is not None,
+                "ESMFold2's PDB output carries N/CA/C" if frames is not None
+                else "no N/CA/C in the model's output -- site geometry cannot "
+                     "be measured; use SEARCH_MODE=alphabet_only or another "
+                     "fold model",
+            ):
+                self._preflight_summary(checks)
+                return 1
+            try:
+                metrics = sitemod.measure_site(site, ref_frames, frames, probe)
+                record("measure site geometry",
+                       metrics.bb_rmsd is not None, metrics.describe())
+            except Exception as exc:  # noqa: BLE001
+                record("measure site geometry", False,
+                       f"{type(exc).__name__}: {exc}")
+
+        return self._preflight_summary(checks)
+
+    @staticmethod
+    def _preflight_summary(checks) -> int:
+        failed = [name for name, ok, _ in checks if not ok]
+        print("\n" + "=" * 70)
+        if failed:
+            print(f"PREFLIGHT FAILED: {len(failed)} of {len(checks)} checks")
+            for name in failed:
+                print(f"  - {name}")
+            print(
+                "\nFix the first failure above before starting a real run; "
+                "the rest are often downstream of it."
+            )
+            return 1
+        print(f"PREFLIGHT PASSED: {len(checks)} checks")
+        print(
+            "Every model, every contract and every metric this run depends on "
+            "worked once.\nNothing here says the science is right -- only that "
+            "the machinery is connected."
+        )
+        return 0
+
+    # ------------------------------------------------------------------
     # Functional site resolution
     # ------------------------------------------------------------------
     def resolve_domain_site(self, pdb_path: str, ref_seq: str):

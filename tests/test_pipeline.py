@@ -100,6 +100,9 @@ class StubMPNN:
         self.cfg = cfg
         self.fixed_seen: list[dict] = []
         self.ligand_atoms = 0
+        # The real engine counts positions it had to correct after sampling,
+        # which preflight reports on.
+        self.n_forced_positions = 0
         # Stands in for a loaded checkpoint; None means load() never ran.
         self.model = object() if loaded else None
 
@@ -114,6 +117,9 @@ class StubMPNN:
 
     def native_sequence(self, _pdb):
         return NATIVE[: self.length]
+
+    def length_of(self, _pdb):
+        return self.length
 
     def ligand_atom_count(self, _pdb):
         return self.ligand_atoms
@@ -917,6 +923,103 @@ def test_site_run_stops_early_if_the_model_has_no_backbone_frames():
         assert not os.path.exists(
             os.path.join(pipe.run_dir, "testdomA00/run_1/COMPLETED")
         )
+
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+
+def _preflight(tmp, **over):
+    os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+    ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+    _write_reference(ref)
+    cfg = _make_config(tmp, **over)
+    pipe = StubPipeline(cfg)
+    pipe.ref_path = ref
+    return pipe, pipe.preflight()
+
+
+def test_preflight_passes_on_a_healthy_setup():
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_") as tmp:
+        pipe, code = _preflight(tmp)
+        assert code == 0
+        # It really did one of each rather than reporting success blindly.
+        assert pipe.mpnn.calls >= 1
+        assert pipe.folder.calls >= 1
+
+
+def test_preflight_checks_the_site_when_one_is_configured():
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_site_") as tmp:
+        pipe, code = _preflight(
+            tmp, search_mode="site_aware", site_spec=SITE
+        )
+        assert code == 0
+        # The fixed-position design happened, so the mechanism was exercised.
+        assert any(f == SITE_INDICES for f in pipe.mpnn.fixed_seen)
+
+
+def test_preflight_fails_with_no_inputs_instead_of_starting():
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_empty_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        cfg = _make_config(tmp)
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = os.path.join(tmp, "inputs", "nothing.pdb")
+        _write_reference(pipe.ref_path)
+        os.remove(pipe.ref_path)
+        assert pipe.preflight() == 1
+
+
+def test_preflight_reports_a_bad_site_spec_without_running_anything():
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_bad_") as tmp:
+        # Residue 2 is C, not H.
+        pipe, code = _preflight(tmp, search_mode="site_aware", site_spec="H2")
+        assert code == 1
+        # It stopped at the site, before folding anything.
+        assert pipe.folder.calls == 0
+
+
+def test_preflight_catches_a_featurise_contract_break():
+    """The bug that reached Colab: featurize raising on a missing key.
+
+    Preflight exists so this surfaces in a minute rather than forty.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_feat_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp)
+
+        class BrokenMPNN(StubMPNN):
+            def design(self, *a, **k):
+                raise KeyError("chain_mask")
+
+        class P(StubPipeline):
+            def setup(self):
+                super().setup()
+                self.mpnn = BrokenMPNN(length=len(NATIVE))
+
+        pipe = P(cfg)
+        pipe.ref_path = ref
+        assert pipe.preflight() == 1
+
+
+def test_preflight_catches_a_fold_model_with_no_backbone_frames():
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_frames_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+
+        class CaOnly(StubPipeline):
+            def setup(self):
+                super().setup()
+                self.folder.ref_frames = None
+                self.folder.want_frames = True
+
+        pipe = CaOnly(cfg)
+        pipe.ref_path = ref
+        assert pipe.preflight() == 1
 
 
 def main():

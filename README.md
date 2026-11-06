@@ -48,10 +48,13 @@ python run_redaa.py --self-test
 # 3. Confirm the resolved settings
 python run_redaa.py --print-config
 
-# 4. Smoke test on one domain (~5 min on an A100)
+# 4. One of everything -- both models, featurise, design, fold, measure (~1 min)
+python run_redaa.py --preflight
+
+# 5. Smoke test on one domain (~5 min on an A100)
 python run_redaa.py --test
 
-# 5. Submit the real thing
+# 6. Submit the real thing
 sbatch slurm/redaa_array.slurm
 ```
 
@@ -291,6 +294,29 @@ largest wins and cannot be measured without the real models.
 
 ---
 
+## Preflight: fail in a minute, not in an hour
+
+```bash
+python run_redaa.py --preflight
+```
+
+Loads both models and does **one of everything** on the shortest input --
+featurise the backbone, one MPNN design, one design with the site held fixed,
+one fold, the metrics, the site geometry -- then stops with a pass/fail table.
+In Colab it is Step 6b.
+
+This exists because of where the failures actually were. The three bugs that
+reached a real GPU run were all contract mismatches at the LigandMPNN or
+ESMFold2 boundary: a key `featurize` reads that `parse_PDB` never writes, a
+checkpoint belonging to a different model type, a ligand model given no
+ligand. None of them could be caught by a stub -- a stub agrees with whatever
+this code believes -- and all of them surfaced either on the first design call
+or forty minutes into a search.
+
+Preflight hits every one of those points once, in the order the real run hits
+them, and names the first thing that broke. It says nothing about whether the
+science is right; only that the machinery is connected.
+
 ## Preserving binding sites and catalytic residues
 
 A minimal folding alphabet is not a protein. The residues that do the work —
@@ -516,7 +542,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 200 tests
+python run_redaa.py --self-test  # all eight suites, 207 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

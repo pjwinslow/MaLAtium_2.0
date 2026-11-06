@@ -775,6 +775,45 @@ for key in ENV_VARS:
 
 code_with_bootstrap(
     """
+#@title Step 6b — Preflight (do this before any long run)
+#@markdown One of everything, on the shortest input: load both models,
+#@markdown featurise, design, hold the site fixed, fold, measure. About a
+#@markdown minute. Every bug that has reached a real run was a mismatch at the
+#@markdown LigandMPNN or ESMFold2 boundary, and this is where such a thing
+#@markdown shows up -- named, with the fix -- instead of forty minutes into
+#@markdown Step 7.
+import importlib, os, sys
+
+import redaa.config, redaa.pipeline
+importlib.reload(redaa.config)
+importlib.reload(redaa.pipeline)
+
+if not os.environ.get("INPUT_PDB_DIR"):
+    raise SystemExit("INPUT_PDB_DIR is not set -- run Step 4 (inputs) first.")
+
+_cfg = redaa.config.RedAAConfig()
+_problems = _cfg.validate()
+if _problems:
+    print("Configuration problems:")
+    for _line in _problems:
+        print("  - " + _line)
+    raise SystemExit("Fix the settings above (Step 5 / Step 6) and re-run.")
+
+_pre = redaa.pipeline.Pipeline(
+    _cfg,
+    folder=globals().get("_REDAA_ENGINES", {}).get("folder"),
+    mpnn=globals().get("_REDAA_ENGINES", {}).get("mpnn"),
+)
+_code = _pre.preflight()
+# Hand the loaded models to Step 7 so it does not pay for the load again.
+_REDAA_ENGINES = {"folder": _pre.folder, "mpnn": _pre.mpnn}
+if _code != 0:
+    raise SystemExit("Preflight failed -- see the first failure above.")
+"""
+)
+
+code_with_bootstrap(
+    """
 #@title Step 7 — Run the search
 #@markdown Safe to re-run: finished replicates are skipped, cached folds are
 #@markdown free, and the loaded models stay in memory between runs.

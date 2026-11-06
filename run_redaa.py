@@ -80,6 +80,14 @@ def main(argv=None) -> int:
         help="with --fetch, chain to use for any spec that does not name one",
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="run one of everything -- load both models, featurise, design, "
+        "fold, measure, and hold the site fixed once -- then stop. About a "
+        "minute, and it is where an integration problem shows up instead of "
+        "forty minutes into a real run.",
+    )
+    parser.add_argument(
         "--list-presets",
         action="store_true",
         help="describe the verified functional-site test cases and exit",
@@ -246,6 +254,9 @@ def main(argv=None) -> int:
         return 0
 
     from redaa.pipeline import Pipeline
+
+    if args.preflight:
+        return Pipeline(cfg).preflight()
 
     return Pipeline(cfg).run()
 
