@@ -782,7 +782,7 @@ code_with_bootstrap(
 #@markdown LigandMPNN or ESMFold2 boundary, and this is where such a thing
 #@markdown shows up -- named, with the fix -- instead of forty minutes into
 #@markdown Step 7.
-import importlib, os, sys
+import importlib, os, subprocess, sys
 
 import redaa.config, redaa.pipeline
 importlib.reload(redaa.config)
@@ -799,14 +799,42 @@ if _problems:
         print("  - " + _line)
     raise SystemExit("Fix the settings above (Step 5 / Step 6) and re-run.")
 
+# Models stay in memory between cells so a re-run does not pay to load 25 GB
+# of ESMFold2 weights again. But a loaded engine is an instance of the class
+# that was imported when it was built: pulling a fix in Step 1 and reloading
+# the modules does not retrofit it, so the old code keeps running and the fix
+# looks like it never landed. Stamp the checkout's commit on the cache and
+# refuse engines built from different code. Reloading costs a couple of
+# minutes from the on-disk weight cache; a runtime restart would cost the
+# whole download, since HF_HOME lives under /content.
+def _code_version():
+    try:
+        _out = subprocess.run(
+            ["git", "-C", "/content/MaLAtium_2.0", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return _out.stdout.strip()
+    except Exception:
+        return ""
+
+_version = _code_version()
+_cached = globals().get("_REDAA_ENGINES") or {}
+if _cached and _cached.get("version") != _version:
+    print(
+        "The checkout changed since these models were loaded (%s -> %s)."
+        % ((_cached.get("version") or "unknown")[:8], (_version or "unknown")[:8])
+    )
+    print("Reloading them, or the old code would keep running.")
+    _cached = {}
+
 _pre = redaa.pipeline.Pipeline(
-    _cfg,
-    folder=globals().get("_REDAA_ENGINES", {}).get("folder"),
-    mpnn=globals().get("_REDAA_ENGINES", {}).get("mpnn"),
+    _cfg, folder=_cached.get("folder"), mpnn=_cached.get("mpnn")
 )
 _code = _pre.preflight()
 # Hand the loaded models to Step 7 so it does not pay for the load again.
-_REDAA_ENGINES = {"folder": _pre.folder, "mpnn": _pre.mpnn}
+_REDAA_ENGINES = {
+    "folder": _pre.folder, "mpnn": _pre.mpnn, "version": _version,
+}
 if _code != 0:
     raise SystemExit("Preflight failed -- see the first failure above.")
 """
@@ -817,7 +845,7 @@ code_with_bootstrap(
 #@title Step 7 — Run the search
 #@markdown Safe to re-run: finished replicates are skipped, cached folds are
 #@markdown free, and the loaded models stay in memory between runs.
-import importlib, os, sys, time
+import importlib, os, subprocess, sys, time
 
 import redaa.config, redaa.pipeline
 importlib.reload(redaa.config)
@@ -836,7 +864,34 @@ if bool(globals().get("TEST_MODE", False)):
 
 # Hand back the engines from an earlier run in this session so ESMFold2 is not
 # reloaded. Pipeline reloads anyway if the model id changed.
+# Models stay in memory between cells so a re-run does not pay to load 25 GB
+# of ESMFold2 weights again. But a loaded engine is an instance of the class
+# that was imported when it was built: pulling a fix in Step 1 and reloading
+# the modules does not retrofit it, so the old code keeps running and the fix
+# looks like it never landed. Stamp the checkout's commit on the cache and
+# refuse engines built from different code. Reloading costs a couple of
+# minutes from the on-disk weight cache; a runtime restart would cost the
+# whole download, since HF_HOME lives under /content.
+def _code_version():
+    try:
+        _out = subprocess.run(
+            ["git", "-C", "/content/MaLAtium_2.0", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return _out.stdout.strip()
+    except Exception:
+        return ""
+
+_version = _code_version()
 _cached = globals().get("_REDAA_ENGINES") or {}
+if _cached and _cached.get("version") != _version:
+    print(
+        "The checkout changed since these models were loaded (%s -> %s)."
+        % ((_cached.get("version") or "unknown")[:8], (_version or "unknown")[:8])
+    )
+    print("Reloading them, or the old code would keep running.")
+    _cached = {}
+
 pipe = redaa.pipeline.Pipeline(
     cfg, folder=_cached.get("folder"), mpnn=_cached.get("mpnn")
 )
@@ -851,7 +906,9 @@ with rc.capture_run_log() as runlog:
     try:
         exit_code = pipe.run()
     finally:
-        _REDAA_ENGINES = {"folder": pipe.folder, "mpnn": pipe.mpnn}
+        _REDAA_ENGINES = {
+            "folder": pipe.folder, "mpnn": pipe.mpnn, "version": _version,
+        }
         RUN_DIR = pipe.run_dir
 
 REPORT_PATH = runlog.report_path

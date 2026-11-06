@@ -589,6 +589,30 @@ def test_preflight_cell_comes_before_the_run_and_reuses_its_models():
     assert "_REDAA_ENGINES" in cells[run_at]
 
 
+def test_cached_engines_are_discarded_when_the_checkout_changes():
+    """A loaded engine is an instance of the class imported when it was built.
+
+    Models are kept in memory between cells so a re-run does not reload 25 GB
+    of weights. But pulling a fix in Step 1 and reloading the modules does not
+    retrofit an existing instance, so the old method keeps running and the fix
+    looks like it never landed -- which is exactly what happened. The cache is
+    therefore stamped with the checkout's commit and refused when it differs.
+    """
+    for cell in _code_cells():
+        if "_REDAA_ENGINES" not in cell:
+            continue
+        title = next(l for l in cell.splitlines() if l.startswith("#@title"))
+        assert "_code_version" in cell, title
+        assert "rev-parse" in cell, title
+        assert '"version": _version' in cell, title
+        # It must check before building the Pipeline, not after.
+        guard_at = cell.index('_cached.get("version") != _version')
+        use_at = cell.index("_cached.get(\"folder\")")
+        assert guard_at < use_at, title
+        # subprocess has to be imported before the probe runs.
+        assert "subprocess" in cell.split("_code_version")[0], title
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
