@@ -623,6 +623,7 @@ def preview_site(
     poly = [r for r in records if not r.is_hetatm]
     lines = [
         f"{os.path.basename(pdb_path)}: {len(poly)} residues",
+        f"  from     : {F.describe_provenance(pdb_path)}",
         f"  spec     : {site.spec_text}",
         f"  resolved : {len(site)} position(s) -- {site.describe()}",
     ]

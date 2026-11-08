@@ -1097,9 +1097,18 @@ class Pipeline:
         # was written against.
         mismatches = [w for w in site.warnings if w.startswith("NUMBERING MISMATCH")]
         if mismatches:
+            # Name the file and say where it came from. A mismatch is as often
+            # a stale or mislabelled input as a wrong spec, and the two have
+            # opposite fixes.
+            from .fetch import describe_provenance
+
             raise sitemod.SiteError(
                 "site spec does not match this structure's numbering:\n    "
                 + "\n    ".join(mismatches)
+                + f"\n  structure: {pdb_path}"
+                + f"\n  provenance: {describe_provenance(pdb_path)}"
+                + "\n  If the provenance is not the structure you meant, the "
+                "input is stale: re-run the input step to rewrite it."
             )
 
         poly_seq = "".join(r.aa for r in records if not r.is_hetatm)

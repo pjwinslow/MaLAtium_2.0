@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .structure import AA3_TO_1, _OK_ALTLOC
 
@@ -596,6 +597,51 @@ def _collect_ligands(
     return lines, sorted(counts.items()), notes
 
 
+PROVENANCE_TAG = "REDAA"
+
+
+def read_provenance(path: str) -> dict:
+    """Read back the REMARK block :func:`prepare` writes, or ``{}``.
+
+    An empty result means the file predates provenance or was not written by
+    this pipeline -- which is itself worth knowing, since the alternative is
+    guessing what an input directory contains.
+    """
+    out: dict[str, str] = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith(("ATOM", "HETATM")):
+                    break  # the remarks are all at the top
+                if not line.startswith("REMARK"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == PROVENANCE_TAG:
+                    out[parts[3]] = " ".join(parts[4:])
+    except OSError:
+        return {}
+    return out
+
+
+def describe_provenance(path: str) -> str:
+    """One line saying where a prepared input came from."""
+    info = read_provenance(path)
+    if not info:
+        return (
+            "no provenance recorded -- this file was not written by a current "
+            "build, so what it contains cannot be confirmed from the file "
+            "itself. Re-run the input step to rewrite it."
+        )
+    bits = [info.get("spec", "?")]
+    if info.get("chain"):
+        bits.append(f"chain {info['chain']}")
+    if info.get("range"):
+        bits.append(f"residues {info['range']}")
+    if info.get("prepared"):
+        bits.append(f"prepared {info['prepared']}")
+    return ", ".join(bits)
+
+
 def prepare(
     text: str,
     out_path: str,
@@ -603,6 +649,7 @@ def prepare(
     resid_range: tuple[int, int] | None = None,
     keep_ligands: tuple[str, ...] | None = None,
     ligand_contact_cutoff: float = 6.0,
+    spec: str = "",
 ) -> dict:
     """Write a single-chain, pipeline-ready PDB and report what was dropped.
 
@@ -688,8 +735,30 @@ def prepare(
         text, chosen, lines, keep_ligands, ligand_contact_cutoff
     )
 
+    # A prepared file is the thing every later stage trusts, and until now it
+    # carried no record of what it was. An input directory that outlives the
+    # run that filled it then becomes unidentifiable -- which is exactly how a
+    # site spec came to be checked against the wrong structure.
+    numbers_all = [key[0] for key in complete]
+    remarks = [
+        f"REMARK   1 {PROVENANCE_TAG} spec {spec or '(unspecified)'}",
+        f"REMARK   1 {PROVENANCE_TAG} chain {chosen}",
+        f"REMARK   1 {PROVENANCE_TAG} range "
+        f"{min(numbers_all)}-{max(numbers_all)}",
+        f"REMARK   1 {PROVENANCE_TAG} residues {len(complete)}",
+        f"REMARK   1 {PROVENANCE_TAG} prepared "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+    ]
+    if ligands_kept:
+        remarks.append(
+            f"REMARK   1 {PROVENANCE_TAG} ligands "
+            + ",".join(f"{c}:{n}" for c, n in ligands_kept)
+        )
+
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     with open(out_path, "w") as fh:
+        fh.write("\n".join(remarks))
+        fh.write("\n")
         fh.write("\n".join(lines))
         fh.write("\nTER\n")
         if ligand_lines:
@@ -730,7 +799,7 @@ def fetch_and_prepare(
     out_path = os.path.join(out_dir, f"{parsed.name}.pdb")
     report = prepare(
         text, out_path, parsed.chain, parsed.resid_range,
-        keep_ligands=keep_ligands,
+        keep_ligands=keep_ligands, spec=parsed.raw,
     )
     report["name"] = parsed.name
     report["source"] = parsed.source

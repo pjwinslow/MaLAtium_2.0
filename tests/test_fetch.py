@@ -588,6 +588,64 @@ def test_kept_ligand_is_parseable_as_a_site():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_prepare_records_provenance_that_reads_back():
+    """A prepared input has to say what it is.
+
+    An input directory outlives the run that filled it -- in Colab it sits in
+    /content across many cell runs -- and a file named for one structure that
+    contains another is unidentifiable without this. That is not hypothetical:
+    a site spec was checked against the wrong structure and neither the file
+    nor the error could say so.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        F.prepare(_two_chain_pdb(), out, chain="A", spec="1abc_A:1-4")
+        info = F.read_provenance(out)
+        assert info["spec"] == "1abc_A:1-4"
+        assert info["chain"] == "A"
+        assert info["residues"] == "4"
+        assert info["prepared"].endswith("Z")
+        described = F.describe_provenance(out)
+        assert "1abc_A:1-4" in described and "chain A" in described
+
+        # The remarks must not disturb anything that reads the coordinates.
+        from redaa import structure as st
+
+        xyz, seq = st.parse_ca_from_file(out)
+        assert len(xyz) == 4 and len(seq) == 4
+        recs = st.parse_residues_from_file(out)
+        assert len([r for r in recs if not r.is_hetatm]) == 4
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_provenance_of_a_file_without_any_is_reported_not_invented():
+    tmp = tempfile.mkdtemp()
+    try:
+        plain = os.path.join(tmp, "plain.pdb")
+        with open(plain, "w") as fh:
+            fh.write(_two_chain_pdb())
+        assert F.read_provenance(plain) == {}
+        assert "no provenance" in F.describe_provenance(plain)
+        assert "re-run the input step" in F.describe_provenance(plain).lower()
+        # A path that does not exist must not raise.
+        assert "no provenance" in F.describe_provenance(os.path.join(tmp, "nope"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_prepare_records_kept_ligands_in_the_provenance():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        F.prepare(_ligand_pdb(), out, keep_ligands=("ATP",), spec="5etn_A")
+        info = F.read_provenance(out)
+        assert info["ligands"] == "ATP:3"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

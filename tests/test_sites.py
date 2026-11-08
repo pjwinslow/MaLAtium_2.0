@@ -158,9 +158,16 @@ def test_resolve_flags_numbering_mismatch():
         p = _write(os.path.join(tmp, "x.pdb"), "ACDEFGHIK", start=1)
         # Residue 3 is D, not H.
         site = S.resolve_site(S.parse_site_spec("H3"), _records(p))
-        assert any(w.startswith("NUMBERING MISMATCH") for w in site.warnings), (
-            site.warnings
-        )
+        bad = [w for w in site.warnings if w.startswith("NUMBERING MISMATCH")]
+        assert bad, site.warnings
+        # The message has to answer the question it provokes -- what IS this
+        # structure? -- or every mismatch costs a round trip.
+        message = bad[0]
+        assert "has D3 at that position" in message
+        assert "Around it:" in message
+        assert "A1" in message and "F5" in message, message
+        # And where the expected residue actually is, if anywhere.
+        assert "H appears at H7" in message, message
 
 
 def test_resolve_reports_missing_residue():

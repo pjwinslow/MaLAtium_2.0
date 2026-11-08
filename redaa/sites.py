@@ -449,9 +449,25 @@ def resolve_site(
         i = hits[0]
         rec = poly[i]
         if tok.expect_aa and rec.aa != tok.expect_aa:
+            # Show the neighbourhood. A bare "expected H46, found D46" leaves
+            # the obvious question -- what IS this structure? -- unanswered,
+            # and answering it has cost a round trip every time.
+            lo = max(0, i - 4)
+            context = " ".join(
+                f"{r.aa}{r.resseq}" for r in poly[lo : i + 5]
+            )
+            elsewhere = [
+                f"{r.aa}{r.resseq}" for r in poly if r.aa == tok.expect_aa
+            ]
+            hint = ""
+            if elsewhere:
+                shown = ", ".join(elsewhere[:8])
+                more = "" if len(elsewhere) <= 8 else f", +{len(elsewhere) - 8} more"
+                hint = f"; {tok.expect_aa} appears at {shown}{more}"
             warnings.append(
                 f"NUMBERING MISMATCH: spec says {tok.describe()} but the "
-                f"structure has {rec.aa}{rec.resseq} at that position"
+                f"structure has {rec.aa}{rec.resseq} at that position. "
+                f"Around it: {context}{hint}"
             )
         by_role[i] = SitePosition(
             index=i, chain=rec.chain, resseq=rec.resseq, icode=rec.icode,
