@@ -602,15 +602,69 @@ def test_cached_engines_are_discarded_when_the_checkout_changes():
         if "_REDAA_ENGINES" not in cell:
             continue
         title = next(l for l in cell.splitlines() if l.startswith("#@title"))
-        assert "_code_version" in cell, title
-        assert "rev-parse" in cell, title
+        # Keyed on the bootstrap's fingerprint of redaa/*.py, which also
+        # catches a file edited in place -- a commit hash would not.
+        assert '_version = globals().get("_REDAA_CODE", "")' in cell, title
         assert '"version": _version' in cell, title
-        # It must check before building the Pipeline, not after.
+        # The check must come before the Pipeline is built, not after.
         guard_at = cell.index('_cached.get("version") != _version')
         use_at = cell.index("_cached.get(\"folder\")")
         assert guard_at < use_at, title
-        # subprocess has to be imported before the probe runs.
-        assert "subprocess" in cell.split("_code_version")[0], title
+
+
+def test_bootstrap_reimports_redaa_when_it_changes_on_disk():
+    """reload() is not recursive, so stale submodules have to be dropped.
+
+    Reloading redaa.pipeline rebinds MPNNEngine from whatever redaa.mpnn is
+    still in sys.modules. If that is the pre-change module, a pulled fix does
+    not take effect and the cell happily reports that it reloaded -- which is
+    what happened. The bootstrap therefore fingerprints redaa/*.py and drops
+    the package when it moves.
+    """
+    boot = _bootstrap_source(_code_cells()[1])
+    tmp = tempfile.mkdtemp(prefix="redaa_nb_stale_")
+    cwd = os.getcwd()
+    saved_modules = _snapshot_redaa_modules()
+    saved_path = list(sys.path)
+    try:
+        repo = os.path.join(tmp, "MaLAtium_2.0")
+        shutil.copytree(os.path.join(REPO_ROOT, "redaa"), os.path.join(repo, "redaa"))
+        src = boot.replace('"/content/MaLAtium_2.0"', repr(repo)).replace(
+            '"/content/LigandMPNN"', repr(os.path.join(tmp, "LigandMPNN"))
+        )
+
+        # First run: imports redaa and records a fingerprint.
+        scope: dict = {"print": lambda *a, **k: None}
+        exec(src, scope)
+        first = scope["_REDAA_CODE"]
+        assert first
+        marker = object()
+        sys.modules["redaa.colab"].__dict__["_probe"] = marker
+
+        # Re-run with nothing changed: the same module object must survive, or
+        # a later cell would throw away its loaded models for no reason.
+        exec(src, scope)
+        assert scope["_REDAA_CODE"] == first
+        assert sys.modules["redaa.colab"].__dict__.get("_probe") is marker
+
+        # Now change a file on disk, as a git pull would.
+        target = os.path.join(repo, "redaa", "mpnn.py")
+        with open(target, "a") as fh:
+            fh.write("# touched\n")
+        os.utime(target, (0, 0))
+
+        printed: list[str] = []
+        scope["print"] = lambda *a, **k: printed.append(" ".join(map(str, a)))
+        exec(src, scope)
+        assert scope["_REDAA_CODE"] != first, "fingerprint did not change"
+        # The stale module was really dropped, not merely reloaded.
+        assert sys.modules["redaa.colab"].__dict__.get("_probe") is None
+        assert any("changed on disk" in line for line in printed), printed
+    finally:
+        os.chdir(cwd)
+        sys.path[:] = saved_path
+        _restore_redaa_modules(saved_modules)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():

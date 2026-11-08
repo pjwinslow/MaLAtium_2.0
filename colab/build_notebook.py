@@ -101,6 +101,40 @@ os.environ.setdefault("MPNN_REPO", _MPNN)
 # that matches MPNN_MODEL_TYPE, and pinning one here would silently hand a
 # ligand_mpnn run the ProteinMPNN weights.
 
+# Has redaa changed on disk since this kernel imported it? importlib.reload()
+# is not recursive, so reloading redaa.pipeline rebinds MPNNEngine from
+# whatever redaa.mpnn is still in sys.modules -- the old one. Dropping the
+# package forces a genuine reimport, and it has to happen here, before the
+# import below, so that every cell gets it rather than only the ones that
+# remember to ask.
+#
+# The fingerprint is size and mtime of redaa/*.py, not the git commit: it also
+# catches a file edited in place, which a commit hash does not.
+def _redaa_fingerprint():
+    import glob, hashlib
+
+    digest = hashlib.sha1()
+    for _path in sorted(glob.glob(os.path.join(_REPO, "redaa", "*.py"))):
+        _info = os.stat(_path)
+        digest.update(
+            ("%s|%d|%d|" % (os.path.basename(_path), _info.st_size,
+                            _info.st_mtime_ns)).encode()
+        )
+    return digest.hexdigest()
+
+_REDAA_FINGERPRINT = _redaa_fingerprint()
+if globals().get("_REDAA_CODE") not in (None, _REDAA_FINGERPRINT):
+    import importlib as _importlib
+
+    for _stale in [
+        _m for _m in list(sys.modules)
+        if _m == "redaa" or _m.startswith("redaa.")
+    ]:
+        del sys.modules[_stale]
+    _importlib.invalidate_caches()
+    print("redaa changed on disk -- reimporting it.")
+_REDAA_CODE = _REDAA_FINGERPRINT
+
 import redaa.colab as rc
 # -------------------------------------------------------------------------
 """
@@ -801,30 +835,20 @@ if _problems:
 
 # Models stay in memory between cells so a re-run does not pay to load 25 GB
 # of ESMFold2 weights again. But a loaded engine is an instance of the class
-# that was imported when it was built: pulling a fix in Step 1 and reloading
-# the modules does not retrofit it, so the old code keeps running and the fix
-# looks like it never landed. Stamp the checkout's commit on the cache and
-# refuse engines built from different code. Reloading costs a couple of
-# minutes from the on-disk weight cache; a runtime restart would cost the
-# whole download, since HF_HOME lives under /content.
-def _code_version():
-    try:
-        _out = subprocess.run(
-            ["git", "-C", "/content/MaLAtium_2.0", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return _out.stdout.strip()
-    except Exception:
-        return ""
-
-_version = _code_version()
+# that was imported when it was built, so an engine built before a code change
+# keeps running the old code. _REDAA_CODE is the fingerprint the bootstrap
+# above computed; engines carry the fingerprint they were built from, and are
+# refused when it no longer matches. Reloading costs a couple of minutes from
+# the on-disk weight cache; a runtime restart would cost the whole download,
+# since HF_HOME lives under /content.
+_version = globals().get("_REDAA_CODE", "")
 _cached = globals().get("_REDAA_ENGINES") or {}
 if _cached and _cached.get("version") != _version:
     print(
-        "The checkout changed since these models were loaded (%s -> %s)."
+        "redaa changed since these models were loaded (%s -> %s); reloading "
+        "them, or the old code would keep running."
         % ((_cached.get("version") or "unknown")[:8], (_version or "unknown")[:8])
     )
-    print("Reloading them, or the old code would keep running.")
     _cached = {}
 
 _pre = redaa.pipeline.Pipeline(
@@ -866,30 +890,20 @@ if bool(globals().get("TEST_MODE", False)):
 # reloaded. Pipeline reloads anyway if the model id changed.
 # Models stay in memory between cells so a re-run does not pay to load 25 GB
 # of ESMFold2 weights again. But a loaded engine is an instance of the class
-# that was imported when it was built: pulling a fix in Step 1 and reloading
-# the modules does not retrofit it, so the old code keeps running and the fix
-# looks like it never landed. Stamp the checkout's commit on the cache and
-# refuse engines built from different code. Reloading costs a couple of
-# minutes from the on-disk weight cache; a runtime restart would cost the
-# whole download, since HF_HOME lives under /content.
-def _code_version():
-    try:
-        _out = subprocess.run(
-            ["git", "-C", "/content/MaLAtium_2.0", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return _out.stdout.strip()
-    except Exception:
-        return ""
-
-_version = _code_version()
+# that was imported when it was built, so an engine built before a code change
+# keeps running the old code. _REDAA_CODE is the fingerprint the bootstrap
+# above computed; engines carry the fingerprint they were built from, and are
+# refused when it no longer matches. Reloading costs a couple of minutes from
+# the on-disk weight cache; a runtime restart would cost the whole download,
+# since HF_HOME lives under /content.
+_version = globals().get("_REDAA_CODE", "")
 _cached = globals().get("_REDAA_ENGINES") or {}
 if _cached and _cached.get("version") != _version:
     print(
-        "The checkout changed since these models were loaded (%s -> %s)."
+        "redaa changed since these models were loaded (%s -> %s); reloading "
+        "them, or the old code would keep running."
         % ((_cached.get("version") or "unknown")[:8], (_version or "unknown")[:8])
     )
-    print("Reloading them, or the old code would keep running.")
     _cached = {}
 
 pipe = redaa.pipeline.Pipeline(
