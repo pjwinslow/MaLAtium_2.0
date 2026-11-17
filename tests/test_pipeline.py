@@ -1141,6 +1141,114 @@ def test_auto_precision_follows_what_the_gpu_actually_supports():
             sys.modules["torch"] = saved
 
 
+def test_preflight_names_the_install_for_a_missing_model_dependency():
+    """ESMFold2's implementation arrives with the weights and brings imports.
+
+    "No module named 'biotite'" came from inside the model, on the first fold,
+    after 25 GB had downloaded. Preflight checks the model card's list before
+    folding so the pip line is in hand first.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_dep_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp)
+
+        from redaa import colab as rc
+        from redaa.folding import FoldEngine
+
+        class QuietEngine(FoldEngine):
+            """A real FoldEngine -- so the check applies -- that loads nothing.
+
+            The dependency check deliberately runs only for the real engine,
+            since a model card's list says nothing about an injected stub. A
+            subclass is the honest way to exercise that branch.
+            """
+
+            def __init__(self, cfg, ref):
+                super().__init__(cfg, verbose=False)
+                self.model = object()
+                self._ref = ref
+
+            def load(self):
+                pass
+
+            def stats(self):
+                return "quiet"
+
+            def fold(self, sequence, steps=None, want_frames=None):
+                return FoldResult(sequence, 88.0, 0.9, self._ref)
+
+            def fold_many(self, sequences, steps=None):
+                return [self.fold(s) for s in sequences]
+
+        saved = rc.model_requirements
+        try:
+            rc.model_requirements = lambda model_id, revision="main": (
+                [("redaa-absent-xyz", ">=1.0")], "stub card"
+            )
+
+            class P(StubPipeline):
+                def setup(self):
+                    super().setup()
+                    self.folder = QuietEngine(self.cfg, self.folder.ref)
+
+            pipe = P(cfg)
+            pipe.ref_path = ref
+
+            import contextlib
+            import io
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                pipe.preflight()
+            out = buf.getvalue()
+            assert "fold model dependencies" in out
+            assert "redaa-absent-xyz" in out
+            assert "pip install redaa-absent-xyz>=1.0" in out
+        finally:
+            rc.model_requirements = saved
+
+
+def test_missing_module_hint_maps_import_names_to_distributions():
+    from redaa.config import RedAAConfig
+    from redaa.folding import FoldEngine
+
+    engine = FoldEngine(RedAAConfig())
+    hint = engine._missing_module_hint(
+        ModuleNotFoundError("No module named 'biotite'", name="biotite")
+    )
+    assert "pip install biotite" in hint
+    # Import name and distribution name differ for these.
+    assert "pip install biopython" in engine._missing_module_hint(
+        ModuleNotFoundError("No module named 'Bio'", name="Bio")
+    )
+    assert "pip install msgpack-numpy" in engine._missing_module_hint(
+        ModuleNotFoundError("x", name="msgpack_numpy")
+    )
+    # Only import errors get this treatment.
+    assert engine._missing_module_hint(RuntimeError("bf16")) == ""
+
+
+def test_preflight_skips_the_dependency_check_for_an_injected_engine():
+    """A model card's dependency list says nothing about a stub.
+
+    The check must apply to the engine that actually downloads and runs the
+    model card's code, and be silent otherwise -- not fail a run whose folder
+    was supplied by the caller.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_skip_") as tmp:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _pipe, code = _preflight(tmp)
+        out = buf.getvalue()
+        assert code == 0
+        assert "fold model dependencies" not in out
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

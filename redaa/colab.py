@@ -816,6 +816,135 @@ def describe_site_results(rows: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The fold model's own dependencies
+# ---------------------------------------------------------------------------
+#
+# ESMFold2 loads with trust_remote_code=True, so the implementation comes from
+# the model repository and brings its own imports. Those are not this
+# repository's dependencies and nothing here can know them -- the first sign
+# of a missing one is ModuleNotFoundError from inside the model, on the first
+# fold, after the weights have downloaded. The model card declares them, so
+# ask it.
+
+HF_REQUIREMENTS_URL = "https://huggingface.co/{model_id}/raw/{revision}/requirements.txt"
+
+# Used when the model card cannot be reached (offline, a login node, a private
+# mirror). These are the non-core entries of ESMFold2-Fast's own list -- the
+# ones a torch-and-transformers environment will not already have. Core
+# packages are deliberately absent: see below on why versions are never
+# upgraded from here.
+FALLBACK_MODEL_REQUIREMENTS = (
+    "biotite", "biopython", "brotli", "einops", "msgpack", "msgpack-numpy",
+    "omegaconf", "rdkit", "scipy", "tqdm", "zstandard",
+)
+
+# Never installed or upgraded automatically, whatever a model card asks for.
+# Replacing these under a kernel that has already imported them is the classic
+# Colab failure: nothing reports a version mismatch and you get an ABI error
+# or a nonsense AttributeError somewhere unrelated.
+PROTECTED_DISTRIBUTIONS = frozenset({
+    "torch", "torchvision", "torchaudio", "numpy", "transformers",
+    "tokenizers", "safetensors", "huggingface-hub", "huggingface_hub",
+    "accelerate", "nvidia-cublas-cu12", "triton",
+})
+
+
+def _parse_requirement(line: str) -> tuple[str, str] | None:
+    """``("biotite", ">=1.7")`` from a requirements line, or None."""
+    text = line.split("#", 1)[0].strip()
+    if not text or text.startswith("-"):
+        return None
+    for i, char in enumerate(text):
+        if char in "<>=!~[ ;":
+            return text[:i].strip().lower(), text[i:].strip()
+    return text.lower(), ""
+
+
+def model_requirements(
+    model_id: str, revision: str = "main", timeout: float = 20.0
+) -> tuple[list[tuple[str, str]], str]:
+    """``(requirements, source)`` from the model repo's requirements.txt."""
+    import urllib.request
+
+    url = HF_REQUIREMENTS_URL.format(model_id=model_id, revision=revision)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            if getattr(response, "status", 200) != 200:
+                raise OSError(f"HTTP {response.status}")
+            body = response.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        return (
+            [(name, "") for name in FALLBACK_MODEL_REQUIREMENTS],
+            f"model card unreachable ({type(exc).__name__}); using the "
+            "built-in list",
+        )
+
+    parsed = [_parse_requirement(line) for line in body.splitlines()]
+    found = [item for item in parsed if item]
+    if not found:
+        return (
+            [(name, "") for name in FALLBACK_MODEL_REQUIREMENTS],
+            "model card had no usable requirements; using the built-in list",
+        )
+    return found, f"{model_id} requirements.txt"
+
+
+def missing_distributions(names) -> list[str]:
+    """Those of *names* that are not installed at all.
+
+    Only absence counts. A package that is present but older than a model
+    card's floor is left alone: the floors are frequently aspirational, the
+    installed versions demonstrably work, and upgrading one of them mid-session
+    is more likely to break the kernel than to fix anything.
+    """
+    import importlib.metadata as md
+
+    missing = []
+    for name in names:
+        try:
+            md.version(name)
+        except Exception:  # noqa: BLE001
+            missing.append(name)
+    return missing
+
+
+def model_dependency_plan(model_id: str, revision: str = "main") -> dict:
+    """What the fold model needs, and what is not installed."""
+    requirements, source = model_requirements(model_id, revision=revision)
+    considered = [
+        (name, spec) for name, spec in requirements
+        if name not in PROTECTED_DISTRIBUTIONS
+    ]
+    protected = [
+        name for name, _ in requirements if name in PROTECTED_DISTRIBUTIONS
+    ]
+    missing = missing_distributions(name for name, _ in considered)
+    by_name = dict(considered)
+    return {
+        "source": source,
+        "requirements": requirements,
+        "missing": missing,
+        # Keep each missing package's version floor, so the install honours it.
+        "install": [f"{name}{by_name.get(name, '')}" for name in missing],
+        "skipped_protected": protected,
+    }
+
+
+def describe_dependency_plan(plan: dict) -> str:
+    lines = [f"Fold model dependencies, from {plan['source']}:"]
+    if plan["missing"]:
+        lines.append(f"  missing: {', '.join(plan['missing'])}")
+    else:
+        lines.append("  all present")
+    if plan["skipped_protected"]:
+        lines.append(
+            "  left alone (replacing these under a running kernel is the "
+            f"bigger risk): {', '.join(sorted(set(plan['skipped_protected'])))}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 

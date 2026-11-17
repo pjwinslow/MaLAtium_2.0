@@ -349,6 +349,22 @@ if needed:
 else:
     print("$ (python dependencies already satisfied -- nothing to install)")
 
+# --- the fold model's own dependencies -------------------------------------
+# ESMFold2 loads with trust_remote_code=True, so its implementation comes from
+# the model repository and brings imports this repo cannot know. The first sign
+# of a missing one is ModuleNotFoundError from inside the model, on the first
+# fold, after 25 GB of weights have downloaded -- which is exactly how
+# "No module named 'biotite'" was found. The model card lists them, so ask it,
+# and install only what is actually absent: upgrading torch or numpy under a
+# kernel that has already imported them is the worse failure.
+import redaa.colab as _rc
+import redaa.config as _redaa_config
+
+_plan = _rc.model_dependency_plan(_redaa_config.RedAAConfig().fold_model_id)
+print(_rc.describe_dependency_plan(_plan))
+if _plan["install"]:
+    sh("pip install -q " + " ".join("'%s'" % r for r in _plan["install"]))
+
 # --- LigandMPNN ------------------------------------------------------------
 if not os.path.isdir(os.path.join(MPNN_DIR, ".git")):
     sh("git clone -q --depth 1 https://github.com/dauparas/LigandMPNN " + MPNN_DIR)

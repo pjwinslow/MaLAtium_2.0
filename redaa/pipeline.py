@@ -46,6 +46,10 @@ from .search import Metrics, Validator, backward_prune
 DONE_SENTINEL = "COMPLETED"
 
 
+class _SkipCheck(Exception):
+    """A preflight check that does not apply to this configuration."""
+
+
 def _fmt(value, spec="0.3f") -> str:
     return f"{value:{spec}}" if value is not None else "N/A"
 
@@ -983,6 +987,33 @@ class Pipeline:
                        f"{type(exc).__name__}: {exc}")
 
         # -- folding -------------------------------------------------------
+        # The fold model's implementation is downloaded with the weights, so
+        # its imports are not this repo's dependencies. Check them before
+        # folding: a missing one otherwise surfaces as ModuleNotFoundError
+        # from inside someone else's code.
+        try:
+            if not isinstance(self.folder, FoldEngine):
+                # An injected engine does not load the model card's code, so
+                # that card's dependency list says nothing about it.
+                raise _SkipCheck
+            from .colab import model_dependency_plan
+
+            plan = model_dependency_plan(cfg.fold_model_id)
+            if plan["missing"]:
+                record(
+                    "fold model dependencies", False,
+                    f"not installed: {', '.join(plan['missing'])} -- "
+                    "pip install " + " ".join(plan["install"]),
+                )
+            else:
+                record("fold model dependencies", True,
+                       f"all present ({plan['source']})")
+        except _SkipCheck:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            # Never fail the run over the check itself.
+            print(f"    (could not check model dependencies: {exc})")
+
         # State what is about to be attempted, so a failure is interpretable
         # even when the model's own error is opaque.
         print(

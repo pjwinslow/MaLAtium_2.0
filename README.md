@@ -169,6 +169,19 @@ the pipeline falls back to its own seed-refined TM-score, which agrees closely
 but is slower per comparison. LigandMPNN is used as a source checkout, not a
 package — clone it and run its `get_model_params.sh`, then set `MPNN_REPO`.
 
+**The fold model brings its own dependencies.** ESMFold2 loads with
+`trust_remote_code=True`, so its implementation is downloaded with the weights
+and imports packages this repository cannot know about — `biotite`, `rdkit`,
+`omegaconf` and others. A missing one surfaces as `ModuleNotFoundError` from
+inside the model, on the first fold, after the weights have downloaded.
+`redaa.colab.model_dependency_plan()` reads the model card's own
+`requirements.txt` and reports what is absent; Step 1 installs it, preflight
+checks it before folding, and a fold that fails this way names the `pip
+install` line. Only *missing* packages are installed — a card's floors for
+torch, numpy or transformers are reported and left alone, because replacing
+those under a kernel that has already imported them is the worse failure.
+`requirements.txt` carries the same list for an offline or batch install.
+
 ESMFold2-Fast needs a recent `transformers` and loads with
 `trust_remote_code=True`, which pulls the FastPLMs implementation from the
 model repository. Pre-cache the weights on a login node (`HF_HOME` pointing at
@@ -546,7 +559,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 218 tests
+python run_redaa.py --self-test  # all eight suites, 226 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

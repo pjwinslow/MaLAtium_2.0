@@ -969,6 +969,92 @@ def test_preview_site_refuses_a_ligand_model_on_a_ligand_free_input():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# The fold model's own dependencies
+# ---------------------------------------------------------------------------
+
+
+def test_parses_a_model_card_requirements_file():
+    body = """
+# a comment
+torch>=2.14
+biotite>=1.7
+rdkit
+-e .
+"""
+    parsed = [C._parse_requirement(l) for l in body.splitlines()]
+    assert [p for p in parsed if p] == [
+        ("torch", ">=2.14"), ("biotite", ">=1.7"), ("rdkit", ""),
+    ]
+
+
+def test_dependency_plan_never_touches_core_packages():
+    """Upgrading torch or numpy under a live kernel is the worse failure.
+
+    A model card declares floors for them (ESMFold2-Fast asks for torch>=2.14
+    and transformers>=5.17), but the installed versions demonstrably work --
+    the model loads and designs -- and swapping them mid-session produces ABI
+    errors far from the cause.
+    """
+    plan = C.model_dependency_plan.__wrapped__ if hasattr(
+        C.model_dependency_plan, "__wrapped__"
+    ) else C.model_dependency_plan
+
+    saved = C.model_requirements
+    try:
+        C.model_requirements = lambda model_id, revision="main": (
+            [("torch", ">=2.14"), ("numpy", ">=2.5"), ("biotite", ">=1.7"),
+             ("transformers", ">=5.17")],
+            "stub",
+        )
+        result = plan("Some/Model")
+        assert "torch" not in result["missing"]
+        assert "numpy" not in result["missing"]
+        assert set(result["skipped_protected"]) >= {"torch", "numpy", "transformers"}
+        # The version floor travels with anything it does install.
+        if "biotite" in result["missing"]:
+            assert "biotite>=1.7" in result["install"]
+    finally:
+        C.model_requirements = saved
+
+
+def test_dependency_plan_falls_back_when_the_card_is_unreachable():
+    saved = C.model_requirements
+    try:
+        reqs, source = C.model_requirements(
+            "Nonexistent/Model-does-not-exist", timeout=0.001
+        )
+        # Either the fetch failed (fallback) or we are offline; either way the
+        # list must be usable rather than empty.
+        assert reqs, "no requirements and no fallback"
+        names = [n for n, _ in reqs]
+        assert "biotite" in names
+        if "built-in list" in source:
+            assert set(names) == set(C.FALLBACK_MODEL_REQUIREMENTS)
+    finally:
+        C.model_requirements = saved
+
+
+def test_missing_distributions_reports_absence_not_version():
+    # Something certainly installed, and something certainly not.
+    assert C.missing_distributions(["numpy"]) == []
+    assert C.missing_distributions(
+        ["redaa-no-such-distribution-xyz"]
+    ) == ["redaa-no-such-distribution-xyz"]
+
+
+def test_describe_dependency_plan_is_readable_either_way():
+    text = C.describe_dependency_plan(
+        {"source": "card", "missing": ["biotite"], "install": ["biotite>=1.7"],
+         "skipped_protected": ["torch"], "requirements": []}
+    )
+    assert "missing: biotite" in text and "torch" in text
+    ok = C.describe_dependency_plan(
+        {"source": "card", "missing": [], "install": [],
+         "skipped_protected": [], "requirements": []}
+    )
+    assert "all present" in ok
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -377,7 +377,7 @@ class FoldEngine:
             return None
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
-            hint = self._precision_hint(exc)
+            hint = self._missing_module_hint(exc) or self._precision_hint(exc)
             if hint:
                 self.last_error += f" -- {hint}"
             print(f"    ESMFold2 error: {self.last_error}")
@@ -436,6 +436,30 @@ class FoldEngine:
         self.cache.put(key, plddt, ptm, ca, frames)
         return FoldResult(
             sequence, plddt, ptm, ca, pdb_text=pdb_text, frames=frames
+        )
+
+    @staticmethod
+    def _missing_module_hint(exc: Exception) -> str:
+        """Name the install when the model's own code imports something absent.
+
+        The implementation arrives with the weights under
+        trust_remote_code=True, so its imports are the model's dependencies,
+        not this repository's. A missing one cannot be anticipated here -- only
+        reported usefully.
+        """
+        if not isinstance(exc, ModuleNotFoundError):
+            return ""
+        name = getattr(exc, "name", "") or ""
+        if not name:
+            return ""
+        # A few import names differ from the distribution that provides them.
+        dist = {"Bio": "biopython", "msgpack_numpy": "msgpack-numpy"}.get(
+            name, name
+        )
+        return (
+            f"the fold model imports {name!r}, which is not installed: "
+            f"pip install {dist} (Step 1 installs the model card's "
+            "requirements; re-run it)"
         )
 
     def _precision_hint(self, exc: Exception) -> str:

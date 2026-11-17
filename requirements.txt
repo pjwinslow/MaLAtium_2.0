@@ -14,6 +14,26 @@ huggingface_hub>=0.23
 # own seed-refined TM-score, which agrees closely but costs more per call.
 tmtools>=0.2.0
 
+# ESMFold2's implementation is downloaded with the weights
+# (trust_remote_code=True), so these are the *model's* dependencies, not this
+# package's -- a missing one surfaces as ModuleNotFoundError from inside the
+# model on the first fold. The authoritative list is the model card's own
+# requirements.txt; redaa.colab.model_dependency_plan() fetches it and the
+# Colab installer acts on it. This is the ESMFold2-Fast set, for an offline
+# or batch install. Core packages (torch, numpy, transformers) are left to the
+# pins above on purpose.
+biotite>=1.7
+biopython>=1.88
+brotli>=1.2
+einops>=0.8
+msgpack>=1.2
+msgpack-numpy>=0.4.8
+omegaconf>=2.3
+rdkit>=2026.3
+scipy>=1.18
+tqdm>=4.70
+zstandard>=0.25
+
 # LigandMPNN is used as a source checkout rather than a package:
 #   git clone https://github.com/dauparas/LigandMPNN
 #   cd LigandMPNN && bash get_model_params.sh ./model_params
