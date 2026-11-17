@@ -1080,6 +1080,67 @@ def test_precision_hint_names_the_t4_problem_only_for_dtype_errors():
     assert "already" in FoldEngine(cfg)._precision_hint(RuntimeError("bad dtype"))
 
 
+def test_auto_precision_follows_what_the_gpu_actually_supports():
+    """"auto" has to mean auto, or the default is a trap.
+
+    FOLD_PRECISION="auto" used to be handed to the model verbatim. A revision
+    that rejects it raises, and the fallback is the *model default* -- bf16 --
+    so a pre-Ampere GPU loaded happily and failed on the first forward pass.
+    Asking the device costs nothing.
+    """
+    import types
+
+    from redaa.folding import FoldEngine
+
+    def _fake_torch(bf16, name):
+        mod = types.ModuleType("torch")
+        mod.cuda = types.SimpleNamespace(
+            is_bf16_supported=lambda: bf16,
+            get_device_name=lambda i: name,
+            is_available=lambda: True,
+        )
+        return mod
+
+    saved = sys.modules.get("torch")
+    cfg = _make_config(tempfile.mkdtemp(prefix="redaa_prec_"))
+    try:
+        cfg.fold_precision = "auto"
+
+        sys.modules["torch"] = _fake_torch(True, "NVIDIA A100-SXM4-40GB")
+        precision, why = FoldEngine(cfg)._resolve_precision(True)
+        assert precision == "bf16", (precision, why)
+
+        sys.modules["torch"] = _fake_torch(False, "Tesla T4")
+        precision, why = FoldEngine(cfg)._resolve_precision(True)
+        assert precision == "fp16", (precision, why)
+        assert "T4" in why and "bfloat16" in why
+
+        # CPU gets fp32, not a half precision it cannot use well.
+        assert FoldEngine(cfg)._resolve_precision(False)[0] == "fp32"
+
+        # An explicit choice is never second-guessed.
+        cfg.fold_precision = "bf16"
+        precision, why = FoldEngine(cfg)._resolve_precision(True)
+        assert precision == "bf16" and "requested" in why
+
+        # A device that cannot answer falls back to the safe option rather
+        # than raising during load.
+        broken = types.ModuleType("torch")
+        broken.cuda = types.SimpleNamespace(
+            is_bf16_supported=lambda: (_ for _ in ()).throw(RuntimeError("x")),
+            get_device_name=lambda i: (_ for _ in ()).throw(RuntimeError("x")),
+            is_available=lambda: True,
+        )
+        sys.modules["torch"] = broken
+        cfg.fold_precision = "auto"
+        assert FoldEngine(cfg)._resolve_precision(True)[0] == "fp16"
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

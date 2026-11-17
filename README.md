@@ -101,10 +101,12 @@ results, diagnose.
 What it handles that the batch job does not need to:
 
 - **GPU roulette.** A free session is usually a T4, which is pre-Ampere and has
-  **no bfloat16** — and ESMFold2's ESM-C backbone loads in bf16 by default. The
-  GPU-check cell reports this up front and suggests `FOLD_PRECISION="fp16"`, a
-  smaller ESMFold2 variant, or an L4/A100 runtime, rather than letting you
-  discover it twenty minutes in. It also caps `FOLD_MAX_RESIDUES` from the
+  **no bfloat16** — and ESMFold2's ESM-C backbone wants bf16 by default. The
+  default `FOLD_PRECISION="auto"` now asks the device and picks fp16 on such a
+  GPU, printing which it chose and why, so this is handled rather than
+  diagnosed. The GPU-check cell still reports it up front and suggests a
+  smaller ESMFold2 variant or an L4/A100 runtime if you want the accuracy
+  back. It also caps `FOLD_MAX_RESIDUES` from the
   VRAM it actually finds (320 at T4 scale, 512 at L4, 1024 at A100).
 - **Sessions that end without warning.** The Drive cell points `OUTPUT_ROOT`,
   `FOLD_CACHE_PATH` and `HF_HOME` at Drive. Completed replicates are
@@ -542,7 +544,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 217 tests
+python run_redaa.py --self-test  # all eight suites, 218 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

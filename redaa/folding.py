@@ -129,8 +129,39 @@ class FoldEngine:
         self._pdb_fn = None
         self.n_folded = 0
         self.fold_seconds = 0.0
+        # What "auto" actually resolved to, once the device is known.
+        self.resolved_precision = ""
 
     # -- setup ------------------------------------------------------------
+    def _resolve_precision(self, use_gpu: bool) -> tuple[str, str]:
+        """Turn ``FOLD_PRECISION`` into a concrete dtype, with the reason.
+
+        ``auto`` used to be passed to the model verbatim. A revision that does
+        not accept it raises, and the fallback is then the *model default* --
+        bf16 -- so a pre-Ampere GPU with no bfloat16 loaded happily and failed
+        on the first forward pass, with an error about dtypes or missing
+        kernels that never mentions the GPU generation. Asking the device what
+        it supports costs nothing and removes that failure entirely.
+        """
+        import torch
+
+        requested = (self.cfg.fold_precision or "auto").strip().lower()
+        if requested and requested != "auto":
+            return requested, "requested explicitly"
+        if not use_gpu:
+            return "fp32", "running on CPU"
+        try:
+            if torch.cuda.is_bf16_supported():
+                return "bf16", "this GPU supports bfloat16"
+        except Exception:  # noqa: BLE001
+            pass
+        name = ""
+        try:
+            name = torch.cuda.get_device_name(0)
+        except Exception:  # noqa: BLE001
+            pass
+        return "fp16", f"{name or 'this GPU'} has no bfloat16"
+
     def load(self) -> None:
         import torch
         from transformers import AutoModel
@@ -145,13 +176,23 @@ class FoldEngine:
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
+        precision, why = self._resolve_precision(use_gpu)
+        self.resolved_precision = precision
+
         kwargs: dict[str, object] = {"trust_remote_code": True}
         if use_gpu:
             kwargs["device_map"] = {"": self.device}
-            kwargs["esmc_precision"] = self.cfg.fold_precision
+            kwargs["esmc_precision"] = precision
 
         if self.verbose:
             print(f"Loading {self.cfg.fold_model_id} (trust_remote_code=True)...")
+            if use_gpu:
+                note = (
+                    f"  precision: {precision} ({why})"
+                    if self.cfg.fold_precision.strip().lower() in ("", "auto")
+                    else f"  precision: {precision} (FOLD_PRECISION)"
+                )
+                print(note)
 
         try:
             model = AutoModel.from_pretrained(self.cfg.fold_model_id, **kwargs)
@@ -163,9 +204,12 @@ class FoldEngine:
             if "esmc_precision" not in kwargs:
                 raise
             print(
-                f"  esmc_precision={self.cfg.fold_precision!r} rejected "
-                f"({exc}); retrying with the model default"
+                f"  esmc_precision={precision!r} rejected ({exc}); retrying "
+                "with the model default. If that default is bf16 and this GPU "
+                "has none, the first fold will fail -- set FOLD_PRECISION "
+                "explicitly or use a smaller FOLD_MODEL_ID."
             )
+            self.resolved_precision = "model default"
             kwargs.pop("esmc_precision", None)
             model = AutoModel.from_pretrained(self.cfg.fold_model_id, **kwargs)
 
@@ -409,7 +453,7 @@ class FoldEngine:
         )
         if not any(m in text for m in markers):
             return ""
-        current = self.cfg.fold_precision
+        current = self.resolved_precision or self.cfg.fold_precision
         if current in ("fp16", "fp32"):
             return (
                 f"FOLD_PRECISION is already {current!r}; try 'fp32', or a "
