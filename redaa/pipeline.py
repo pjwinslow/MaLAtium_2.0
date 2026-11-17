@@ -983,17 +983,38 @@ class Pipeline:
                        f"{type(exc).__name__}: {exc}")
 
         # -- folding -------------------------------------------------------
+        # State what is about to be attempted, so a failure is interpretable
+        # even when the model's own error is opaque.
+        print(
+            f"    folding L={len(probe)} at {cfg.fold_steps_screen} steps, "
+            f"precision={cfg.fold_precision}, "
+            f"FOLD_MAX_RESIDUES={cfg.fold_max_residues}"
+        )
         try:
             result = self.folder.fold(probe, steps=cfg.fold_steps_screen)
             ok = result is not None and result.ok
-            record("ESMFold2 fold", ok,
-                   f"pLDDT {_fmt(result.plddt, '0.1f')}, {len(result.ca)} CA"
-                   if ok else "produced no usable model")
+            # fold() returns None for five different reasons and prints each
+            # one; carry the actual reason into the check rather than making
+            # the reader scroll for it.
+            detail = (
+                f"pLDDT {_fmt(result.plddt, '0.1f')}, {len(result.ca)} CA"
+                if ok else (
+                    getattr(self.folder, "last_error", "")
+                    or "produced no usable model"
+                )
+            )
+            record("ESMFold2 fold", ok, detail)
             if not ok:
                 self._preflight_summary(checks)
                 return 1
         except Exception as exc:  # noqa: BLE001
-            record("ESMFold2 fold", False, f"{type(exc).__name__}: {exc}")
+            hint = ""
+            try:
+                hint = self.folder._precision_hint(exc)
+            except Exception:  # noqa: BLE001
+                hint = ""
+            record("ESMFold2 fold", False,
+                   f"{type(exc).__name__}: {exc}" + (f" -- {hint}" if hint else ""))
             self._preflight_summary(checks)
             return 1
 

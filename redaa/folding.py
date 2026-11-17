@@ -113,6 +113,11 @@ class FoldEngine:
         # Set if the model's output turns out to have no backbone frame, so
         # the warning is printed once rather than per fold.
         self.frames_unavailable = False
+        # Why the most recent fold returned None. fold() prints each reason as
+        # it happens, but a caller that only sees None cannot report it -- so
+        # preflight could say no more than "produced no usable model" about a
+        # failure whose cause was one line further up the log.
+        self.last_error = ""
         self.cache = cache if cache is not None else FoldCache(None, enabled=False)
         self.verbose = verbose
         self.model = None
@@ -297,10 +302,12 @@ class FoldEngine:
             return FoldResult(sequence, plddt, ptm, ca, frames=frames)
 
         if len(sequence) > self.cfg.fold_max_residues:
-            print(
-                f"    skipping fold: {len(sequence)} residues exceeds "
-                f"FOLD_MAX_RESIDUES={self.cfg.fold_max_residues}"
+            self.last_error = (
+                f"{len(sequence)} residues exceeds FOLD_MAX_RESIDUES="
+                f"{self.cfg.fold_max_residues}; raise it, or use shorter "
+                "domains"
             )
+            print(f"    skipping fold: {self.last_error}")
             return None
 
         if self.model is None:
@@ -317,10 +324,19 @@ class FoldEngine:
                 result = self._fold_fn(sequence, **call_kwargs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            print(f"    ESMFold2 OOM at L={len(sequence)}; skipping this sequence")
+            self.last_error = (
+                f"CUDA out of memory at L={len(sequence)}. Lower "
+                "FOLD_STEPS_SCREEN, use a smaller FOLD_MODEL_ID "
+                "(ESMFold2-600 / ESMFold2-300), or a larger GPU"
+            )
+            print(f"    ESMFold2 OOM: {self.last_error}")
             return None
         except Exception as exc:  # noqa: BLE001
-            print(f"    ESMFold2 error: {exc}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            hint = self._precision_hint(exc)
+            if hint:
+                self.last_error += f" -- {hint}"
+            print(f"    ESMFold2 error: {self.last_error}")
             return None
         finally:
             self.fold_seconds += time.time() - started
@@ -328,7 +344,11 @@ class FoldEngine:
 
         pdb_text = self._result_pdb_text(result)
         if not pdb_text:
-            print("    ESMFold2 returned no PDB text for this sequence")
+            self.last_error = (
+                "the model ran but its result_to_pdb produced no text; this "
+                "revision may name that method differently"
+            )
+            print(f"    ESMFold2: {self.last_error}")
             return None
 
         frames = None
@@ -361,15 +381,44 @@ class FoldEngine:
         else:
             ca, _ = st.parse_ca_from_text(pdb_text)
         if len(ca) < 3:
-            print("    ESMFold2 output had no usable CA trace")
+            self.last_error = "the model's PDB output had no usable CA trace"
+            print(f"    ESMFold2: {self.last_error}")
             return None
 
         plddt = normalise_plddt(_to_float(getattr(result, "plddt", None)))
         ptm = _to_float(getattr(result, "ptm", None))
 
+        self.last_error = ""
         self.cache.put(key, plddt, ptm, ca, frames)
         return FoldResult(
             sequence, plddt, ptm, ca, pdb_text=pdb_text, frames=frames
+        )
+
+    def _precision_hint(self, exc: Exception) -> str:
+        """Name the precision fix when an error looks like a dtype problem.
+
+        A pre-Ampere GPU (the free-tier T4) has no bfloat16, and ESMFold2's
+        ESM-C backbone asks for it by default. The weights load regardless, so
+        the failure arrives on the first forward pass with a message about
+        dtypes or kernels that never mentions the GPU generation.
+        """
+        text = str(exc).lower()
+        markers = (
+            "bf16", "bfloat16", "half", "float16", "dtype", "not implemented",
+            "no kernel", "cublas", "triu_tril_cuda_template",
+        )
+        if not any(m in text for m in markers):
+            return ""
+        current = self.cfg.fold_precision
+        if current in ("fp16", "fp32"):
+            return (
+                f"FOLD_PRECISION is already {current!r}; try 'fp32', or a "
+                "smaller FOLD_MODEL_ID"
+            )
+        return (
+            "this looks like a precision problem. A free-tier T4 has no "
+            "bfloat16, which ESMFold2 wants by default -- set "
+            "FOLD_PRECISION='fp16' (Step 6) or pick an L4/A100 runtime"
         )
 
     def _result_pdb_text(self, result) -> str | None:

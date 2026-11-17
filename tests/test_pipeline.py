@@ -1022,6 +1022,64 @@ def test_preflight_catches_a_fold_model_with_no_backbone_frames():
         assert pipe.preflight() == 1
 
 
+def test_preflight_reports_why_the_fold_failed_not_just_that_it_did():
+    """fold() returns None for five different reasons.
+
+    Each one prints itself, but a caller holding only None could say no more
+    than "produced no usable model" -- so the cause sat one line up the log,
+    detached from the check that failed.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_why_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp)
+
+        class MuteFolder(StubFolder):
+            def fold(self, sequence, steps=None, want_frames=None):
+                self.last_error = "CUDA out of memory at L=221. Lower ..."
+                return None
+
+        class P(StubPipeline):
+            def setup(self):
+                super().setup()
+                broken = MuteFolder(self.folder.ref, want_frames=False)
+                broken.last_error = ""
+                self.folder = broken
+
+        pipe = P(cfg)
+        pipe.ref_path = ref
+
+        import io, contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = pipe.preflight()
+        out = buf.getvalue()
+        assert code == 1
+        # The reason travels with the check.
+        assert "CUDA out of memory" in out, out[-600:]
+        # And the attempt is described before it is made, so an opaque model
+        # error is still interpretable.
+        assert "precision=" in out and "FOLD_MAX_RESIDUES=" in out
+
+
+def test_precision_hint_names_the_t4_problem_only_for_dtype_errors():
+    from redaa.config import RedAAConfig
+    from redaa.folding import FoldEngine
+
+    cfg = RedAAConfig()
+    cfg.fold_precision = "auto"
+    engine = FoldEngine(cfg)
+    hint = engine._precision_hint(RuntimeError("\"triu_tril_cuda_template\" not implemented for 'BFloat16'"))
+    assert "FOLD_PRECISION" in hint and "T4" in hint
+    # Not every error is a precision error.
+    assert engine._precision_hint(ValueError("no such file")) == ""
+    # If the user already moved off auto, say something useful instead.
+    cfg.fold_precision = "fp16"
+    assert "already" in FoldEngine(cfg)._precision_hint(RuntimeError("bad dtype"))
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
