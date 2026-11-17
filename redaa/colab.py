@@ -282,6 +282,13 @@ def scan_hf_cache(cache_dir: str | None = None) -> list[tuple[str, str]]:
     if not os.path.isdir(cache_dir):
         return broken
     for root, _dirs, names in os.walk(cache_dir):
+        # huggingface_hub caches *negative* lookups under .no_exist: an empty
+        # file there records "this repo does not contain this file", so it is
+        # correct and expected, not a truncated download. Reporting those as
+        # corrupt sent a real run chasing a non-problem.
+        parts = set(root.replace("\\", "/").split("/"))
+        if ".no_exist" in parts:
+            continue
         for name in names:
             if not name.endswith(".safetensors"):
                 continue
@@ -826,6 +833,8 @@ def describe_site_results(rows: list[dict]) -> str:
 # fold, after the weights have downloaded. The model card declares them, so
 # ask it.
 
+RESOLVED_CONFIG_NAME = "RESOLVED_CONFIG.txt"
+
 HF_REQUIREMENTS_URL = "https://huggingface.co/{model_id}/raw/{revision}/requirements.txt"
 
 # Used when the model card cannot be reached (offline, a login node, a private
@@ -1088,12 +1097,28 @@ def diagnose(try_model_load: bool = False) -> dict:
             try:
                 free, total = torch.cuda.mem_get_info()
                 info("gpu_free_gb", round(free / 1024**3, 1))
+                # Our own loaded models account for most of the card, so low
+                # free VRAM is the normal state once a run has started. Only
+                # say something when nothing of ours is loaded, or the advice
+                # ("restart the session") throws away a 25 GB download to cure
+                # a healthy run.
+                ours = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+                info("gpu_reserved_by_us_gb", round(ours / 1024**3, 1))
                 if free / total < 0.5:
-                    problem(
-                        "Only %.1f of %.1f GB of VRAM is free -- something else "
-                        "is holding it. Runtime > Restart session."
-                        % (free / 1024**3, total / 1024**3)
-                    )
+                    if ours > 0.25 * (total - free):
+                        ok(
+                            "VRAM: %.1f of %.1f GB free, %.1f GB held by this "
+                            "session's own models"
+                            % (free / 1024**3, total / 1024**3, ours / 1024**3)
+                        )
+                    else:
+                        problem(
+                            "Only %.1f of %.1f GB of VRAM is free and this "
+                            "session's models account for %.1f GB of it, so "
+                            "something else is holding the rest. "
+                            "Runtime > Restart session."
+                            % (free / 1024**3, total / 1024**3, ours / 1024**3)
+                        )
             except Exception:
                 pass
         else:
@@ -1166,8 +1191,30 @@ def diagnose(try_model_load: bool = False) -> dict:
         )
     else:
         ok("LigandMPNN checkout present")
+    # MPNN_CHECKPOINT is deliberately left unset so the engine picks the file
+    # matching MPNN_MODEL_TYPE. Reporting that as "missing -- re-run Step 1"
+    # told a working run to repeat a 25 GB install.
+    resolved_ckpt = ckpt
+    if not resolved_ckpt and mpnn_repo:
+        try:
+            from .mpnn import checkpoint_name
+
+            model_type = os.environ.get("MPNN_MODEL_TYPE", "protein_mpnn")
+            resolved_ckpt = os.path.join(
+                mpnn_repo, "model_params", checkpoint_name(model_type)
+            )
+            info("mpnn_checkpoint_resolved", resolved_ckpt)
+        except Exception:  # noqa: BLE001
+            resolved_ckpt = ""
+    ckpt = resolved_ckpt
+
     if not ckpt or not os.path.exists(ckpt):
-        problem("MPNN checkpoint missing at %r -- re-run Step 1" % (ckpt,))
+        problem(
+            "MPNN checkpoint not found at %r -- re-run Step 1" % (ckpt,)
+            if ckpt else
+            "cannot work out which MPNN checkpoint to expect; set "
+            "MPNN_REPO (and MPNN_MODEL_TYPE), then re-run Step 1"
+        )
     elif os.path.getsize(ckpt) < 1_000_000:
         problem(
             "MPNN checkpoint is only %d bytes, so the download was truncated "
@@ -1308,7 +1355,7 @@ def log_dir() -> str:
     return path
 
 
-def _env_block() -> list[str]:
+def _env_block(run_dir: str | None = None) -> list[str]:
     report = diagnose()
     lines = ["=== environment ==="]
     for key, value in report["info"].items():
@@ -1318,9 +1365,7 @@ def _env_block() -> list[str]:
 
     env = report["info"].get("env") or {}
     lines.append("")
-    lines.append("=== run configuration (%d set) ===" % len(env))
-    for key in sorted(env):
-        lines.append("  %-24s %s" % (key, env[key]))
+    lines.extend(_config_section(env, run_dir))
 
     lines.append("")
     lines.append("=== checks ===")
@@ -1328,6 +1373,41 @@ def _env_block() -> list[str]:
         lines.append("  ok    " + line)
     for line in report["problems"]:
         lines.append("  !!    " + line)
+    return lines
+
+
+def _config_section(env: dict, run_dir: str | None = None) -> list[str]:
+    """Environment variables, plus the settings the run actually used.
+
+    The two differ. ``--test`` / ``TEST_MODE`` rewrites the budgets in memory
+    after the environment is read, so a report showing only the variables
+    claims FOLD_STEPS_FINAL=200 for a run that used 50 -- which is exactly
+    what one report did. Re-reading the environment here would repeat the
+    error, so the run writes what it resolved into its own directory and this
+    reads that back.
+    """
+    lines = ["=== run configuration (%d env var(s) set) ===" % len(env)]
+    for key in sorted(env):
+        lines.append("  %-24s %s" % (key, env[key]))
+
+    path = os.path.join(run_dir, RESOLVED_CONFIG_NAME) if run_dir else ""
+    if path and os.path.exists(path):
+        try:
+            with open(path) as fh:
+                body = fh.read().rstrip()
+        except OSError:
+            body = ""
+        if body:
+            lines.append("")
+            lines.append("=== settings the run actually used ===")
+            lines.extend("  " + l for l in body.splitlines())
+    elif run_dir:
+        lines.append("")
+        lines.append(
+            "  (no %s in the run directory -- it predates this file, so the "
+            "variables above may not be what ran: --test and TEST_MODE shrink "
+            "the budgets after they are read)" % RESOLVED_CONFIG_NAME
+        )
     return lines
 
 
@@ -1354,7 +1434,7 @@ def write_report(
         "generated %s" % datetime.now().isoformat(timespec="seconds"),
         "",
     ]
-    parts += _env_block()
+    parts += _env_block(run_dir)
 
     run_dir = run_dir or latest_run_dir()
     if run_dir and os.path.isdir(run_dir):

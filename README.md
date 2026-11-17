@@ -574,7 +574,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 228 tests
+python run_redaa.py --self-test  # all eight suites, 231 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

@@ -1055,6 +1055,113 @@ def test_describe_dependency_plan_is_readable_either_way():
     )
     assert "all present" in ok
 
+# ---------------------------------------------------------------------------
+# Diagnostics that cried wolf on a working run
+# ---------------------------------------------------------------------------
+
+
+def test_negative_lookup_cache_is_not_reported_as_corrupt():
+    """huggingface_hub records "this file does not exist" as an empty file.
+
+    A real report called one of those a corrupt download and told the user to
+    purge a 25 GB cache to cure a run that had just succeeded.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        # The negative-lookup marker: empty, and correct.
+        no_exist = os.path.join(
+            tmp, "models--Some--Model", ".no_exist", "abc123"
+        )
+        os.makedirs(no_exist)
+        open(os.path.join(no_exist, "model.safetensors"), "w").close()
+        assert C.scan_hf_cache(tmp) == []
+
+        # A genuinely truncated weight file in the real snapshot still counts.
+        snapshot = os.path.join(tmp, "models--Some--Model", "snapshots", "abc123")
+        os.makedirs(snapshot)
+        truncated = os.path.join(snapshot, "model.safetensors")
+        open(truncated, "w").close()
+        found = C.scan_hf_cache(tmp)
+        assert [p for p, _ in found] == [truncated], found
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_unset_mpnn_checkpoint_resolves_instead_of_alarming():
+    """MPNN_CHECKPOINT is deliberately unset so the model type picks the file.
+
+    Reporting that as "missing -- re-run Step 1" told a working run to repeat
+    its whole install.
+    """
+    from redaa.mpnn import checkpoint_name
+
+    tmp = tempfile.mkdtemp()
+    saved = {k: os.environ.get(k) for k in
+             ("MPNN_REPO", "MPNN_CHECKPOINT", "MPNN_MODEL_TYPE")}
+    try:
+        repo = os.path.join(tmp, "LigandMPNN")
+        params = os.path.join(repo, "model_params")
+        os.makedirs(params)
+        open(os.path.join(repo, "data_utils.py"), "w").close()
+        # A plausible checkpoint for the protein model.
+        name = checkpoint_name("protein_mpnn")
+        with open(os.path.join(params, name), "wb") as fh:
+            fh.write(b"0" * 2_000_000)
+
+        os.environ["MPNN_REPO"] = repo
+        os.environ.pop("MPNN_CHECKPOINT", None)
+        os.environ["MPNN_MODEL_TYPE"] = "protein_mpnn"
+
+        report = C.diagnose()
+        text = " ".join(report["problems"])
+        assert "checkpoint" not in text.lower(), report["problems"]
+        assert any("MPNN checkpoint" in line for line in report["ok"]), report["ok"]
+        assert report["info"].get("mpnn_checkpoint_resolved", "").endswith(name)
+
+        # A ligand run looks for a different file, and says so when it is absent.
+        os.environ["MPNN_MODEL_TYPE"] = "ligand_mpnn"
+        report = C.diagnose()
+        assert any(
+            "checkpoint not found" in line for line in report["problems"]
+        ), report["problems"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_report_carries_the_settings_the_run_actually_used():
+    """Env vars are not what ran: TEST_MODE rewrites the budgets afterwards.
+
+    One report claimed FOLD_STEPS_FINAL=200 for a run that used 50.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        run_dir = os.path.join(tmp, "run")
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, C.RESOLVED_CONFIG_NAME), "w") as fh:
+            fh.write("test_mode: True\n  fold_steps_final  50\n")
+
+        lines = C._config_section({"FOLD_STEPS_FINAL": "200"}, run_dir)
+        text = "\n".join(lines)
+        # Both are present, and which is which is unambiguous.
+        assert "FOLD_STEPS_FINAL         200" in text
+        assert "settings the run actually used" in text
+        assert "test_mode: True" in text
+        assert "fold_steps_final  50" in text
+
+        # An older run directory says so rather than implying the env is truth.
+        bare = os.path.join(tmp, "old")
+        os.makedirs(bare)
+        older = "\n".join(C._config_section({"FOLD_STEPS_FINAL": "200"}, bare))
+        assert "predates this file" in older
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

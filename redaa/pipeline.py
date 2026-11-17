@@ -160,6 +160,22 @@ class Pipeline:
             self.run_dir, "fold_cache.sqlite"
         )
         self.cache = FoldCache(cache_path, enabled=cfg.use_fold_cache)
+
+        # Record what this run actually resolved to. The environment variables
+        # are not the whole story: --test / TEST_MODE rewrites the budgets
+        # afterwards, so a report built from os.environ alone misstates the
+        # step counts and replicate count a run used.
+        try:
+            from .colab import RESOLVED_CONFIG_NAME
+
+            with open(
+                os.path.join(self.run_dir, RESOLVED_CONFIG_NAME), "w"
+            ) as fh:
+                fh.write(f"test_mode: {cfg.test_mode}\n")
+                fh.write(f"recorded: {datetime.now().isoformat(timespec='seconds')}\n")
+                fh.write(cfg.describe() + "\n")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (could not record the resolved configuration: {exc})")
         if self.cache.enabled:
             print(f"Fold cache: {cache_path}")
 
