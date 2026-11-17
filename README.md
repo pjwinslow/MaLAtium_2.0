@@ -522,6 +522,8 @@ resolved values. The ones you are most likely to touch:
 | `SITE_MAX_CB_DEV` | `1.5` | Å, worst site CB–CB distance error |
 | `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
+| `FOLD_PRECISION` | `auto` | `auto` asks the GPU: bf16 where supported, else fp16; fp32 on CPU. Also `bf16`, `fp16`, `fp32` |
+| `FOLD_MAX_RESIDUES` | `1024` | Longer sequences are skipped, not run until they die |
 | `FOLD_STEPS_SCREEN` | `50` | Diffusion steps for screening folds |
 | `FOLD_STEPS_FINAL` | `200` | Diffusion steps for reported folds |
 | `CHUNK_INDEX` | `$SLURM_ARRAY_TASK_ID` | Which chunk of domains to run |
