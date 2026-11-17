@@ -329,8 +329,23 @@ this code believes -- and all of them surfaced either on the first design call
 or forty minutes into a search.
 
 Preflight hits every one of those points once, in the order the real run hits
-them, and names the first thing that broke. It says nothing about whether the
-science is right; only that the machinery is connected.
+them, and names the first thing that broke.
+
+It then folds the **native** sequence and reports TM, RMSD and pLDDT against
+the reference, plus the site geometry that fold achieves. That is a different
+question from the ones above — not "does the machinery work" but "would the
+answers mean anything":
+
+- if ESMFold2 cannot reproduce the reference from its own native sequence, no
+  reduced-alphabet design's pass or fail on that domain can be trusted;
+- the native fold's site geometry is the **ceiling** for any design, so a
+  `SITE_MAX_*` threshold tighter than it is unreachable for reasons that have
+  nothing to do with the alphabet.
+
+Both are reported as warnings rather than failures — the pipeline is not
+broken — and both are repeated in the summary so they cannot scroll away. The
+native fold is not wasted work: the cache is keyed on sequence plus model and
+sampler settings, so the real run's own native check is a cache hit.
 
 ## Preserving binding sites and catalytic residues
 
@@ -559,7 +574,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 226 tests
+python run_redaa.py --self-test  # all eight suites, 228 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

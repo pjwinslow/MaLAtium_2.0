@@ -1249,6 +1249,78 @@ def test_preflight_skips_the_dependency_check_for_an_injected_engine():
         assert "fold model dependencies" not in out
 
 
+def test_preflight_warns_but_does_not_fail_on_a_weak_native_round_trip():
+    """Machinery working and answers meaning something are different claims.
+
+    If ESMFold2 cannot reproduce the reference from its own native sequence,
+    no reduced-alphabet design's pass or fail on that domain can be trusted --
+    but the pipeline is not broken, so this warns rather than stopping a run.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_weak_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp)
+
+        class NativeFailsFolder(StubFolder):
+            def fold(self, sequence, steps=None, want_frames=None):
+                if sequence == NATIVE:
+                    # Folds, but nowhere near the reference.
+                    rng = np.random.default_rng(1)
+                    return FoldResult(
+                        sequence, 41.0, 0.2,
+                        rng.normal(scale=30.0, size=self.ref.shape),
+                    )
+                return super().fold(sequence, steps=steps)
+
+        class P(StubPipeline):
+            def setup(self):
+                super().setup()
+                self.folder = NativeFailsFolder(self.folder.ref)
+
+        pipe = P(cfg)
+        pipe.ref_path = ref
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = pipe.preflight()
+        out = buf.getvalue()
+
+        # Warned, not failed: the machinery is fine.
+        assert code == 0, out[-800:]
+        assert "[warn] native round-trip" in out, out[-800:]
+        assert "NATIVE_TM_MIN" in out
+        assert "unreliable" in out
+        # And it is repeated in the summary, so it cannot scroll away.
+        assert "worth knowing before a long run" in out
+
+
+def test_preflight_flags_site_thresholds_the_model_cannot_reach():
+    """A gate tighter than the native fold is unreachable for any design.
+
+    Discovering that after a long run would waste it, and would look like the
+    alphabet failing when it is really the threshold.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_pf_thresh_") as tmp:
+        cfg_over = {"search_mode": "site_aware", "site_spec": SITE,
+                    "site_max_bb_rmsd": 0.001, "site_max_local_rmsd": 0.001,
+                    "site_max_cb_dev": 0.001}
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _pipe, code = _preflight(tmp, **cfg_over)
+        out = buf.getvalue()
+        assert code == 0, out[-800:]
+        assert "[warn] site thresholds are reachable" in out, out[-900:]
+        assert "no design can" in out
+        assert "Loosen" in out
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

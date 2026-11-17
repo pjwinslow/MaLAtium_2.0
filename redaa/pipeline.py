@@ -858,12 +858,22 @@ class Pipeline:
         """
         cfg = self.cfg
         checks: list[tuple[str, bool, str]] = []
+        # Things worth knowing that are not machinery failures: the reference
+        # being hard to reproduce, or a threshold set tighter than the model
+        # can reach. These must not stop a run -- but silently passing them
+        # would waste hours.
+        notes: list[tuple[str, str]] = []
 
         def record(name, ok, detail=""):
             checks.append((name, bool(ok), detail))
             mark = "ok  " if ok else "FAIL"
             print(f"  [{mark}] {name}" + (f" -- {detail}" if detail else ""))
             return ok
+
+        def note(name, detail=""):
+            notes.append((name, detail))
+            print(f"  [warn] {name}" + (f" -- {detail}" if detail else ""))
+            return False
 
         print("\n" + "=" * 70)
         print("PREFLIGHT -- one of everything, on the shortest input")
@@ -1015,12 +1025,30 @@ class Pipeline:
             print(f"    (could not check model dependencies: {exc})")
 
         # State what is about to be attempted, so a failure is interpretable
-        # even when the model's own error is opaque.
+        # even when the model's own error is opaque. Report the precision the
+        # engine *resolved*, not the request: "auto" is the default, so
+        # echoing the request tells the reader nothing about what ran.
+        resolved = getattr(self.folder, "resolved_precision", "") or "unknown"
+        requested = (cfg.fold_precision or "auto").strip().lower()
+        precision = (
+            resolved if requested in ("auto", "") else f"{resolved} ({requested})"
+        )
         print(
             f"    folding L={len(probe)} at {cfg.fold_steps_screen} steps, "
-            f"precision={cfg.fold_precision}, "
+            f"precision={precision}, "
             f"FOLD_MAX_RESIDUES={cfg.fold_max_residues}"
         )
+        if len(probe) > 0.8 * cfg.fold_max_residues:
+            # The cap is set from VRAM by the notebook's GPU cell and persists
+            # in the environment. A session that started on a smaller GPU
+            # keeps that smaller cap, and longer domains are then skipped
+            # silently rather than attempted.
+            print(
+                f"    note: FOLD_MAX_RESIDUES={cfg.fold_max_residues} is "
+                f"close to this sequence's length ({len(probe)}). Anything "
+                "longer is skipped, not folded. Re-run the GPU cell if the "
+                "runtime changed, or raise it."
+            )
         try:
             result = self.folder.fold(probe, steps=cfg.fold_steps_screen)
             ok = result is not None and result.ok
@@ -1078,10 +1106,86 @@ class Pipeline:
                 record("measure site geometry", False,
                        f"{type(exc).__name__}: {exc}")
 
-        return self._preflight_summary(checks)
+        # -- is this domain worth running at all? --------------------------
+        # Everything above says the machinery is connected. This says whether
+        # the answers would mean anything: if ESMFold2 cannot reproduce the
+        # reference from its *own* native sequence, then no reduced-alphabet
+        # design's pass or fail on this domain can be trusted.
+        #
+        # Not free, but not wasted either: the fold cache is keyed on sequence
+        # plus model and sampler settings, so the real run's native check --
+        # which uses the same final step count -- is a cache hit afterwards.
+        print(
+            f"\n    native round-trip: folding the native sequence at "
+            f"{cfg.fold_steps_final} steps (the real run reuses this from the "
+            "cache)"
+        )
+        try:
+            native = self.folder.fold(ref_seq, steps=cfg.fold_steps_final)
+            if native is None or not native.ok:
+                note(
+                    "native round-trip",
+                    "no model produced for the native sequence: "
+                    + (getattr(self.folder, "last_error", "") or "unknown"),
+                )
+            else:
+                nat_rmsd, nat_tm = st.compare(
+                    ref_xyz, ref_seq, native.ca, ref_seq
+                )
+                summary = (
+                    f"TM={_fmt(nat_tm)} RMSD={_fmt(nat_rmsd, '0.2f')} A "
+                    f"pLDDT={_fmt(native.plddt, '0.1f')}"
+                )
+                if nat_tm is not None and nat_tm >= cfg.native_tm_min:
+                    record(
+                        "native round-trip", True,
+                        f"{summary} -- the reference is reproducible, so a "
+                        "design's verdict on this domain means something",
+                    )
+                else:
+                    note(
+                        "native round-trip",
+                        f"{summary}, below NATIVE_TM_MIN="
+                        f"{cfg.native_tm_min}. The run will flag this domain: "
+                        "pass/fail of any design on it is unreliable",
+                    )
+
+                # The native fold's site geometry is the best any design could
+                # manage here, so it calibrates the thresholds. Gates tighter
+                # than this are unreachable for reasons that have nothing to
+                # do with the alphabet.
+                if site is not None and native.site_frames is not None:
+                    best = sitemod.measure_site(
+                        site, ref_frames, native.site_frames, ref_seq
+                    )
+                    reachable = best.passed(
+                        cfg.site_max_bb_rmsd, cfg.site_max_local_rmsd,
+                        cfg.site_max_cb_dev,
+                        require_identity=cfg.site_require_identity,
+                    )
+                    detail = (
+                        f"{best.describe()} -- the ceiling for any design here"
+                    )
+                    if reachable:
+                        record("site thresholds are reachable", True, detail)
+                    else:
+                        note(
+                            "site thresholds are reachable",
+                            f"{detail}. The native sequence itself does not "
+                            "satisfy SITE_MAX_BB_RMSD="
+                            f"{cfg.site_max_bb_rmsd}/SITE_MAX_LOCAL_RMSD="
+                            f"{cfg.site_max_local_rmsd}/SITE_MAX_CB_DEV="
+                            f"{cfg.site_max_cb_dev}, so no design can. Loosen "
+                            "them to the numbers above, or raise "
+                            "FOLD_STEPS_FINAL",
+                        )
+        except Exception as exc:  # noqa: BLE001
+            note("native round-trip", f"{type(exc).__name__}: {exc}")
+
+        return self._preflight_summary(checks, notes)
 
     @staticmethod
-    def _preflight_summary(checks) -> int:
+    def _preflight_summary(checks, notes=()) -> int:
         failed = [name for name, ok, _ in checks if not ok]
         print("\n" + "=" * 70)
         if failed:
@@ -1094,6 +1198,13 @@ class Pipeline:
             )
             return 1
         print(f"PREFLIGHT PASSED: {len(checks)} checks")
+        if notes:
+            print(
+                f"\n{len(notes)} thing(s) worth knowing before a long run -- "
+                "the machinery works, but these affect what the answers mean:"
+            )
+            for name, detail in notes:
+                print(f"  - {name}: {detail}")
         print(
             "Every model, every contract and every metric this run depends on "
             "worked once.\nNothing here says the science is right -- only that "
