@@ -507,6 +507,61 @@ def _atom_xyz(line: str) -> tuple[float, float, float] | None:
         return None
 
 
+def _bindable_components(
+    text: str,
+    chosen_chain: str,
+    kept_protein_lines: list[str],
+    cutoff: float,
+) -> dict[str, int]:
+    """Heteroatom components that could define a pocket, with atom counts.
+
+    Solvent, cryoprotectants and lone ions are excluded: a "pocket" defined by
+    a glycerol or a stray sulfate is noise. A component is counted when it is
+    on the chosen chain or sits within *cutoff* of it, so a copy bound to
+    another chain of the crystal is not advertised as this chain's ligand.
+    """
+    from .sites import ION_COMPONENTS, SOLVENT_COMPONENTS
+
+    prot = [
+        xyz for xyz in (_atom_xyz(l) for l in kept_protein_lines)
+        if xyz is not None
+    ]
+    cut2 = cutoff * cutoff
+
+    groups: dict[tuple[str, str, int, str], list[tuple[float, float, float]]] = {}
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not line.startswith("HETATM") or len(line) < 54:
+            continue
+        if line[16] not in _OK_ALTLOC:
+            continue
+        name = line[17:20].strip().upper()
+        if name in SOLVENT_COMPONENTS or name in ION_COMPONENTS:
+            continue
+        try:
+            resseq = int(line[22:26])
+        except ValueError:
+            continue
+        xyz = _atom_xyz(line)
+        if xyz is None:
+            continue
+        groups.setdefault((name, line[21], resseq, line[26]), []).append(xyz)
+
+    counts: dict[str, int] = {}
+    for (name, chain, _resseq, _icode), atoms in groups.items():
+        if chain != chosen_chain:
+            near = any(
+                (a[0] - p[0]) ** 2 + (a[1] - p[1]) ** 2 + (a[2] - p[2]) ** 2
+                <= cut2
+                for a in atoms for p in prot
+            )
+            if not near:
+                continue
+        counts[name] = counts.get(name, 0) + len(atoms)
+    return counts
+
+
 def _collect_ligands(
     text: str,
     chosen_chain: str,
@@ -517,16 +572,32 @@ def _collect_ligands(
     """Pick out the HETATM records worth keeping.
 
     Returns ``(lines, [(comp_id, n_atoms), ...], notes)``.  Notes name
-    components that were asked for and not found, and copies rejected for
-    sitting too far from the chosen chain -- both are the kind of thing that
-    otherwise shows up much later as an empty binding site.
-    """
-    if not keep_ligands:
-        return [], [], []
+    components that were asked for and not found, copies rejected for sitting
+    too far from the chosen chain, and -- whether or not anything was asked
+    for -- the bindable components this entry *does* contain.
 
-    wanted = {c.strip().upper() for c in keep_ligands if c and c.strip()}
+    That last one closes a real gap. Without a preset there was nothing to
+    tell you a structure's ligand code: you had to go and read the entry
+    before you could write ``SITE_KEEP_LIGANDS``, and a spec naming the wrong
+    code produced an empty pocket much later. The candidates are reported at
+    the moment you would need them, by the command you were already running.
+    """
+    wanted = {c.strip().upper() for c in (keep_ligands or ()) if c and c.strip()}
+
+    candidates = _bindable_components(text, chosen_chain, kept_protein_lines, cutoff)
+    discovery: list[str] = []
+    unkept = {c: n for c, n in candidates.items() if c not in wanted}
+    if unkept:
+        listed = ", ".join(
+            "%s (%d atoms)" % (c, n) for c, n in sorted(unkept.items())
+        )
+        discovery.append(
+            "this entry also contains %s -- keep one with SITE_KEEP_LIGANDS "
+            "to design against it or derive a pocket from it" % listed
+        )
+
     if not wanted:
-        return [], [], []
+        return [], [], discovery
 
     prot_xyz = [
         xyz for xyz in (_atom_xyz(l) for l in kept_protein_lines) if xyz is not None
@@ -592,9 +663,14 @@ def _collect_ligands(
             f"{cutoff:g} A from chain {chosen_chain}"
         )
     for name in sorted(wanted - set(counts)):
-        notes.append(f"{name}: requested but not present in this entry")
+        extra = ""
+        if candidates:
+            extra = "; this entry has %s" % ", ".join(sorted(candidates))
+        notes.append(
+            f"{name}: requested but not present in this entry{extra}"
+        )
 
-    return lines, sorted(counts.items()), notes
+    return lines, sorted(counts.items()), notes + discovery
 
 
 PROVENANCE_TAG = "REDAA"

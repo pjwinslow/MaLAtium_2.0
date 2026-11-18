@@ -646,6 +646,68 @@ def test_prepare_records_kept_ligands_in_the_provenance():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_bindable_components_are_reported_even_when_none_are_requested():
+    """Without a preset there was no way to learn a structure's ligand code.
+
+    You had to go and read the entry before you could write
+    SITE_KEEP_LIGANDS, and a spec naming the wrong code produced an empty
+    pocket much later. The candidates are now named by the fetch itself.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        report = F.prepare(_ligand_pdb(), os.path.join(tmp, "o.pdb"))
+        notes = " ".join(report["ligand_notes"])
+        assert "ATP" in notes, report["ligand_notes"]
+        assert "SITE_KEEP_LIGANDS" in notes
+        # Nothing was kept -- this is discovery, not retention.
+        assert report["ligands_kept"] == []
+        # Crystallisation additives are not advertised as ligands.
+        assert "GOL" not in notes
+        assert "HOH" not in notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_requesting_the_wrong_ligand_code_names_the_right_one():
+    tmp = tempfile.mkdtemp()
+    try:
+        report = F.prepare(
+            _ligand_pdb(), os.path.join(tmp, "o.pdb"), keep_ligands=("GTP",)
+        )
+        notes = " ".join(report["ligand_notes"])
+        assert "GTP: requested but not present" in notes
+        assert "this entry has ATP" in notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_kept_ligand_is_not_also_advertised_as_a_candidate():
+    """Reporting what you already asked for would just be noise."""
+    tmp = tempfile.mkdtemp()
+    try:
+        report = F.prepare(
+            _ligand_pdb(), os.path.join(tmp, "o.pdb"), keep_ligands=("ATP",)
+        )
+        notes = " ".join(report["ligand_notes"])
+        assert "also contains" not in notes, report["ligand_notes"]
+        assert report["ligands_kept"] == [("ATP", 3)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_ligand_on_another_chain_is_not_advertised_for_this_one():
+    tmp = tempfile.mkdtemp()
+    try:
+        # _ligand_pdb puts a second ATP on chain B, 200 A away.
+        report = F.prepare(_ligand_pdb(), os.path.join(tmp, "o.pdb"), chain="A")
+        notes = " ".join(report["ligand_notes"])
+        # The nearby copy is advertised; its atom count must not include the
+        # distant one, or the number implies a ligand that is not there.
+        assert "ATP (3 atoms)" in notes, report["ligand_notes"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

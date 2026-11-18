@@ -479,6 +479,20 @@ and is specific to the structure in hand. A ligand has to survive cleaning
 first — `SITE_KEEP_LIGANDS=ATP`, or `--preset atp`, since everything
 heteroatom is stripped by default.
 
+**You do not have to know the ligand's code in advance.** Fetching a structure
+reports the bindable components it contains, so the code you need is in the
+output of the command you were already running:
+
+```
+  ok    4BS0_A: chain A, 299 residues  [1 incomplete dropped]
+        ligand: this entry also contains 6NT (16 atoms) -- keep one with
+                SITE_KEEP_LIGANDS to design against it or derive a pocket from it
+```
+
+Solvent, cryoprotectants and lone ions are left out of that list, and a copy
+bound to a different chain of the crystal is not advertised as this chain's.
+Asking for a code the entry does not have says which ones it does.
+
 ```bash
 # See the two verified test cases
 python run_redaa.py --list-presets
@@ -654,7 +668,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 242 tests
+python run_redaa.py --self-test  # all nine suites, 246 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
