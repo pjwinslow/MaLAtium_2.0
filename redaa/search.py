@@ -237,6 +237,13 @@ class Validator:
         self.exempt: frozenset[int] = frozenset()
         if self.site is not None and cfg.site_residue_policy == "exempt":
             self.exempt = frozenset(self.site.indices)
+        # Under measure_only the design picks its own residues at the site, so
+        # requiring the native ones there would fail every candidate by
+        # definition.
+        self.require_identity = bool(
+            cfg.site_require_identity
+            and cfg.site_residue_policy != "measure_only"
+        )
 
     @property
     def site_active(self) -> bool:
@@ -359,7 +366,7 @@ class Validator:
                     self.cfg.site_max_bb_rmsd,
                     self.cfg.site_max_local_rmsd,
                     self.cfg.site_max_cb_dev,
-                    require_identity=self.cfg.site_require_identity,
+                    require_identity=self.require_identity,
                 )
                 if ok_site:
                     metrics.num_site_pass += 1

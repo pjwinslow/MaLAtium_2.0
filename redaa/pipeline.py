@@ -37,6 +37,7 @@ from .config import (
     MODE_SCAFFOLD_THEN_SITE,
     MODE_SITE_AWARE,
     POLICY_IN_ALPHABET,
+    POLICY_MEASURE_ONLY,
 )
 from .foldcache import FoldCache
 from .folding import FoldEngine
@@ -304,8 +305,14 @@ class Pipeline:
         mode = cfg.search_mode
 
         # Positions MPNN must not redesign, and the residue each must keep.
+        # Empty under measure_only: there the design picks its own residues and
+        # only the geometry is judged.
         fixed: dict[int, str] = {}
-        if site is not None and mode == MODE_SITE_AWARE:
+        if (
+            site is not None
+            and mode == MODE_SITE_AWARE
+            and cfg.site_residue_policy != POLICY_MEASURE_ONLY
+        ):
             fixed = {p.index: p.native_aa for p in site.positions}
 
         def design(alphabet, **kw):
@@ -1011,7 +1018,13 @@ class Pipeline:
         # configured. Folding an unfixed design instead would make the site
         # checks meaningless -- it would not carry the site at all.
         probe = designs.pairs[0][1]
-        if site is not None:
+        if site is not None and cfg.site_residue_policy == POLICY_MEASURE_ONLY:
+            record(
+                "site positions are free (measure_only)", True,
+                "MPNN chooses its own residues there; only the geometry is "
+                "gated",
+            )
+        elif site is not None:
             fixed = {p.index: p.native_aa for p in site.positions}
             try:
                 held = self.mpnn.design(

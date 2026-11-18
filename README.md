@@ -524,10 +524,40 @@ framings of different claims:
   and protected from pruning, so the reported alphabet is one a real protein
   could be written in end to end.
 
+- **`measure_only`** — the site is neither fixed nor exempt. MPNN puts
+  whatever the alphabet allows there, and the site is gated on **geometry
+  alone**; the identity check is off, because the design chose its own
+  residues.
+
 `exempt` can flatter a result — a "3-letter alphabet" with twenty exempt
 positions is not a 3-letter protein — so the exempt count and residue types
 are always reported beside the alphabet, and a site covering more than a
 quarter of the chain warns.
+
+### Ligand-shaped design without preserving any identity
+
+`MPNN_MODEL_TYPE=ligand_mpnn` and the site machinery are independent, so the
+ligand can shape a design through atom context with nothing held native:
+
+```bash
+SEARCH_MODE=alphabet_only SITE_KEEP_LIGANDS=6NT MPNN_MODEL_TYPE=ligand_mpnn   python run_redaa.py --input-dir ./inputs
+```
+
+That folds only — the ligand is in the prepared PDB and LigandMPNN conditions
+on it, but **nothing checks the pocket**, so there is no evidence the ligand
+context changed anything. For the version with evidence, keep the site and set
+the policy to `measure_only`:
+
+```bash
+SEARCH_MODE=site_aware SITE_RESIDUE_POLICY=measure_only   SITE_SPEC="ligand:6NT@4.0" SITE_KEEP_LIGANDS=6NT   MPNN_MODEL_TYPE=ligand_mpnn python run_redaa.py --input-dir ./inputs
+```
+
+Now the design picks its own residues in the pocket, and the pocket still has
+to be in the right place and the right shape. That is a different and arguably
+purer question than fixing the native residues: not "can this alphabet carry
+*these* residues" but "can it build a pocket for this ligand at all".
+`measure_only` cannot be combined with `scaffold_then_site`, which has nothing
+to graft.
 
 ### How preservation is measured
 
@@ -652,7 +682,7 @@ resolved values. The ones you are most likely to touch:
 | `SITE_CHAIN` | — | Default chain for spec tokens that do not name one |
 | `SITE_KEEP_LIGANDS` | — | Components to retain through cleaning, e.g. `ATP` |
 | `SITE_CONTACT_MAX` | `0` (all) | Cap a ligand contact shell, closest first |
-| `SITE_RESIDUE_POLICY` | `exempt` | Or `in_alphabet` |
+| `SITE_RESIDUE_POLICY` | `exempt` | Also `in_alphabet`, `measure_only` |
 | `SITE_GATE` | `1` | `0` records site metrics without gating on them |
 | `SITE_MAX_BB_RMSD` | `1.5` | Å, site backbone after global superposition; `0` disables |
 | `SITE_MAX_LOCAL_RMSD` | `1.0` | Å, site backbone after site-only superposition |
@@ -683,7 +713,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 249 tests
+python run_redaa.py --self-test  # all nine suites, 252 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

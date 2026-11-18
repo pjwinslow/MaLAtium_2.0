@@ -553,8 +553,11 @@ def configure_site(
         keep_ligands = keep_ligands.strip() or ",".join(chosen.keep_ligands)
         mpnn_model_type = mpnn_model_type.strip() or chosen.mpnn_model_type
 
-    if policy not in ("exempt", "in_alphabet"):
-        raise ValueError(f"policy must be exempt or in_alphabet, not {policy!r}")
+    if policy not in ("exempt", "in_alphabet", "measure_only"):
+        raise ValueError(
+            "policy must be exempt, in_alphabet or measure_only, not "
+            f"{policy!r}"
+        )
 
     # Always decide the model type here, rather than only when one is given.
     # A notebook's cells get re-run in any order: configuring the ATP preset
@@ -767,7 +770,18 @@ def describe_site_results(rows: list[dict]) -> str:
                 f"{min(sizes)}" if min(sizes) == max(sizes)
                 else f"{min(sizes)}-{max(sizes)}"
             )
-            if policy == "exempt":
+            if policy == "measure_only":
+                out.append(
+                    f"  alphabet: {span} letter(s) {', '.join(alphabets)} -- "
+                    "the whole chain, site included"
+                )
+                out.append(
+                    "    nothing was held at its native identity: the design "
+                    "chose its own residues at the site and only the pocket's "
+                    "geometry was gated, so this number needs no caveat -- but "
+                    "it is not evidence of function"
+                )
+            elif policy == "exempt":
                 out.append(
                     f"  alphabet: {span} letter(s) {', '.join(alphabets)} "
                     f"PLUS {n_site} exempt position(s) held at native identity "

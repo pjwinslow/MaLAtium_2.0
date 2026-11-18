@@ -47,9 +47,20 @@ SEARCH_MODES = (MODE_ALPHABET_ONLY, MODE_SCAFFOLD_THEN_SITE, MODE_SITE_AWARE)
 # EXEMPT is the default because it keeps the folding question clean, but it
 # can flatter a result, so the number of exempt positions and their residue
 # types are always reported alongside the alphabet.
+#   MEASURE_ONLY site positions are neither fixed nor exempt: MPNN is free to
+#                put whatever the alphabet allows there, and the site is
+#                measured and gated on *geometry alone*. Identity is not
+#                required, because the whole point is that the design chose
+#                its own residues.
+#
+# MEASURE_ONLY is the honest companion to MPNN_MODEL_TYPE=ligand_mpnn without
+# fixed residues: the ligand shapes the design through atom context, nothing
+# is held at its native identity, and the pocket's backbone geometry is still
+# measured -- otherwise there is no evidence the ligand context did anything.
 POLICY_EXEMPT = "exempt"
 POLICY_IN_ALPHABET = "in_alphabet"
-SITE_POLICIES = (POLICY_EXEMPT, POLICY_IN_ALPHABET)
+POLICY_MEASURE_ONLY = "measure_only"
+SITE_POLICIES = (POLICY_EXEMPT, POLICY_IN_ALPHABET, POLICY_MEASURE_ONLY)
 
 # Every environment variable this module reads. Exported so a caller can
 # report the settings actually in effect without pattern-matching os.environ
@@ -317,6 +328,15 @@ class RedAAConfig:
             problems.append(
                 f"SEARCH_MODE={self.search_mode} needs a site: set SITE_SPEC "
                 "or SITE_PRESET"
+            )
+        if (
+            self.site_residue_policy == POLICY_MEASURE_ONLY
+            and self.search_mode == MODE_SCAFFOLD_THEN_SITE
+        ):
+            problems.append(
+                "SITE_RESIDUE_POLICY=measure_only has nothing to graft, so it "
+                "cannot be combined with SEARCH_MODE=scaffold_then_site; use "
+                "SEARCH_MODE=site_aware"
             )
         if (self.site_spec or self.site_preset) and not self.site_enabled:
             problems.append(

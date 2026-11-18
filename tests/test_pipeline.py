@@ -1421,6 +1421,85 @@ def test_no_site_configured_still_reports_a_plain_verdict():
     assert P._verdict(Validation(passed=True)) == "PASS"
 
 
+def test_measure_only_frees_the_site_but_still_measures_it():
+    """Ligand-shaped design without preserving any native identity.
+
+    The companion to MPNN_MODEL_TYPE=ligand_mpnn: the ligand shapes the design
+    through atom context, nothing is held native, and the pocket geometry is
+    still gated -- otherwise there is no evidence the ligand did anything.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_measure_") as tmp:
+        pipe, code = _preflight(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="measure_only",
+        )
+        assert code == 0
+        # Nothing was fixed.
+        assert all(f == {} for f in pipe.mpnn.fixed_seen), [
+            f for f in pipe.mpnn.fixed_seen if f
+        ][:3]
+
+
+def test_measure_only_does_not_require_the_native_identity():
+    """Requiring it would fail every candidate by definition."""
+    from redaa import sites as sitemod
+    from redaa import structure as st
+    from redaa.search import Validator
+
+    with tempfile.TemporaryDirectory(prefix="redaa_measure2_") as tmp:
+        ref = os.path.join(tmp, "ref.pdb")
+        _write_reference(ref)
+        ref_xyz, ref_seq = st.parse_ca_from_file(ref)
+        records = st.parse_residues_from_file(
+            ref, atom_names=None, include_hetatm=True
+        )
+        frames, _ = st.frames_from_records(records)
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+        folder = StubFolder(
+            np.array(ref_xyz), ref_frames=frames[:, :3, :], want_frames=True
+        )
+
+        # A design with the WRONG residues at the site, folding correctly.
+        chars = list("G" * len(ref_seq))
+        for i, aa in enumerate("VL"):
+            chars[50 + i] = aa
+        design = "".join(chars)
+        assert not sitemod.site_identity_kept(site, design)
+        pairs = [(1.0, design)]
+
+        strict = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+        v = Validator(strict, folder, np.array(ref_xyz), ref_seq,
+                      site=site, ref_frames=frames)
+        assert v.require_identity
+        assert not v.validate(set("GVL"), pairs, 1).passed
+
+        free = _make_config(tmp, search_mode="site_aware", site_spec=SITE,
+                            site_residue_policy="measure_only")
+        v2 = Validator(free, folder, np.array(ref_xyz), ref_seq,
+                       site=site, ref_frames=frames)
+        assert not v2.require_identity
+        out = v2.validate(set("GVL"), pairs, 1)
+        assert out.passed, out.reason
+        # The geometry was still measured, not waived.
+        assert out.metrics.site_bb_rmsd is not None
+
+        # Site positions are not exempt either: the design must be fully
+        # in-alphabet, since nothing is held native.
+        assert v2.exempt == frozenset()
+
+
+def test_measure_only_is_rejected_with_scaffold_then_site():
+    """There is nothing to graft, so the combination is meaningless."""
+    from redaa.config import RedAAConfig
+
+    cfg = RedAAConfig()
+    cfg.search_mode = "scaffold_then_site"
+    cfg.site_spec = "H46"
+    cfg.site_residue_policy = "measure_only"
+    problems = cfg.validate()
+    assert any("nothing to graft" in p for p in problems), problems
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

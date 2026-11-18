@@ -686,6 +686,12 @@ alphabet letters:
 - `in_alphabet` — the site's types are forced into the alphabet and protected
   from pruning, so the reported alphabet is one a real protein could be written
   in end to end.
+- `measure_only` — the site is neither fixed nor exempt. MPNN puts whatever the
+  alphabet allows there, and the site is gated on **geometry alone**. This is
+  the companion to `MPNN_MODEL_TYPE=ligand_mpnn` when you want the ligand to
+  shape the design through atom context without preserving any native
+  identity: the pocket still has to be in the right place and the right shape,
+  but the design picks its own residues.
 
 `exempt` is the default, but it can flatter a result — the exempt count and
 residue types are always reported next to the alphabet, and a site covering
@@ -716,7 +722,7 @@ SEARCH_MODE = "alphabet_only" #@param ["alphabet_only", "site_aware", "scaffold_
 SITE_PRESET = "none" #@param ["none", "atp", "tev"]
 SITE_SPEC = "" #@param {type:"string"}
 SITE_CHAIN = "" #@param {type:"string"}
-SITE_RESIDUE_POLICY = "exempt" #@param ["exempt", "in_alphabet"]
+SITE_RESIDUE_POLICY = "exempt" #@param ["exempt", "in_alphabet", "measure_only"]
 SITE_CONTACT_MAX = 0 #@param {type:"integer"}
 MPNN_MODEL_TYPE = "" #@param ["", "protein_mpnn", "soluble_mpnn", "ligand_mpnn"]
 #@markdown Gate thresholds in Angstroms. Set any to 0 to record the number
