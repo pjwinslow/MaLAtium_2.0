@@ -142,6 +142,7 @@ def main(argv=None) -> int:
             test_pipeline,
             test_search,
             test_sites,
+            test_slurm,
             test_structure,
         )
 
@@ -152,6 +153,7 @@ def main(argv=None) -> int:
             ("fetching and input prep", test_fetch),
             ("functional sites", test_sites),
             ("mpnn integration", test_mpnn),
+            ("batch scripts", test_slurm),
             ("colab helpers", test_colab),
             ("colab notebook", test_notebook),
             ("pipeline orchestration", test_pipeline),

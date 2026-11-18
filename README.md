@@ -28,35 +28,115 @@ takes your own uploads, picks defaults to match whichever GPU the session got,
 and keeps results on Drive so a disconnect resumes instead of restarting.
 See [Running on Colab](#running-on-colab).
 
-**MSI batch** — `slurm/redaa_array.slurm`. An array job over chunks of a domain
-panel, with a shared fold cache and preemption-safe checkpointing.
+**MSI batch** — `slurm/prepare_msi.sh` once on a login node, then
+`slurm/redaa_array.slurm`: an array job over chunks of a domain panel, with
+preemption-safe checkpointing. See [Running on MSI](#running-on-msi).
 
 Both import the same `redaa/` package, so results are comparable.
 
 ---
 
-## Quick start (MSI)
+## Running on MSI
+
+The order matters more than the commands do: **everything that needs the
+network happens on a login node**, because compute nodes usually cannot reach
+the internet, and because ten array tasks each discovering a 25 GB model
+download is not a plan.
+
+### 1. Build the environment (once)
+
+`torch` has to match the CUDA module the batch script loads, so this one step
+is yours — installing the wrong build is the slowest possible way to find out.
 
 ```bash
-# 1. Point at your LigandMPNN checkout and your domain PDBs
-export MPNN_REPO=/projects/standard/seeligb/shared/LigandMPNN
-export INPUT_PDB_DIR=/projects/standard/seeligb/shared/.../All_inputs_260612
-
-# 2. Check the metrics layer (no GPU, no model weights, runs anywhere)
-python run_redaa.py --self-test
-
-# 3. Confirm the resolved settings
-python run_redaa.py --print-config
-
-# 4. One of everything -- both models, featurise, design, fold, measure (~1 min)
-python run_redaa.py --preflight
-
-# 5. Smoke test on one domain (~5 min on an A100)
-python run_redaa.py --test
-
-# 6. Submit the real thing
-sbatch slurm/redaa_array.slurm
+module load conda                  # or your site's equivalent
+conda create -y -n redaa python=3.11
+conda activate redaa
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # match your CUDA module
+pip install -r requirements.txt
 ```
+
+### 2. Stage everything offline-unfriendly (login node, once)
+
+```bash
+REDAA_PRESET=tev bash slurm/prepare_msi.sh
+```
+
+That script is idempotent and does the four things a compute node cannot:
+installs the **fold model's own** dependencies (ESMFold2 loads with
+`trust_remote_code=True`, so it imports `biotite`, `rdkit`, `omegaconf` and
+others that are not this package's dependencies), clones LigandMPNN and
+downloads the checkpoint for **each** model type, pre-caches the ~25 GB of
+ESMFold2 weights into a shared `HF_HOME`, and fetches your input structures.
+Use `REDAA_FETCH='1ubq_A, cath:1cukA01'` instead of `REDAA_PRESET` for your own
+accessions, or copy prepared PDBs into `INPUT_PDB_DIR` yourself.
+
+### 3. Prove it works on one GPU node, interactively
+
+```bash
+srun --partition=a100-4 --gres=gpu:a100:1 --time=0:40:00 --cpus-per-task=4 --mem=48g --pty bash
+```
+
+```bash
+conda activate redaa
+export HF_HOME=/scratch.global/$USER/hf MPNN_REPO=/scratch.global/$USER/LigandMPNN
+export INPUT_PDB_DIR=/scratch.global/$USER/redaa_inputs
+export SEARCH_MODE=site_aware SITE_PRESET=tev
+python run_redaa.py --preflight
+```
+
+**Do not submit the array until this passes once.** Preflight does one of
+everything in a few minutes — loads both models, featurises, designs with the
+site held fixed, folds, measures, and folds the native sequence — and names
+the first thing that breaks. Finding the same problem through the queue costs
+a wait per attempt.
+
+One thing to watch for here: the model downloads a chemical-component data
+file (~400 MB) on its **first fold**, not at load, so step 2 does not cover
+it. Running preflight interactively warms it. If preflight fails on a download
+instead, your compute nodes have no outbound network — note what it tried to
+fetch and that can be staged too.
+
+### 4. Submit
+
+```bash
+sbatch --export=ALL slurm/redaa_array.slurm
+```
+
+`--export=ALL` matters: the site settings you exported above are what make it
+a site-aware run. The script prints `--print-config` before loading any model,
+so the first lines of the log tell you what it is actually about to do.
+
+Edit the `#SBATCH` header for your allocation — **partition names, GPU type
+strings and account names are site-specific and change**, so check `sinfo` and
+your group's allocation rather than trusting the values committed here.
+
+### What the batch script assumes
+
+- **`HF_HUB_OFFLINE=1` by default.** Step 2 cached the weights; set it to `0`
+  only if you know your nodes have network.
+- **`MPNN_CHECKPOINT` is deliberately unset**, so the engine picks the file
+  matching `MPNN_MODEL_TYPE`. The checkpoints are not interchangeable.
+- **A per-task fold cache.** SQLite in WAL mode expects POSIX locking that a
+  parallel filesystem may not provide faithfully across nodes, so a shared
+  cache can hang or corrupt rather than merely miss. Sharing saves real work —
+  ten replicates of one domain fold many of the same sequences — so set
+  `FOLD_CACHE_PATH` to one path *if* you have confirmed locking works there.
+- **Preemption is survivable.** `--signal=B:USR1@300` and `MAX_WALL_SECONDS`
+  both trigger a clean stop: the replicate in flight finishes its bookkeeping,
+  summaries are written, and the task exits 2. Resubmit the same array task
+  and it resumes — completed replicates are skipped.
+
+### A smaller first run
+
+```bash
+python run_redaa.py --test --preset tev
+```
+
+One domain, one replicate, reduced budgets. Note that `--test` rewrites the
+budgets *after* the environment is read, so the run records what it actually
+used in `RESOLVED_CONFIG.txt` in its output directory — trust that over the
+variables you exported.
 
 ## Inputs: fetch or supply
 
@@ -574,7 +654,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all eight suites, 231 tests
+python run_redaa.py --self-test  # all nine suites, 242 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements
@@ -583,6 +663,7 @@ python tests/test_colab.py       # GPU recommendations, input gathering, results
 python tests/test_notebook.py    # notebook structure, forms, restart bootstrap
 python tests/test_sites.py       # site specs, resolution, metrics, presets
 python tests/test_mpnn.py        # LigandMPNN's featurise contract, fixed positions
+python tests/test_slurm.py       # the batch scripts, against the settings they drive
 python tests/test_pipeline.py    # full orchestration against stub engines
 ```
 
@@ -606,6 +687,7 @@ redaa/pipeline.py            batch and replicate orchestration
 redaa/colab.py               GPU-aware defaults, Drive wiring, input gathering
 colab/RedAA_Colab.ipynb      the notebook
 colab/build_notebook.py      generates the notebook; edit this, not the JSON
+slurm/prepare_msi.sh         login-node staging: deps, weights, checkpoints, inputs
 slurm/redaa_array.slurm      MSI array job template
 reference/New_V9_619.py      the original script, for diffing
 ```
