@@ -552,6 +552,21 @@ from a site that has been pulled apart. All three are rigid-body invariant and
 all three are recorded whether or not they gate (`SITE_GATE=0` records without
 gating).
 
+**The fold gate and the site gate are separate, and a verdict says which
+bound.** A candidate line reads
+
+```
++R (ACDGLPRT): minRMSD=1.40 maxTM=0.960 maxpLDDT=84.8 siteBB=2.41 siteLocal=0.84 cbDev=1.90 fail[site]
+```
+
+so a design that folds beautifully while losing the site is distinguishable at
+a glance from one that never folded. `fail[TM]`, `fail[site]`, `fail[TM and
+site]` and `fail[no single design passed both]` are the four cases. The last
+one is worth knowing about: both gates are applied **per fold**, while the
+reported numbers are each the best across folds, so a candidate can show a
+passing TM from one design and a passing site from another and still fail
+because no single design managed both.
+
 **These are a necessary condition, not a sufficient one.** They say the
 scaffold puts the functional residues where they belong. Whether the chemistry
 works is a wet-lab question, and nothing here predicts catalysis.
@@ -668,7 +683,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 246 tests
+python run_redaa.py --self-test  # all nine suites, 249 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

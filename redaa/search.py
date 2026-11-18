@@ -200,6 +200,12 @@ class BestSequence:
 @dataclass
 class Validation:
     passed: bool = False
+    # Why it failed, in a few words, when it did. The fold gate and the site
+    # gate are separate conditions and a candidate can satisfy either one
+    # alone, so "fail" without this is genuinely ambiguous -- a design can
+    # fold beautifully and still not hold the site, which is the whole point
+    # of having a site gate.
+    reason: str = ""
     metrics: Metrics = field(default_factory=Metrics)
     best: BestSequence = field(default_factory=BestSequence)
     folded: list[tuple[str, float | None, float | None, float | None]] = field(
@@ -334,11 +340,16 @@ class Validator:
 
         passed = False
         site_ok_flags: list[bool | None] = []
+        n_tm_ok = 0
+        n_plddt_ok = 0
+        n_site_ok = 0
         for idx, (_seq, _rmsd, tm, plddt) in enumerate(folded):
             ok_tm = tm is not None and tm >= self.cfg.min_tm_score
             ok_plddt = True
             if self.cfg.use_plddt_gate:
                 ok_plddt = plddt is None or plddt >= self.cfg.min_plddt_disorder
+            n_tm_ok += int(ok_tm)
+            n_plddt_ok += int(ok_plddt)
 
             sm = site_metrics[idx] if idx < len(site_metrics) else None
             if sm is None:
@@ -352,6 +363,7 @@ class Validator:
                 )
                 if ok_site:
                     metrics.num_site_pass += 1
+                    n_site_ok += 1
             site_ok_flags.append(ok_site)
 
             # The site is a gate only when asked for; otherwise the numbers
@@ -365,6 +377,26 @@ class Validator:
             if ok_tm and ok_plddt and gate_site:
                 metrics.num_pass_all += 1
                 passed = True
+
+        # Name the binding constraint. Both gates are per-fold, and the
+        # reported metrics are each the best across folds, so a candidate can
+        # show a passing TM and a passing site and still fail because no
+        # single design managed both at once.
+        reason = ""
+        if not passed:
+            gating_site = self.site_active and self.cfg.site_gate
+            if n_tm_ok == 0 and gating_site and n_site_ok == 0:
+                reason = "TM and site"
+            elif n_tm_ok == 0:
+                reason = "TM"
+            elif self.cfg.use_plddt_gate and n_plddt_ok == 0:
+                reason = "pLDDT"
+            elif gating_site and n_site_ok == 0:
+                reason = "site"
+            elif gating_site:
+                reason = "no single design passed both"
+            else:
+                reason = "gate"
 
         ranked = sorted(
             range(len(folded)),
@@ -385,7 +417,10 @@ class Validator:
             site_cb_dev=sm.cb_max_dev if sm else None,
             site_ok=site_ok_flags[pick],
         )
-        return Validation(passed=passed, metrics=metrics, best=best, folded=folded)
+        return Validation(
+            passed=passed, metrics=metrics, best=best, folded=folded,
+            reason=reason,
+        )
 
 
 # ---------------------------------------------------------------------------

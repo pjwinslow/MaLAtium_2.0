@@ -1321,6 +1321,106 @@ def test_preflight_flags_site_thresholds_the_model_cannot_reach():
         assert "Loosen" in out
 
 
+def test_a_failing_verdict_names_the_gate_that_bound():
+    """"maxTM=0.960 ... fail" is a puzzle, and it was asked about.
+
+    The fold gate and the site gate are separate per-fold conditions. A design
+    can fold beautifully and still not hold the site -- which is the point of
+    a site gate -- but nothing on the console line said so.
+    """
+    from redaa import sites as sitemod
+    from redaa import structure as st
+    from redaa.search import Validator
+    import redaa.pipeline as P
+
+    with tempfile.TemporaryDirectory(prefix="redaa_reason_") as tmp:
+        ref = os.path.join(tmp, "ref.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+        ref_xyz, ref_seq = st.parse_ca_from_file(ref)
+        records = st.parse_residues_from_file(
+            ref, atom_names=None, include_hetatm=True
+        )
+        frames, _ = st.frames_from_records(records)
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+
+        folder = StubFolder(
+            np.array(ref_xyz), ref_frames=frames[:, :3, :], want_frames=True
+        )
+        design = list("G" * len(ref_seq))
+        for idx, aa in SITE_INDICES.items():
+            design[idx] = aa
+        for i, aa in enumerate("VL"):
+            design[50 + i] = aa
+        design = "".join(design)
+        pairs = [(1.0, design)]
+        v = Validator(cfg, folder, np.array(ref_xyz), ref_seq,
+                      site=site, ref_frames=frames)
+
+        good = v.validate(set("GVL"), pairs, 1)
+        assert good.passed and good.reason == ""
+        assert P._verdict(good) == "PASS"
+
+        # Folds just as well, site displaced.
+        folder.break_site_for = {design}
+        bad = v.validate(set("GVL"), pairs, 1)
+        assert not bad.passed
+        assert bad.reason == "site", bad.reason
+        assert P._verdict(bad) == "fail[site]"
+        # The fold really was fine, so TM cannot be what the reader blames.
+        assert bad.metrics.max_tm > cfg.min_tm_score
+        # And the site numbers are on the line now.
+        fields = P._site_fields(bad.metrics)
+        assert "siteBB=" in fields and "cbDev=" in fields
+
+        # With the gate off, the same fold is accepted and nothing is blamed.
+        cfg.site_gate = False
+        reported = v.validate(set("GVL"), pairs, 1)
+        assert reported.passed and reported.reason == ""
+
+
+def test_a_fold_failure_is_blamed_on_the_fold_not_the_site():
+    from redaa import sites as sitemod
+    from redaa import structure as st
+    from redaa.search import Validator
+
+    with tempfile.TemporaryDirectory(prefix="redaa_reason2_") as tmp:
+        ref = os.path.join(tmp, "ref.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE)
+        ref_xyz, ref_seq = st.parse_ca_from_file(ref)
+        records = st.parse_residues_from_file(
+            ref, atom_names=None, include_hetatm=True
+        )
+        frames, _ = st.frames_from_records(records)
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+        folder = StubFolder(
+            np.array(ref_xyz), ref_frames=frames[:, :3, :], want_frames=True
+        )
+        v = Validator(cfg, folder, np.array(ref_xyz), ref_seq,
+                      site=site, ref_frames=frames)
+
+        # A sequence the stub folds to garbage: no G/V/L requirement met.
+        junk = "A" * len(ref_seq)
+        chars = list(junk)
+        for idx, aa in SITE_INDICES.items():
+            chars[idx] = aa
+        out = v.validate(set("A") | set(SITE_INDICES.values()), [(1.0, "".join(chars))], 1)
+        assert not out.passed
+        assert out.reason in ("TM", "TM and site"), out.reason
+
+
+def test_no_site_configured_still_reports_a_plain_verdict():
+    """The site columns must not appear in an alphabet_only run."""
+    import redaa.pipeline as P
+    from redaa.search import Metrics, Validation
+
+    metrics = Metrics(max_tm=0.2, min_rmsd=20.0)
+    assert P._site_fields(metrics) == ""
+    assert P._verdict(Validation(passed=False, reason="TM")) == "fail[TM]"
+    assert P._verdict(Validation(passed=True)) == "PASS"
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

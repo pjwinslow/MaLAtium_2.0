@@ -46,6 +46,30 @@ from .search import Metrics, Validator, backward_prune
 DONE_SENTINEL = "COMPLETED"
 
 
+def _site_fields(metrics) -> str:
+    """Site columns for a console line, or nothing when no site is configured."""
+    if not getattr(metrics, "site_active", False):
+        return ""
+    return (
+        f"siteBB={_fmt(metrics.site_bb_rmsd, '0.2f')} "
+        f"siteLocal={_fmt(metrics.site_local_rmsd, '0.2f')} "
+        f"cbDev={_fmt(metrics.site_cb_dev, '0.2f')} "
+    )
+
+
+def _verdict(validation) -> str:
+    """``PASS``, or ``fail[reason]`` naming the gate that bound.
+
+    Without the reason, a line reading "maxTM=0.960 ... fail" is a puzzle: the
+    fold gate passed comfortably and nothing on the line says the site gate
+    did not.
+    """
+    if validation.passed:
+        return "PASS"
+    reason = getattr(validation, "reason", "")
+    return f"fail[{reason}]" if reason else "fail"
+
+
 class _SkipCheck(Exception):
     """A preflight check that does not apply to this configuration."""
 
@@ -533,7 +557,8 @@ class Pipeline:
                         f"minRMSD={_fmt(v.metrics.min_rmsd, '0.2f')} "
                         f"maxTM={_fmt(v.metrics.max_tm)} "
                         f"maxpLDDT={_fmt(v.metrics.max_plddt, '0.1f')} "
-                        f"{'PASS' if v.passed else 'fail'}"
+                        + _site_fields(v.metrics)
+                        + _verdict(v)
                         + ("" if aa in promote else "  [screened out]")
                     )
                     evaluated.append((aa, d, v))
@@ -608,7 +633,8 @@ class Pipeline:
                 f"  full validation: minRMSD={_fmt(full.metrics.min_rmsd, '0.2f')} A "
                 f"maxTM={_fmt(full.metrics.max_tm)} "
                 f"maxpLDDT={_fmt(full.metrics.max_plddt, '0.1f')} "
-                f"{'PASSED' if full.passed else 'FAILED'}"
+                + _site_fields(full.metrics)
+                + ("PASSED" if full.passed else _verdict(full).strip())
             )
 
             # -- 5. backward pruning ---------------------------------------
