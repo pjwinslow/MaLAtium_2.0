@@ -690,6 +690,33 @@ def test_inverse_fold_cell_comes_after_the_results_and_reuses_models():
     assert "_REDAA_CODE" in cell and '"version": _version' in cell
     assert "INPUT_PDB_DIR" in cell
 
+def test_hf_token_is_read_from_the_secret_store_and_never_printed():
+    """A credential that reaches a log reaches every chat the log is pasted in.
+
+    The run report is explicitly built to be attached to bug reports, so the
+    token must be taken from Colab's secret store and never echoed.
+    """
+    boot = _bootstrap_source(_code_cells()[1])
+    assert 'userdata.get("HF_TOKEN")' in boot
+    assert 'os.environ["HF_TOKEN"] = _hf' in boot
+    # Never a literal, never printed.
+    assert "hf_" + "abc" not in boot
+    assert "print(_hf" not in boot and "print(os.environ[\"HF_TOKEN\"]" not in boot
+    # An existing token in the environment wins, so a non-Colab run is not
+    # overridden by an empty secret store.
+    assert 'if not os.environ.get("HF_TOKEN")' in boot
+    # Absence must not be an error.
+    assert "except Exception" in boot.split('userdata.get("HF_TOKEN")')[1][:200]
+
+
+def test_the_install_cell_says_whether_a_token_is_in_use():
+    cell = next(c for c in _code_cells() if "#@title Step 1" in c)
+    assert 'os.environ.get("HF_TOKEN")' in cell
+    assert "rate limited" in cell
+    # It must say where to put one, not merely that it is missing.
+    assert "HF_TOKEN" in cell and "secret" in cell.lower()
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

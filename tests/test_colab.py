@@ -1162,6 +1162,42 @@ def test_report_carries_the_settings_the_run_actually_used():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_a_hugging_face_token_never_reaches_a_report():
+    """The report is made to be attached to chats and bug trackers."""
+    saved = os.environ.get("HF_TOKEN")
+    secret = "hf_thisvalueshouldneverbeprinted"
+    tmp = tempfile.mkdtemp()
+    try:
+        os.environ["HF_TOKEN"] = secret
+        report = C.diagnose()
+        assert secret not in repr(report)
+        assert report["info"].get("hf_token") == "set"
+
+        path = C.write_report(out_path=os.path.join(tmp, "r.txt"))
+        body = open(path).read()
+        assert secret not in body
+        assert "hf_token" in body
+
+        os.environ.pop("HF_TOKEN")
+        assert C.diagnose()["info"].get("hf_token") == "not set"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if saved is None:
+            os.environ.pop("HF_TOKEN", None)
+        else:
+            os.environ["HF_TOKEN"] = saved
+
+
+def test_the_token_is_not_among_the_settings_the_report_dumps():
+    """ENV_VARS is dumped verbatim, so a secret there would be published."""
+    from redaa.config import ENV_VARS
+
+    for name in ENV_VARS:
+        assert "TOKEN" not in name.upper(), name
+        assert "SECRET" not in name.upper(), name
+        assert name.upper() not in ("HF_TOKEN", "GITHUB_TOKEN")
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

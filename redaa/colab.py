@@ -1240,6 +1240,14 @@ def diagnose(try_model_load: bool = False) -> dict:
     # -- model weight cache ------------------------------------------------
     cache = hf_cache_dir()
     info("hf_cache", cache)
+    # Presence only. The value is a credential and must never reach a report
+    # that people attach to chats and bug trackers.
+    info("hf_token", "set" if os.environ.get("HF_TOKEN") else "not set")
+    if not os.environ.get("HF_TOKEN"):
+        ok(
+            "no Hugging Face token: downloads work anonymously but are rate "
+            "limited, which is slow for a 25 GB model"
+        )
     if on_drive(cache):
         problem(
             "The model cache is on Google Drive (%s). safetensors reads "

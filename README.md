@@ -199,6 +199,17 @@ What it handles that the batch job does not need to:
   log, so it is the one thing worth attaching when asking about a failure.
   Colab truncates long cell output and loses it on a disconnect; the file does
   not. `rc.capture_run_log()` and `rc.write_report()` are the API.
+- **A Hugging Face token is optional but worth having.** ESMFold2 is public
+  and downloads anonymously, which is what the
+  `You are sending unauthenticated requests` warning means — it is a notice,
+  not an error. Anonymous traffic is rate limited, though, and the weights are
+  25 GB, which a fresh runtime re-fetches. Make a **read-only** token at
+  `huggingface.co/settings/tokens`, store it as the Colab secret `HF_TOKEN`
+  (key icon in the left sidebar), and every cell picks it up. It is read from
+  the secret store, never written into the notebook, never printed, and
+  deliberately not among the variables the run report dumps — that file is
+  built to be attached to bug reports. On MSI, export `HF_TOKEN` before
+  running `prepare_msi.sh`; never put it in a job script.
 - **Model weights are kept off Drive on purpose.** safetensors reads weights
   by memory-mapping them, and Drive's FUSE mount serves neither mmap nor
   reliable multi-gigabyte writes, so a model cached there fails to load with
@@ -782,7 +793,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 265 tests
+python run_redaa.py --self-test  # all nine suites, 269 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

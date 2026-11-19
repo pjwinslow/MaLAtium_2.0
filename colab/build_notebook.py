@@ -135,6 +135,22 @@ if globals().get("_REDAA_CODE") not in (None, _REDAA_FINGERPRINT):
     print("redaa changed on disk -- reimporting it.")
 _REDAA_CODE = _REDAA_FINGERPRINT
 
+# A Hugging Face token is optional -- ESMFold2 is public and downloads without
+# one -- but anonymous traffic is rate limited and slower, which is felt when
+# the weights are 25 GB and a fresh runtime re-fetches them. If a HF_TOKEN
+# secret exists, use it. Read from Colab's secret store, never written into
+# the notebook, never printed, and deliberately not among the variables the
+# run report dumps.
+if not os.environ.get("HF_TOKEN"):
+    try:
+        from google.colab import userdata as _userdata
+
+        _hf = _userdata.get("HF_TOKEN")
+        if _hf:
+            os.environ["HF_TOKEN"] = _hf
+    except Exception:
+        pass
+
 import redaa.colab as rc
 # -------------------------------------------------------------------------
 """
@@ -437,6 +453,19 @@ if problems:
     for line in problems:
         print("  - " + line)
     raise SystemExit("Fix the above and re-run Step 1.")
+
+if os.environ.get("HF_TOKEN"):
+    print("\\nHugging Face token: in use (higher rate limits, faster downloads)")
+else:
+    print(
+        "\\nHugging Face token: none. Downloads still work -- ESMFold2 is "
+        "public -- but\\n"
+        "  anonymous traffic is rate limited, which is felt on a 25 GB "
+        "model. To use one:\\n"
+        "  a read-only token from huggingface.co/settings/tokens, stored as "
+        "the Colab\\n"
+        "  secret HF_TOKEN (key icon, left sidebar), then re-run this cell."
+    )
 
 print("\\nInstall complete and verified.")
 print("  repo        " + REPO_DIR)

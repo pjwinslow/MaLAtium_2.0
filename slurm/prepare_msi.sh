@@ -145,6 +145,16 @@ EOF
 # ---------------------------------------------------------------------------
 # ESMFold2-Fast is ~25 GB. Pull it once, here, into the shared HF_HOME so the
 # array tasks can run with HF_HUB_OFFLINE=1.
+# A token is optional -- the model is public -- but anonymous traffic is rate
+# limited, which is felt at 25 GB. Export HF_TOKEN before running this script
+# to use one. Never put it in the script or in a job file: those get committed
+# and shared.
+if [ -n "${HF_TOKEN:-}" ]; then
+  echo "  using the HF_TOKEN from the environment"
+else
+  echo "  no HF_TOKEN set; downloading anonymously (slower, rate limited)"
+fi
+
 say "pre-caching $FOLD_MODEL_ID into $HF_HOME (this is the slow part)"
 python - "$FOLD_MODEL_ID" <<'EOF'
 import sys
