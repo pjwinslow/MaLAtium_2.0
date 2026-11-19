@@ -63,6 +63,11 @@ SOLVENT_COMPONENTS = frozenset({
     "SO4", "PO4", "CL", "BR", "IOD", "NO3", "FMT", "CIT", "FLC", "TRS",
     "EPE", "MES", "BME", "TCE", "AZI", "CAC", "MLI", "TAR", "SCN",
     "NH4", "UNX", "UNL",
+    # Buffers, reductants and crystallisation additives. IMD in particular is
+    # everywhere -- it turned up as a "ligand" candidate beside the real one
+    # in a GlyRS structure.
+    "IMD", "BTB", "B3P", "MRD", "SPD", "SPM", "DTT", "NHE", "LDA", "C8E",
+    "PE4", "P33", "PGO", "BU3", "GOL",
 })
 
 # Monatomic ions.  Not solvent -- a catalytic zinc or the magnesium that makes

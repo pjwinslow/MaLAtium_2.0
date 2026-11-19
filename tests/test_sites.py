@@ -240,6 +240,23 @@ def test_missing_ligand_is_reported_not_guessed():
         assert any("no atoms found" in w for w in site.warnings)
 
 
+def test_common_crystallisation_additives_are_not_ligand_candidates():
+    """Imidazole and friends turn up beside real ligands constantly.
+
+    A GlyRS structure offered IMD as a binding candidate next to its actual
+    adenylate analogue. The list is for *auto-detection* only -- anything can
+    still be named explicitly -- so it is better to be generous here than to
+    advertise a buffer as a pocket.
+    """
+    for code in ("IMD", "BTB", "B3P", "MRD", "SPD", "SPM", "DTT", "GOL",
+                 "EDO", "MES", "SO4", "HOH"):
+        assert code in S.SOLVENT_COMPONENTS, code
+    # Real ligands must not have been swept up with them.
+    for code in ("ATP", "ADP", "G5A", "6NT", "B12", "NAD", "FAD", "HEM"):
+        assert code not in S.SOLVENT_COMPONENTS, code
+        assert code not in S.ION_COMPONENTS, code
+
+
 def test_solvent_is_never_taken_for_a_ligand():
     with tempfile.TemporaryDirectory() as tmp:
         p = _write(
