@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import json
 import os
 import signal
 import time
@@ -268,6 +269,96 @@ class Pipeline:
         return os.path.exists(
             os.path.join(domain_dir, f"run_{rep}", DONE_SENTINEL)
         )
+
+    @staticmethod
+    def rep_result_path(domain_dir: str, rep: int) -> str:
+        return os.path.join(domain_dir, f"run_{rep}", "result.json")
+
+    def load_rep_result(self, domain: str, domain_dir: str, rep: int) -> dict:
+        """What a finished replicate found, read back or reconstructed.
+
+        Runs made before results were recorded still have their per-replicate
+        CSVs, so rather than reporting a resumed replicate as a blank row, the
+        essentials are rebuilt from those. An incomplete row is still far more
+        use than an empty one, and it saves re-running hours of work to
+        recover numbers that are already on disk.
+        """
+        path = self.rep_result_path(domain_dir, rep)
+        if os.path.exists(path):
+            try:
+                with open(path) as fh:
+                    recorded = json.load(fh)
+                recorded["status"] = "resumed"
+                return recorded
+            except (OSError, ValueError) as exc:
+                print(f"  (replicate {rep} result unreadable: {exc})")
+
+        rebuilt = self._reconstruct_rep_result(domain_dir, rep)
+        rebuilt.update(pdb=domain, replicate=rep)
+        return rebuilt
+
+    @staticmethod
+    def _reconstruct_rep_result(domain_dir: str, rep: int) -> dict:
+        """Recover what the per-replicate CSVs still say about a replicate."""
+        run_dir = os.path.join(domain_dir, f"run_{rep}")
+        out: dict = {"status": "resumed_reconstructed"}
+
+        build = os.path.join(run_dir, "alphabet_building_log.csv")
+        if os.path.exists(build):
+            try:
+                with open(build, newline="") as fh:
+                    rows = list(csv.DictReader(fh))
+            except OSError:
+                rows = []
+            forward = ""
+            pruned = ""
+            for row in rows:
+                if row.get("Status") == "ACCEPTED_STOP_VALIDATED":
+                    forward = row.get("Current_Set", "")
+                elif row.get("Stage") == "OPEN" and row.get("Current_Set"):
+                    forward = forward or ""
+                if row.get("Candidate_AA") == "BACKWARD_PASS":
+                    pruned = row.get("Current_Set", "")
+            if not forward:
+                opens = [r for r in rows if r.get("Stage") == "OPEN"]
+                if opens:
+                    forward = opens[-1].get("Current_Set", "")
+            if forward:
+                out["final_alphabet"] = forward
+                out["alphabet_size"] = len(forward)
+            if pruned:
+                out["pruned_alphabet"] = pruned
+                out["pruned_alphabet_size"] = len(pruned)
+
+        val = os.path.join(run_dir, "esmfold_validation_log.csv")
+        if os.path.exists(val):
+            try:
+                with open(val, newline="") as fh:
+                    rows = list(csv.DictReader(fh))
+            except OSError:
+                rows = []
+
+            def _num(text):
+                try:
+                    return float(text)
+                except (TypeError, ValueError):
+                    return None
+
+            best = None
+            for row in rows:
+                tm = _num(row.get("Max_TM"))
+                if tm is not None and (best is None or tm > best[0]):
+                    best = (tm, row)
+            if best is not None:
+                tm, row = best
+                out["best_seq_tm"] = tm
+                out["best_seq_rmsd"] = _num(row.get("Min_RMSD"))
+                out["best_seq_plddt"] = _num(row.get("Max_pLDDT"))
+                out["best_seq_alphabet"] = row.get("Alphabet", "")
+                out["best_seq_site_bb_rmsd"] = _num(row.get("Site_BB_RMSD"))
+                out["best_seq_site_local_rmsd"] = _num(row.get("Site_Local_RMSD"))
+                out["best_seq_site_cb_dev"] = _num(row.get("Site_CB_Dev"))
+        return out
 
     @staticmethod
     def mark_rep_done(domain_dir: str, rep: int) -> None:
@@ -749,6 +840,16 @@ class Pipeline:
                 site_policy=cfg.site_residue_policy,
             )
         result.update(graft)
+
+        # Record it beside the replicate's logs. A resumed run skips finished
+        # replicates, and without this their results were absent from
+        # BATCH_SUMMARY -- so a run spread over several Colab sessions
+        # reported only the replicates that happened to run in the last one.
+        try:
+            with open(self.rep_result_path(domain_dir, rep), "w") as fh:
+                json.dump(result, fh, indent=1, default=str)
+        except OSError as exc:
+            print(f"  (could not record the replicate result: {exc})")
         return result
 
     # ------------------------------------------------------------------
@@ -1670,13 +1771,25 @@ class Pipeline:
         try:
             for rep in range(1, cfg.num_replicates + 1):
                 if self.rep_done(domain_dir, rep):
-                    print(f"\n  --- replicate {rep}/{cfg.num_replicates} "
-                          f"[skipped, checkpoint present] ---")
-                    self.results.append(
-                        {"pdb": domain, "replicate": rep, "status": "resumed",
-                         "esmfold_native_flag": domain_flag,
-                         "esmfold_native_tm": nat_tm}
+                    recovered = self.load_rep_result(domain, domain_dir, rep)
+                    recovered.setdefault("pdb", domain)
+                    recovered.setdefault("replicate", rep)
+                    recovered["esmfold_native_flag"] = domain_flag
+                    recovered["esmfold_native_tm"] = nat_tm
+                    shown = recovered.get("pruned_alphabet") or recovered.get(
+                        "final_alphabet"
                     )
+                    print(
+                        f"\n  --- replicate {rep}/{cfg.num_replicates} "
+                        f"[skipped, checkpoint present] ---"
+                        + (f" {shown}" if shown else "")
+                        + (
+                            "  (rebuilt from this replicate's logs)"
+                            if recovered.get("status")
+                            == "resumed_reconstructed" else ""
+                        )
+                    )
+                    self.results.append(recovered)
                     continue
 
                 self.check_stop()

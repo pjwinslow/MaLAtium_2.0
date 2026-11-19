@@ -1728,6 +1728,69 @@ def test_inverse_fold_reports_excluded_survivors_per_sequence():
             assert not set(row["sequence"]) & set("CWM")
 
 
+def test_a_resumed_replicate_keeps_its_result_in_the_summary():
+    """A run spread over several sessions reported only the last session's work.
+
+    Colab disconnects, so a 3-replicate run routinely finishes across
+    sessions. Resumed replicates were written as blank rows, so BATCH_SUMMARY
+    -- the file anyone analyses -- silently lost two thirds of the data.
+    """
+    with tempfile.TemporaryDirectory(prefix="redaa_resume_") as tmp:
+        pipe, code = _run(tmp, num_replicates=1)
+        assert code == 0
+        first = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert first["final_alphabet"]
+
+        # Run again over the same directory: the replicate is finished, so it
+        # must be reported from its record rather than as a stub.
+        pipe.cfg.resume_from = pipe.run_dir
+        again = StubPipeline(pipe.cfg)
+        again.ref_path = pipe.ref_path
+        assert again.run() == 0
+        row = _read_csv(os.path.join(again.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"] == "resumed"
+        assert row["final_alphabet"] == first["final_alphabet"], row
+        assert row["pruned_alphabet"] == first["pruned_alphabet"]
+        assert row["best_sequence"] == first["best_sequence"]
+
+
+def test_a_replicate_from_an_older_run_is_rebuilt_from_its_logs():
+    """Recovering numbers already on disk beats re-running hours of work."""
+    with tempfile.TemporaryDirectory(prefix="redaa_rebuild_") as tmp:
+        pipe, _ = _run(tmp, num_replicates=1)
+        expected = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+
+        # Simulate a run made before results were recorded.
+        record = pipe.rep_result_path(
+            os.path.join(pipe.run_dir, "testdomA00"), 1
+        )
+        assert os.path.exists(record)
+        os.remove(record)
+
+        pipe.cfg.resume_from = pipe.run_dir
+        again = StubPipeline(pipe.cfg)
+        again.ref_path = pipe.ref_path
+        assert again.run() == 0
+        row = _read_csv(os.path.join(again.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"] == "resumed_reconstructed", row["status"]
+        # The alphabets come back from the building log...
+        assert row["final_alphabet"] == expected["final_alphabet"], row
+        assert row["pruned_alphabet"] == expected["pruned_alphabet"], row
+        # ... and the metrics from the validation log.
+        assert float(row["best_seq_tm"]) > 0
+        assert row["best_seq_rmsd"]
+
+
+def test_reconstruction_survives_a_replicate_with_no_logs_at_all():
+    with tempfile.TemporaryDirectory(prefix="redaa_rebuild2_") as tmp:
+        cfg = _make_config(tmp)
+        pipe = StubPipeline(cfg)
+        pipe.run_dir = tmp
+        out = pipe._reconstruct_rep_result(os.path.join(tmp, "nothing"), 1)
+        assert out["status"] == "resumed_reconstructed"
+        assert "final_alphabet" not in out
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
