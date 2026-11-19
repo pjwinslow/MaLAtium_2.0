@@ -690,8 +690,18 @@ Three conflicts are reported rather than silently resolved:
   reinstating the residue would make the reported alphabet a lie. The result
   is then a design under that constraint, not a reproduction of the native.
 - **Excluded but needed by an `in_alphabet` site** — a contradiction, so that
-  domain is skipped with the two ways to resolve it. Under `exempt` it is
-  consistent and runs, because an exempt residue is not an alphabet letter.
+  domain is skipped with the two ways to resolve it.
+- **Excluded but held by an `exempt` site** — consistent as far as the
+  *alphabet* goes, since an exempt residue is not a letter, but it puts the
+  residue straight back into the **sequence**, at the positions that matter
+  most. If the point is to remove a residue from the protein entirely, that is
+  the opposite of what you wanted, so the run says which positions and how
+  many, and suggests `measure_only`.
+
+Whichever happens, the outcome is reported rather than inferred from the
+settings: `BATCH_SUMMARY.csv` and `INVERSE_FOLD.csv` both carry
+`excluded_present` and `excluded_count` for the sequence in hand. If you barred
+a residue in order to eliminate it, that column is the thing to read.
 
 ## Inverse folding: turning an alphabet into candidates
 
@@ -772,7 +782,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 262 tests
+python run_redaa.py --self-test  # all nine suites, 265 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

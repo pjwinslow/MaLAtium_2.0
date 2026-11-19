@@ -727,6 +727,17 @@ class Pipeline:
                 "" if best["site_ok"] is None else int(bool(best["site_ok"]))
             ),
             "search_mode": mode,
+            # The direct check on an exclusion: did a barred residue reach the
+            # sequence anyway? It can, legitimately, through an exempt site
+            # position -- so the answer belongs in the output rather than
+            # being assumed from the settings.
+            "excluded_aas": "".join(cfg.exclude_aas),
+            "excluded_present": "".join(
+                sorted(set(cfg.exclude_aas) & set(best["sequence"] or ""))
+            ),
+            "excluded_count": sum(
+                (best["sequence"] or "").count(aa) for aa in cfg.exclude_aas
+            ),
         }
         if site is not None:
             result.update(
@@ -1501,6 +1512,27 @@ class Pipeline:
                 "constraint rather than a reproduction of the native."
             )
             protected -= barred
+        if site is not None and cfg.site_residue_policy != POLICY_IN_ALPHABET:
+            # Exempt positions are held at their NATIVE identity, so an exempt
+            # site residue whose type is barred puts that residue back into the
+            # protein -- silently defeating the exclusion. Anyone excluding a
+            # residue wants it gone from the sequence, not gone from the
+            # alphabet while surviving at the positions that matter most.
+            held = [
+                p for p in site.positions if p.native_aa in barred
+            ] if cfg.site_residue_policy != POLICY_MEASURE_ONLY else []
+            if held:
+                where = ", ".join(p.label for p in held)
+                print(
+                    f"\n  WARNING: EXCLUDE_AAS bars "
+                    f"{''.join(sorted({p.native_aa for p in held}))}, but the "
+                    f"site holds {where} at native identity under "
+                    "SITE_RESIDUE_POLICY=exempt.\n"
+                    f"    The designed protein will still contain "
+                    f"{len(held)} of them. If the point is to remove the "
+                    "residue entirely, drop those positions from SITE_SPEC or "
+                    "use SITE_RESIDUE_POLICY=measure_only."
+                )
         if site is not None and cfg.site_residue_policy == POLICY_IN_ALPHABET:
             site_clash = sorted(set(site.residue_types) & barred)
             if site_clash:
@@ -1696,7 +1728,8 @@ class Pipeline:
         "best_seq_alphabet", "best_seq_rmsd", "best_seq_tm", "best_seq_plddt",
         "best_sequence",
         # mode and site
-        "search_mode", "site_name", "site_spec", "site_n_positions",
+        "search_mode", "excluded_aas", "excluded_present", "excluded_count",
+        "site_name", "site_spec", "site_n_positions",
         "site_residues", "site_residue_types", "site_policy",
         "best_seq_site_bb_rmsd", "best_seq_site_local_rmsd",
         "best_seq_site_cb_dev", "best_seq_site_ok",
@@ -1714,7 +1747,8 @@ class Pipeline:
         "pdb", "alphabet", "alphabet_size", "rank", "mpnn_score",
         "tm", "rmsd", "plddt", "passed",
         "site_bb_rmsd", "site_local_rmsd", "site_cb_dev", "site_ok",
-        "site_identity_kept", "length", "sequence",
+        "site_identity_kept", "excluded_present", "excluded_count",
+        "length", "sequence",
     ]
 
     def alphabet_for(self, domain: str, override: str | None = None) -> str:
@@ -1895,6 +1929,12 @@ class Pipeline:
                     "site_ok": "" if ok_site is None else int(bool(ok_site)),
                     "site_identity_kept": (
                         "" if metrics is None else int(bool(metrics.identity_kept))
+                    ),
+                    "excluded_present": "".join(
+                        sorted(set(cfg.exclude_aas) & set(seq))
+                    ),
+                    "excluded_count": sum(
+                        seq.count(aa) for aa in cfg.exclude_aas
                     ),
                     "length": len(seq),
                     "sequence": seq,

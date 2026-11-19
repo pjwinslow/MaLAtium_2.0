@@ -1666,6 +1666,68 @@ def test_inverse_fold_without_a_summary_or_an_alphabet_says_so():
             raise AssertionError("expected a clear refusal")
 
 
+def test_an_exempt_site_holding_an_excluded_residue_is_called_out():
+    """The trap for "remove this residue from the protein entirely".
+
+    Exempt positions keep their NATIVE identity, so an exempt site residue
+    whose type is barred puts that residue straight back into the sequence --
+    at the positions that matter most, and without a word.
+    """
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory(prefix="redaa_exempt_excl_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        # SITE holds C2, D3 and H7; bar C, which one of them is.
+        cfg = _make_config(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="exempt", exclude_aas=("C",),
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = ref
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pipe.run()
+        out = buf.getvalue()
+        assert "EXCLUDE_AAS bars C" in out, out[-900:]
+        assert "still contain" in out
+        assert "measure_only" in out
+
+        # And the CSV says so rather than leaving it to be assumed.
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["excluded_aas"] == "C"
+        assert row["excluded_present"] == "C", row
+        assert int(row["excluded_count"]) >= 1
+
+
+def test_a_clean_exclusion_reports_nothing_present():
+    with tempfile.TemporaryDirectory(prefix="redaa_excl_clean_") as tmp:
+        pipe, code = _run(tmp, exclude_aas=("C", "W"))
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["excluded_aas"] == "CW"
+        assert row["excluded_present"] == "", row
+        assert int(row["excluded_count"]) == 0
+        assert "C" not in row["best_sequence"] and "W" not in row["best_sequence"]
+
+
+def test_inverse_fold_reports_excluded_survivors_per_sequence():
+    with tempfile.TemporaryDirectory(prefix="redaa_inv_excl_") as tmp:
+        pipe, _ = _run(tmp, exclude_aas=("C", "W", "M"))
+        pipe.cfg.resume_from = pipe.run_dir
+        second = StubPipeline(pipe.cfg)
+        second.ref_path = pipe.ref_path
+        rows = _read_csv(second.inverse_fold(num_seq=20, n_folds=4))
+        assert rows
+        for row in rows:
+            assert row["excluded_present"] == "", row
+            assert int(row["excluded_count"]) == 0
+            assert not set(row["sequence"]) & set("CWM")
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
