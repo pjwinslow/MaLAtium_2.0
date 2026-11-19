@@ -42,7 +42,13 @@ from .config import (
 from .foldcache import FoldCache
 from .folding import FoldEngine
 from .mpnn import MPNNEngine
-from .search import Metrics, Validator, backward_prune
+from .search import (
+    Metrics,
+    Validator,
+    backward_prune,
+    in_alphabet,
+    select_sequences,
+)
 
 DONE_SENTINEL = "COMPLETED"
 
@@ -412,8 +418,12 @@ class Pipeline:
             # -- 1. 20-residue baseline -------------------------------------
             # Always at the coldest temperature, independent of the restricted
             # runs, so it is the strongest possible reference score.
+            # The baseline is the reference every restricted alphabet is
+            # compared against, so it must be reachable: with EXCLUDE_AAS set,
+            # a 20-letter baseline is a score no candidate could ever match.
+            usable = list(cfg.usable_aas)
             baseline = design(
-                list(ALL_AAS),
+                usable,
                 temperature=cfg.mpnn_baseline_temp, seed=base_seed,
             )
             target_score = baseline.mean_score * cfg.baseline_tolerance
@@ -425,7 +435,7 @@ class Pipeline:
             if cfg.dynamic_seeding:
                 counts: Counter = Counter()
                 for _sc, seq in baseline.pairs:
-                    counts.update(c for c in seq if c in set(ALL_AAS))
+                    counts.update(c for c in seq if c in set(usable))
                 top = counts.most_common()
                 current = sorted(aa for aa, _ in top[: cfg.dynamic_seed_size])
                 comp = " ".join(f"{aa}:{n}" for aa, n in top[:10])
@@ -449,7 +459,7 @@ class Pipeline:
                 if cfg.use_hydrophobic_seeding:
                     best_aa, best_sc = None, float("inf")
                     for i, aa in enumerate(("V", "I", "L")):
-                        if aa in current:
+                        if aa in current or aa not in set(usable):
                             continue
                         d = design(current + [aa], seed=base_seed + 2 + i)
                         build.writerow(
@@ -473,10 +483,10 @@ class Pipeline:
 
             # -- 3. forward greedy rounds ----------------------------------
             rounds = 0
-            while len(current) < 20:
+            while len(current) < len(usable):
                 self.check_stop()
                 rounds += 1
-                remaining = [aa for aa in ALL_AAS if aa not in current]
+                remaining = [aa for aa in usable if aa not in current]
                 if not remaining:
                     break
 
@@ -825,9 +835,9 @@ class Pipeline:
         # search, but every trial now has the site fixed and site-gated, so
         # the letters it adds are the ones the *site* needs.
         added: list[str] = []
-        while len(current) < 20:
+        while len(current) < len(cfg.usable_aas):
             self.check_stop()
-            remaining = [aa for aa in ALL_AAS if aa not in current]
+            remaining = [aa for aa in cfg.usable_aas if aa not in current]
             if not remaining:
                 break
             trials = []
@@ -1474,6 +1484,39 @@ class Pipeline:
             if cfg.site_residue_policy == POLICY_IN_ALPHABET:
                 protected |= set(site.residue_types)
 
+        # An excluded residue that this structure chemically needs is a
+        # contradiction only the structure can reveal -- config validation
+        # cannot know about its disulfides. Say so here, per domain, and let
+        # the exclusion win: the user asked for it explicitly, and silently
+        # reinstating a residue would make the reported alphabet a lie.
+        barred = set(cfg.exclude_aas)
+        clash = sorted(protected & barred)
+        if clash:
+            print(
+                f"\n  WARNING: EXCLUDE_AAS bars {', '.join(clash)}, which this "
+                "structure's chemistry asks to protect "
+                f"({'; '.join(req.notes) or 'see the analysis below'}).\n"
+                "    The exclusion wins. Those features cannot be reproduced, "
+                "so treat this domain's result as a design under that "
+                "constraint rather than a reproduction of the native."
+            )
+            protected -= barred
+        if site is not None and cfg.site_residue_policy == POLICY_IN_ALPHABET:
+            site_clash = sorted(set(site.residue_types) & barred)
+            if site_clash:
+                print(
+                    f"  ERROR: SITE_RESIDUE_POLICY=in_alphabet needs "
+                    f"{', '.join(site_clash)} for the site, but EXCLUDE_AAS "
+                    "bars them -- skipping this domain. Use "
+                    "SITE_RESIDUE_POLICY=exempt, or stop excluding them."
+                )
+                self.results.append(
+                    {"pdb": domain, "replicate": 0,
+                     "status": "skipped_excluded_site_residue: "
+                               + ",".join(site_clash)}
+                )
+                return
+
         if cfg.dynamic_seeding:
             start_alphabet: list[str] = []
         else:
@@ -1485,6 +1528,11 @@ class Pipeline:
         for note in req.notes:
             print(f"    -> {note}")
         print(f"    starting alphabet: {start_alphabet or '(dynamic)'}")
+        if barred:
+            print(
+                f"    excluded     : {''.join(sorted(barred))} "
+                f"({len(cfg.usable_aas)} residues available)"
+            )
         with open(info_path, "a") as fh:
             fh.write("\nStructural requirements:\n")
             fh.write(f"  Disulfides: {req.n_disulfides}\n")
@@ -1658,6 +1706,265 @@ class Pipeline:
         "graft_passed", "graft_tm", "graft_site_bb_rmsd",
         "graft_site_local_rmsd", "graft_site_cb_dev",
     ]
+
+    # ------------------------------------------------------------------
+    # Inverse folding with a finished alphabet
+    # ------------------------------------------------------------------
+    INVERSE_FIELDS = [
+        "pdb", "alphabet", "alphabet_size", "rank", "mpnn_score",
+        "tm", "rmsd", "plddt", "passed",
+        "site_bb_rmsd", "site_local_rmsd", "site_cb_dev", "site_ok",
+        "site_identity_kept", "length", "sequence",
+    ]
+
+    def alphabet_for(self, domain: str, override: str | None = None) -> str:
+        """The alphabet to design with: *override*, or what the run settled on.
+
+        Prefers the pruned alphabet over the forward one, since pruning is
+        what makes the answer minimal; falls back to the forward alphabet when
+        pruning was off or removed nothing.
+        """
+        if override:
+            return "".join(sorted(set(override.upper())))
+
+        path = os.path.join(self.run_dir, "BATCH_SUMMARY.csv")
+        if not os.path.exists(path):
+            raise SystemExit(
+                f"no alphabet given and no BATCH_SUMMARY.csv in {self.run_dir} "
+                "-- run a search first, or pass one explicitly"
+            )
+        best = ""
+        with open(path, newline="") as fh:
+            for row in csv.DictReader(fh):
+                if row.get("pdb") != domain:
+                    continue
+                candidate = (
+                    row.get("pruned_alphabet") or row.get("final_alphabet") or ""
+                )
+                # Across replicates, take the smallest that the search accepted.
+                if candidate and (not best or len(candidate) < len(best)):
+                    best = candidate
+        if not best:
+            raise SystemExit(
+                f"BATCH_SUMMARY.csv has no alphabet for {domain!r}; pass one "
+                "explicitly"
+            )
+        return "".join(sorted(set(best)))
+
+    def inverse_fold(
+        self,
+        alphabet: str | None = None,
+        num_seq: int | None = None,
+        n_folds: int | None = None,
+    ) -> str:
+        """Design many sequences from a finished alphabet, and fold them.
+
+        The search answers "how small can the alphabet be"; it reports one
+        best sequence per replicate, which is the wrong output for anything
+        downstream. This takes the alphabet a run settled on and produces a
+        set of candidates with their own numbers, so there is something to
+        order, rank and take to a bench.
+
+        Everything the run was configured with still applies: the site is held
+        exactly as SEARCH_MODE and SITE_RESIDUE_POLICY say, the folds are at
+        FOLD_STEPS_FINAL, and the fold cache means sequences the search
+        already folded cost nothing.
+        """
+        cfg = self.cfg
+        num_seq = num_seq or max(cfg.mpnn_num_seq, 50)
+        n_folds = n_folds or cfg.num_seqs_to_fold
+
+        domains = self.discover()
+        start = cfg.chunk_index * cfg.chunk_size
+        chunk = domains[start : start + cfg.chunk_size]
+        if not chunk:
+            raise SystemExit(f"no domains in chunk {cfg.chunk_index}")
+
+        self.setup()
+        rows: list[dict] = []
+
+        print("\n" + "=" * 70)
+        print("INVERSE FOLDING with a fixed alphabet")
+        print("=" * 70)
+        print(f"  domains      : {[name for name, _ in chunk]}")
+        print(f"  sequences    : {num_seq} designed, {n_folds} folded")
+        print(f"  fold quality : {cfg.fold_steps_final} steps")
+
+        for domain, source_path in chunk:
+            if not os.path.isfile(source_path):
+                print(f"\n{domain}: file missing, skipping")
+                continue
+
+            domain_dir = os.path.join(self.run_dir, domain)
+            os.makedirs(domain_dir, exist_ok=True)
+            pdb_path = source_path
+            if len(domain) <= 4:
+                chain_path = os.path.join(domain_dir, f"{domain}_chainA.pdb")
+                if st.extract_chain(source_path, "A", chain_path) == 0:
+                    print(f"\n{domain}: no usable chain A, skipping")
+                    continue
+                pdb_path = chain_path
+
+            ref_xyz, ref_seq = st.parse_ca_from_file(pdb_path)
+            if len(ref_xyz) < 15:
+                print(f"\n{domain}: too short, skipping")
+                continue
+
+            site = None
+            ref_frames = None
+            if cfg.site_enabled:
+                try:
+                    site, ref_frames = self.resolve_domain_site(pdb_path, ref_seq)
+                except sitemod.SiteError as exc:
+                    print(f"\n{domain}: {exc}")
+                    continue
+
+            try:
+                alpha = self.alphabet_for(domain, alphabet)
+            except SystemExit as exc:
+                print(f"\n{domain}: {exc}")
+                continue
+
+            fixed: dict[int, str] = {}
+            if (
+                site is not None
+                and cfg.search_mode == MODE_SITE_AWARE
+                and cfg.site_residue_policy != POLICY_MEASURE_ONLY
+            ):
+                fixed = {p.index: p.native_aa for p in site.positions}
+
+            validator = Validator(
+                cfg, self.folder, ref_xyz, ref_seq,
+                site=site, ref_frames=ref_frames,
+            )
+
+            print(f"\n{domain}: alphabet {alpha} ({len(alpha)} letters)"
+                  + (f", {len(fixed)} site positions held" if fixed else ""))
+
+            designs = self.mpnn.design(
+                pdb_path, list(alpha), num_seq=num_seq,
+                fixed=fixed or None, seed=cfg.fold_seed + 1234,
+            )
+            usable_pairs = [
+                (sc, sq) for sc, sq in designs.pairs
+                if sq and sq != ref_seq
+                and in_alphabet(sq, set(alpha), validator.exempt)
+            ]
+            if not usable_pairs:
+                print("  MPNN produced no usable in-alphabet sequence")
+                continue
+            print(f"  {len(designs.pairs)} distinct designs, "
+                  f"{len(usable_pairs)} in alphabet")
+
+            chosen = select_sequences(
+                usable_pairs, n_folds, max_identity=cfg.max_identity_for_fold
+            )
+            scores = dict((sq, sc) for sc, sq in usable_pairs)
+            results = self.folder.fold_many(chosen, steps=cfg.fold_steps_final)
+
+            produced: list[dict] = []
+            for seq, result in zip(chosen, results):
+                if result is None or not result.ok:
+                    continue
+                rmsd, tm = st.compare(ref_xyz, ref_seq, result.ca, seq)
+                metrics = validator.measure(seq, result)
+                ok_site = None
+                if metrics is not None:
+                    ok_site = metrics.passed(
+                        cfg.site_max_bb_rmsd, cfg.site_max_local_rmsd,
+                        cfg.site_max_cb_dev,
+                        require_identity=validator.require_identity,
+                    )
+                gate_site = True if ok_site is None else bool(ok_site)
+                if not (site is not None and cfg.site_gate):
+                    gate_site = True
+                produced.append({
+                    "pdb": domain,
+                    "alphabet": alpha,
+                    "alphabet_size": len(alpha),
+                    "mpnn_score": scores.get(seq),
+                    "tm": tm,
+                    "rmsd": rmsd,
+                    "plddt": result.plddt,
+                    "passed": int(bool(
+                        tm is not None and tm >= cfg.min_tm_score and gate_site
+                    )),
+                    "site_bb_rmsd": metrics.bb_rmsd if metrics else None,
+                    "site_local_rmsd": metrics.local_rmsd if metrics else None,
+                    "site_cb_dev": metrics.cb_max_dev if metrics else None,
+                    "site_ok": "" if ok_site is None else int(bool(ok_site)),
+                    "site_identity_kept": (
+                        "" if metrics is None else int(bool(metrics.identity_kept))
+                    ),
+                    "length": len(seq),
+                    "sequence": seq,
+                })
+
+            produced.sort(
+                key=lambda r: (
+                    -r["passed"],
+                    -(r["tm"] if r["tm"] is not None else -1.0),
+                    r["rmsd"] if r["rmsd"] is not None else 1e9,
+                )
+            )
+            for rank, row in enumerate(produced, start=1):
+                row["rank"] = rank
+                print(
+                    f"    {rank:>2}. TM={_fmt(row['tm'])} "
+                    f"RMSD={_fmt(row['rmsd'], '0.2f')} A "
+                    f"pLDDT={_fmt(row['plddt'], '0.1f')} "
+                    + (
+                        f"siteBB={_fmt(row['site_bb_rmsd'], '0.2f')} "
+                        if site is not None else ""
+                    )
+                    + ("PASS" if row["passed"] else "fail")
+                )
+            rows.extend(produced)
+            self.mpnn.release(pdb_path)
+
+        if not rows:
+            raise SystemExit("inverse folding produced nothing")
+
+        csv_path = os.path.join(self.run_dir, "INVERSE_FOLD.csv")
+        with open(csv_path, "w", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=self.INVERSE_FIELDS, extrasaction="ignore"
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in self.INVERSE_FIELDS})
+
+        fasta_path = os.path.join(self.run_dir, "INVERSE_FOLD.fasta")
+        with open(fasta_path, "w") as fh:
+            for row in rows:
+                header = (
+                    f">{row['pdb']}_rank{row['rank']} "
+                    f"alphabet={row['alphabet']} "
+                    f"TM={_fmt(row['tm'])} "
+                    f"RMSD={_fmt(row['rmsd'], '0.2f')} "
+                    f"pLDDT={_fmt(row['plddt'], '0.1f')}"
+                )
+                if row["site_ok"] != "":
+                    header += f" site_ok={row['site_ok']}"
+                    header += f" siteBB={_fmt(row['site_bb_rmsd'], '0.2f')}"
+                if not row["passed"]:
+                    header += " FAILED_GATE"
+                seq = row["sequence"]
+                fh.write(header + "\n")
+                for i in range(0, len(seq), 80):
+                    fh.write(seq[i : i + 80] + "\n")
+
+        n_pass = sum(r["passed"] for r in rows)
+        print("\n" + "=" * 70)
+        print(f"{len(rows)} sequences folded, {n_pass} passed every gate")
+        print(f"  {csv_path}")
+        print(f"  {fasta_path}")
+        print(
+            "These are candidates, not results: a passing gate means the "
+            "backbone and the site geometry look right, which is necessary "
+            "and nowhere near sufficient."
+        )
+        return csv_path
 
     def write_summaries(self) -> tuple[str, str]:
         summary_path = os.path.join(self.run_dir, "BATCH_SUMMARY.csv")

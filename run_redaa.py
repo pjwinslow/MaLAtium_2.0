@@ -80,6 +80,27 @@ def main(argv=None) -> int:
         help="with --fetch, chain to use for any spec that does not name one",
     )
     parser.add_argument(
+        "--inverse-fold",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ALPHABET",
+        help="design many sequences from a finished alphabet and fold them, "
+        "instead of searching. With no argument, uses the alphabet the "
+        "resumed run settled on (pruned if there is one); give letters such "
+        "as GLV to override. Writes INVERSE_FOLD.csv and .fasta.",
+    )
+    parser.add_argument(
+        "--inverse-seqs", type=int, default=None,
+        help="with --inverse-fold, how many sequences to design (default: at "
+        "least 50)",
+    )
+    parser.add_argument(
+        "--inverse-folds", type=int, default=None,
+        help="with --inverse-fold, how many of them to fold "
+        "(default: NUM_SEQS_TO_FOLD)",
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help="run one of everything -- load both models, featurise, design, "
@@ -259,6 +280,14 @@ def main(argv=None) -> int:
 
     if args.preflight:
         return Pipeline(cfg).preflight()
+
+    if args.inverse_fold is not None:
+        Pipeline(cfg).inverse_fold(
+            alphabet=args.inverse_fold or None,
+            num_seq=args.inverse_seqs,
+            n_folds=args.inverse_folds,
+        )
+        return 0
 
     return Pipeline(cfg).run()
 

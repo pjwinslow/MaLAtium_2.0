@@ -667,6 +667,29 @@ def test_bootstrap_reimports_redaa_when_it_changes_on_disk():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_settings_cell_exposes_the_alphabet_knobs():
+    cell = next(c for c in _code_cells() if "Search settings" in c)
+    assert "START_ALPHABET" in cell and "EXCLUDE_AAS" in cell
+    # Exported, not merely displayed.
+    assert '"START_ALPHABET":' in cell and '"EXCLUDE_AAS":' in cell
+    # A blank seed must not become an empty alphabet.
+    assert 'START_ALPHABET.strip() or "AG"' in cell
+
+
+def test_inverse_fold_cell_comes_after_the_results_and_reuses_models():
+    cells = _code_cells()
+    results_at = next(i for i, c in enumerate(cells) if "Step 8 " in c)
+    inverse_at = next(i for i, c in enumerate(cells) if "Inverse fold" in c)
+    assert results_at < inverse_at, "inverse folding belongs after the results"
+
+    cell = cells[inverse_at]
+    assert ".inverse_fold(" in cell
+    # Leaving the alphabet blank must mean "what the run found", not "".
+    assert "ALPHABET.strip() or None" in cell
+    # Model reuse with the staleness guard, like the other heavy cells.
+    assert "_REDAA_CODE" in cell and '"version": _version' in cell
+    assert "INPUT_PDB_DIR" in cell
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

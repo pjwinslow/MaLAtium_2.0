@@ -663,6 +663,63 @@ otherwise produce a run that completes normally and means nothing:
 
 ---
 
+## Choosing and constraining the alphabet
+
+`START_ALPHABET` sets where the forward search begins — `AG` by default, the
+two smallest residues, which is what V9 used so results stay comparable. The
+search only ever grows, so a larger seed asks a different and weaker question:
+what that set needs *added*, not what the minimum is.
+
+`EXCLUDE_AAS` bars residues outright. They are never seeded, never offered as
+a candidate, and left out of the 20-residue baseline — that last part matters,
+because the baseline is the reference every restricted alphabet is scored
+against, and a 20-letter baseline would be a target no candidate could reach.
+
+```bash
+EXCLUDE_AAS=C python run_redaa.py                 # no cysteine, so no disulfides
+START_ALPHABET=GS EXCLUDE_AAS=CWM python run_redaa.py
+```
+
+Three conflicts are reported rather than silently resolved:
+
+- **Excluded and in the starting alphabet** — refused by `--print-config`
+  before anything runs.
+- **Excluded but chemically needed** — a structure with a disulfide asks for
+  `C` to be protected. Config validation cannot know that, so the run says so
+  per domain and **the exclusion wins**: you asked for it, and quietly
+  reinstating the residue would make the reported alphabet a lie. The result
+  is then a design under that constraint, not a reproduction of the native.
+- **Excluded but needed by an `in_alphabet` site** — a contradiction, so that
+  domain is skipped with the two ways to resolve it. Under `exempt` it is
+  consistent and runs, because an exempt residue is not an alphabet letter.
+
+## Inverse folding: turning an alphabet into candidates
+
+The search answers *how small can the alphabet be* and reports one best
+sequence per replicate. That is the wrong output for anything downstream — you
+cannot order a point estimate.
+
+```bash
+python run_redaa.py --inverse-fold                # the alphabet the run found
+python run_redaa.py --inverse-fold GLVAP          # or one you name
+python run_redaa.py --inverse-fold --inverse-seqs 200 --inverse-folds 20
+```
+
+Designs many sequences from a fixed alphabet, folds a spread of them at
+`FOLD_STEPS_FINAL`, and ranks them. With no argument it reads the alphabet the
+run settled on — the pruned one if pruning removed anything, and the smallest
+across replicates. Naming one explicitly is how you ask "what would one more
+letter buy me?".
+
+Everything the run was configured with still applies: the site is held exactly
+as `SEARCH_MODE` and `SITE_RESIDUE_POLICY` say, and the fold cache means
+sequences the search already folded cost nothing. Output is
+`INVERSE_FOLD.csv` — every folded sequence with its own TM, RMSD, pLDDT and
+site metrics — and `INVERSE_FOLD.fasta`. In Colab it is Step 8b.
+
+These are candidates, not results. A passing gate means the backbone and the
+site geometry look right, which is necessary and nowhere near sufficient.
+
 ## Configuration
 
 Everything is environment-driven; `python run_redaa.py --print-config` shows
@@ -696,6 +753,8 @@ resolved values. The ones you are most likely to touch:
 | `CHUNK_INDEX` | `$SLURM_ARRAY_TASK_ID` | Which chunk of domains to run |
 | `CHUNK_SIZE` | `10` | Domains per chunk |
 | `NUM_REPLICATES` | `10` | Independent searches per domain |
+| `START_ALPHABET` | `AG` | Where the forward search begins |
+| `EXCLUDE_AAS` | — | Residues barred entirely, e.g. `C` or `CM` |
 | `MIN_TM_SCORE` | `0.51` | The acceptance gate |
 | `USE_PLDDT_GATE` | `0` | pLDDT is logged either way |
 | `SCREEN_FOLDS_STAGE1` | `1` | Folds per candidate in the cheap pass |
@@ -713,7 +772,7 @@ FOLD_STEPS_SCREEN=200`.
 ## Tests
 
 ```bash
-python run_redaa.py --self-test  # all nine suites, 253 tests
+python run_redaa.py --self-test  # all nine suites, 262 tests
 
 python tests/test_structure.py   # metrics: parsing, Kabsch, RMSD, TM-score
 python tests/test_search.py      # selection, pruning, chemical requirements

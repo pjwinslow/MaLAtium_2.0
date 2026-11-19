@@ -795,8 +795,21 @@ FOLD_STEPS_FINAL = 200 #@param {type:"integer"}
 FOLD_MODEL_ID = "Synthyra/ESMFold2-Fast" #@param ["Synthyra/ESMFold2-Fast", "Synthyra/ESMFold2", "Synthyra/ESMFold2-600", "Synthyra/ESMFold2-300"]
 FOLD_PRECISION = "auto" #@param ["auto", "bf16", "fp16", "fp32"]
 DO_BACKWARD_PRUNING = True #@param {type:"boolean"}
+START_ALPHABET = "AG" #@param {type:"string"}
+EXCLUDE_AAS = "" #@param {type:"string"}
 MAX_WALL_MINUTES = 660 #@param {type:"integer"}
 TEST_MODE = False #@param {type:"boolean"}
+#@markdown `START_ALPHABET` is where the forward search begins -- A and G by
+#@markdown default, the two smallest residues. The search only grows, so a
+#@markdown bigger seed asks a different and weaker question: what that set
+#@markdown needs *added*, not what the minimum is.
+#@markdown
+#@markdown `EXCLUDE_AAS` bars residues entirely: never seeded, never offered
+#@markdown as a candidate, and left out of the 20-letter baseline so that
+#@markdown reference score stays reachable. `C` to keep disulfides out of a
+#@markdown design, `CM` to avoid oxidation-prone residues. If a structure's
+#@markdown chemistry needs one anyway, the run says so per domain and the
+#@markdown exclusion wins.
 #@markdown `TEST_MODE` runs one domain, one replicate, reduced budgets. Use it
 #@markdown once to confirm the whole path works before committing hours to it.
 
@@ -811,6 +824,8 @@ _settings = {
     "FOLD_MODEL_ID": FOLD_MODEL_ID,
     "FOLD_PRECISION": FOLD_PRECISION,
     "DO_BACKWARD_PRUNING": int(DO_BACKWARD_PRUNING),
+    "START_ALPHABET": START_ALPHABET.strip() or "AG",
+    "EXCLUDE_AAS": EXCLUDE_AAS.strip(),
     "MAX_WALL_SECONDS": MAX_WALL_MINUTES * 60,
     "CHUNK_SIZE": 1000,          # one Colab session is one chunk
     "AUTO_RESUME": 1,
@@ -1032,6 +1047,112 @@ if DOWNLOAD_REPORT:
     print("\\nRun report: %s (%.0f KB)"
           % (report, os.path.getsize(report) / 1024))
     _download(report)
+"""
+)
+
+md(
+    """
+## Step 8b — Inverse fold with the alphabet you found
+
+The search answers *how small can the alphabet be*. It reports one best
+sequence per replicate, which is the wrong output for anything downstream:
+you cannot order a point estimate.
+
+This step takes the alphabet a run settled on and designs **many** sequences
+from it, folds a selection at full quality, and ranks them — so there is a set
+of candidates with their own numbers rather than one anecdote.
+
+Everything the run was configured with still applies. The site is held exactly
+as `SEARCH_MODE` and `SITE_RESIDUE_POLICY` say, folds use `FOLD_STEPS_FINAL`,
+and the fold cache means any sequence the search already folded costs nothing.
+
+Leave `ALPHABET` blank to use what the run found — the pruned alphabet if
+pruning removed anything, otherwise the forward one, and the smallest across
+replicates. Type letters such as `GLVAP` to override, which is how you ask
+"what would one more letter buy me?".
+
+Output: `INVERSE_FOLD.csv` (every folded sequence with TM, RMSD, pLDDT and the
+site metrics) and `INVERSE_FOLD.fasta`, both in the run directory.
+"""
+)
+
+code_with_bootstrap(
+    """
+#@title Step 8b — Inverse fold with the alphabet you found
+ALPHABET = "" #@param {type:"string"}
+N_SEQUENCES = 100 #@param {type:"integer"}
+N_FOLDS = 10 #@param {type:"integer"}
+DOWNLOAD_RESULTS = True #@param {type:"boolean"}
+#@markdown `N_SEQUENCES` is how many MPNN designs to sample; `N_FOLDS` how
+#@markdown many of them to fold. Folding is the cost, so sample generously and
+#@markdown fold selectively -- the selection is spread across the MPNN score
+#@markdown distribution rather than taking the top N.
+
+import importlib, os, subprocess, sys
+
+import redaa.config, redaa.pipeline
+importlib.reload(redaa.config)
+importlib.reload(redaa.pipeline)
+
+if not os.environ.get("INPUT_PDB_DIR"):
+    raise SystemExit("INPUT_PDB_DIR is not set -- run Step 4 (inputs) first.")
+
+# Models stay in memory between cells so a re-run does not pay to load 25 GB
+# of ESMFold2 weights again. But a loaded engine is an instance of the class
+# that was imported when it was built, so an engine built before a code change
+# keeps running the old code. _REDAA_CODE is the fingerprint the bootstrap
+# above computed; engines carry the fingerprint they were built from, and are
+# refused when it no longer matches.
+_version = globals().get("_REDAA_CODE", "")
+_cached = globals().get("_REDAA_ENGINES") or {}
+if _cached and _cached.get("version") != _version:
+    print("redaa changed since these models were loaded; reloading them.")
+    _cached = {}
+# Land on the run whose alphabet we mean to use. Step 7 records RUN_DIR; a
+# fresh config would otherwise resolve a new, empty output directory and find
+# no summary to read the alphabet from.
+_run_dir = globals().get("RUN_DIR") or rc.latest_run_dir()
+if _run_dir:
+    os.environ["RESUME_FROM"] = _run_dir
+    print("using run directory: %s" % _run_dir)
+elif not ALPHABET.strip():
+    raise SystemExit(
+        "No previous run found, so there is no alphabet to read. "
+        "Run Step 7 first, or type one into ALPHABET above."
+    )
+
+_cfg = redaa.config.RedAAConfig()
+_pipe = redaa.pipeline.Pipeline(
+    _cfg, folder=_cached.get("folder"), mpnn=_cached.get("mpnn")
+)
+_csv = _pipe.inverse_fold(
+    alphabet=ALPHABET.strip() or None,
+    num_seq=N_SEQUENCES,
+    n_folds=N_FOLDS,
+)
+_REDAA_ENGINES = {
+    "folder": _pipe.folder, "mpnn": _pipe.mpnn, "version": _version,
+}
+
+try:
+    import pandas as pd
+    _frame = pd.read_csv(_csv)
+    _show = [c for c in (
+        "pdb", "rank", "alphabet", "tm", "rmsd", "plddt", "passed",
+        "site_bb_rmsd", "site_ok", "length",
+    ) if c in _frame.columns]
+    display(_frame[_show])
+except Exception as _exc:
+    print("(pandas unavailable: %s)" % _exc)
+    print(open(_csv).read()[:4000])
+
+if DOWNLOAD_RESULTS:
+    try:
+        from google.colab import files as colab_files
+        colab_files.download(_csv)
+        colab_files.download(_csv.replace("INVERSE_FOLD.csv", "INVERSE_FOLD.fasta"))
+    except Exception as _exc:
+        print("download unavailable (%s); the files are in the run directory" % _exc)
 """
 )
 

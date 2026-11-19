@@ -80,6 +80,7 @@ ENV_VARS = (
     "PRUNING_DOWNWARD_CLOSURE", "PRUNING_MIN_SIZE", "RESUME_FROM",
     "RUN_NAME", "SAVE_FOLD_PDBS", "SCREEN_FOLDS_STAGE1",
     "SCREEN_FOLDS_STAGE2", "SCREEN_STAGE2_KEEP", "SEARCH_MODE",
+    "EXCLUDE_AAS", "START_ALPHABET",
     "SITE_CHAIN", "SITE_CONTACT_MAX", "SITE_GATE", "SITE_KEEP_LIGANDS",
     "SITE_MAX_BB_RMSD", "SITE_MAX_CB_DEV", "SITE_MAX_LOCAL_RMSD",
     "SITE_PRESET", "SITE_REQUIRE_IDENTITY", "SITE_RESIDUE_POLICY",
@@ -100,6 +101,26 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else float(raw)
+
+
+def _env_aas(name: str, default: str) -> tuple[str, ...]:
+    """Parse a set of one-letter residue codes from the environment.
+
+    Accepts "AG", "A,G", "A G" and lower case. Unknown letters raise rather
+    than being dropped: a typo in an alphabet is not something to discover
+    from a result that looks plausible.
+    """
+    raw = os.environ.get(name)
+    text = default if raw is None or raw.strip() == "" else raw
+    letters = [c for c in text.upper() if not c.isspace() and c != ","]
+    bad = sorted({c for c in letters if c not in ALL_AAS})
+    if bad:
+        raise ValueError(
+            f"{name}={text!r} contains {', '.join(bad)}, which "
+            f"{'is' if len(bad) == 1 else 'are'} not standard one-letter "
+            "residue code(s). Use letters from " + "".join(ALL_AAS)
+        )
+    return tuple(dict.fromkeys(letters))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -171,7 +192,27 @@ class RedAAConfig:
 
     # ---------------- search ----------------
     num_replicates: int = field(default_factory=lambda: _env_int("NUM_REPLICATES", 10))
-    starting_alphabet: tuple[str, ...] = ("A", "G")
+    # Where the forward search starts. A and G by default: the two smallest
+    # residues, and the pair V9 used, so results stay comparable. Any set of
+    # one-letter codes works -- "AGV", "GS", a single letter. The search can
+    # only grow, so a larger seed is a different (and weaker) question: it
+    # asks what that set needs *added*, not what the minimum is.
+    starting_alphabet: tuple[str, ...] = field(
+        default_factory=lambda: _env_aas("START_ALPHABET", "AG")
+    )
+    # Residues the search may never use: never seeded, never offered as a
+    # candidate, and left out of the 20-letter baseline so that reference
+    # score is the achievable ceiling rather than an unreachable one.
+    #
+    # The obvious use is C, to keep disulfides out of a design, or W and M for
+    # a target where oxidation matters. Note this is a statement about the
+    # *alphabet*, not about the structure: a site residue held at its native
+    # identity under SITE_RESIDUE_POLICY=exempt is not an alphabet letter, so
+    # excluding its type is consistent. Under in_alphabet it is a
+    # contradiction, and validate() says so.
+    exclude_aas: tuple[str, ...] = field(
+        default_factory=lambda: _env_aas("EXCLUDE_AAS", "")
+    )
     use_hydrophobic_seeding: bool = field(
         default_factory=lambda: _env_bool("USE_HYDROPHOBIC_SEEDING", True)
     )
@@ -307,6 +348,12 @@ class RedAAConfig:
         return self.search_mode in (MODE_SCAFFOLD_THEN_SITE, MODE_SITE_AWARE)
 
     @property
+    def usable_aas(self) -> tuple[str, ...]:
+        """The residues the search is allowed to consider, in a fixed order."""
+        barred = set(self.exclude_aas)
+        return tuple(aa for aa in ALL_AAS if aa not in barred)
+
+    @property
     def keep_ligand_tuple(self) -> tuple[str, ...]:
         raw = (self.site_keep_ligands or "").replace(",", " ").split()
         return tuple(dict.fromkeys(x.strip().upper() for x in raw if x.strip()))
@@ -338,6 +385,20 @@ class RedAAConfig:
                 "cannot be combined with SEARCH_MODE=scaffold_then_site; use "
                 "SEARCH_MODE=site_aware"
             )
+        barred = set(self.exclude_aas)
+        if barred:
+            overlap = sorted(barred & set(self.starting_alphabet))
+            if overlap:
+                problems.append(
+                    f"EXCLUDE_AAS and START_ALPHABET both name "
+                    f"{', '.join(overlap)}: the search cannot start from a "
+                    "residue it may not use"
+                )
+            if len(barred) >= len(ALL_AAS) - 1:
+                problems.append(
+                    f"EXCLUDE_AAS bars {len(barred)} of {len(ALL_AAS)} "
+                    "residues, leaving nothing to search with"
+                )
         if (self.site_spec or self.site_preset) and not self.site_enabled:
             problems.append(
                 "a site was given but SEARCH_MODE=alphabet_only, so it would "

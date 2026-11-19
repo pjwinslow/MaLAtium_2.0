@@ -99,6 +99,7 @@ class StubMPNN:
         self.calls = 0
         self.cfg = cfg
         self.fixed_seen: list[dict] = []
+        self.alphabets_seen: list[str] = []
         self.ligand_atoms = 0
         # The real engine counts positions it had to correct after sampling,
         # which preflight reports on.
@@ -131,6 +132,7 @@ class StubMPNN:
         self.calls += 1
         self.fixed_seen.append(dict(fixed or {}))
         allowed = sorted(set(allowed))
+        self.alphabets_seen.append("".join(allowed))
         rng = np.random.default_rng(abs(hash(("".join(allowed), seed))) % 2**32)
         n = num_seq or 25
         pairs = []
@@ -1498,6 +1500,170 @@ def test_measure_only_is_rejected_with_scaffold_then_site():
     cfg.site_residue_policy = "measure_only"
     problems = cfg.validate()
     assert any("nothing to graft" in p for p in problems), problems
+
+
+# ---------------------------------------------------------------------------
+# Starting alphabet, exclusions, and inverse folding
+# ---------------------------------------------------------------------------
+
+
+def test_the_search_starts_from_the_configured_alphabet():
+    with tempfile.TemporaryDirectory(prefix="redaa_start_") as tmp:
+        pipe, code = _run(tmp, starting_alphabet=("G", "S"))
+        assert code == 0
+        build = _read_csv(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/alphabet_building_log.csv")
+        )
+        init = next(r for r in build if r["Stage"] == "INIT")
+        assert init["Current_Set"] == "GS", init
+
+
+def test_excluded_residues_never_appear_anywhere_in_a_run():
+    """Not offered, not seeded, and not in the baseline either."""
+    barred = ("C", "W", "M", "H", "Y")
+    with tempfile.TemporaryDirectory(prefix="redaa_excl_") as tmp:
+        pipe, code = _run(tmp, exclude_aas=barred)
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert not set(row["final_alphabet"]) & set(barred), row
+        assert not set(row["pruned_alphabet"]) & set(barred), row
+
+        build = _read_csv(
+            os.path.join(pipe.run_dir, "testdomA00/run_1/alphabet_building_log.csv")
+        )
+        offered = {r["Candidate_AA"] for r in build}
+        assert not offered & set(barred), sorted(offered & set(barred))
+
+        # The baseline must be the reachable ceiling, not an unreachable
+        # 20-letter score. The stub's mean score falls with alphabet size, so
+        # a 15-letter baseline scores higher than a 20-letter one would.
+        assert any(r["Stage"] == "BASELINE" for r in build)
+        design_calls = [set(a) for a in pipe.mpnn.alphabets_seen]
+        assert design_calls, "no MPNN calls recorded"
+        assert not any(c & set(barred) for c in design_calls), (
+            "MPNN was asked for an excluded residue"
+        )
+
+
+def test_excluding_a_residue_the_structure_needs_warns_and_wins():
+    """Config validation cannot know about a structure's disulfides."""
+    with tempfile.TemporaryDirectory(prefix="redaa_exclchem_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(tmp, exclude_aas=("C",))
+
+        class NeedsCys(StubPipeline):
+            def setup(self):
+                super().setup()
+
+        import contextlib
+        import io
+
+        import redaa.pipeline as P
+
+        real = P.analyze_requirements
+
+        class _Req:
+            required_aas = ("C",)
+            n_disulfides = 1
+            cis_pro_count = 0
+            notes = ("1 disulfide bond",)
+
+        try:
+            P.analyze_requirements = lambda _p: _Req()
+            pipe = NeedsCys(cfg)
+            pipe.ref_path = ref
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                pipe.run()
+            out = buf.getvalue()
+            assert "EXCLUDE_AAS bars C" in out, out[-700:]
+            assert "exclusion wins" in out
+            row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+            assert "C" not in row["final_alphabet"], row
+        finally:
+            P.analyze_requirements = real
+
+
+def test_an_excluded_site_residue_is_fatal_under_in_alphabet():
+    with tempfile.TemporaryDirectory(prefix="redaa_exclsite_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="in_alphabet", exclude_aas=("C",),
+        )
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["status"].startswith("skipped_excluded_site_residue"), row
+        # ... and harmless under exempt, where it is not an alphabet letter.
+    with tempfile.TemporaryDirectory(prefix="redaa_exclsite2_") as tmp:
+        pipe, code = _run(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="exempt", exclude_aas=("C",),
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        assert code == 0
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert not row["status"].startswith("skipped"), row
+
+
+def test_inverse_fold_uses_the_alphabet_the_run_settled_on():
+    with tempfile.TemporaryDirectory(prefix="redaa_inv_") as tmp:
+        pipe, _ = _run(tmp)
+        summary = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        expected = summary["pruned_alphabet"]
+
+        pipe.cfg.resume_from = pipe.run_dir     # as the notebook does
+        second = StubPipeline(pipe.cfg)
+        second.ref_path = pipe.ref_path
+        csv_path = second.inverse_fold(num_seq=20, n_folds=4)
+        rows = _read_csv(csv_path)
+        assert rows, "no sequences produced"
+        # Pruned, not forward: pruning is what makes the answer minimal.
+        assert all(r["alphabet"] == expected for r in rows), rows[0]
+        assert all(set(r["sequence"]) <= set(expected) for r in rows)
+        # Ranked best first, and every row carries its own numbers.
+        assert [int(r["rank"]) for r in rows] == sorted(int(r["rank"]) for r in rows)
+        assert all(r["tm"] and r["rmsd"] and r["length"] for r in rows)
+        fasta = csv_path.replace("INVERSE_FOLD.csv", "INVERSE_FOLD.fasta")
+        assert os.path.exists(fasta)
+        assert open(fasta).read().startswith(">testdomA00_rank1 ")
+
+
+def test_inverse_fold_honours_an_explicit_alphabet_and_the_site():
+    with tempfile.TemporaryDirectory(prefix="redaa_inv2_") as tmp:
+        pipe, _ = _run(tmp, search_mode="site_aware", site_spec=SITE,
+                       num_seqs_to_fold=3, prune_folds=1)
+        pipe.cfg.resume_from = pipe.run_dir
+        second = StubPipeline(pipe.cfg)
+        second.ref_path = pipe.ref_path
+        csv_path = second.inverse_fold(
+            alphabet="GLVA", num_seq=20, n_folds=4
+        )
+        rows = _read_csv(csv_path)
+        assert all(r["alphabet"] == "AGLV" for r in rows), rows[0]["alphabet"]
+        # The site was held, and measured.
+        for row in rows:
+            seq = row["sequence"]
+            for idx, aa in SITE_INDICES.items():
+                assert seq[idx] == aa, (idx, seq[idx], aa)
+            assert row["site_bb_rmsd"] not in ("", "N/A")
+            assert row["site_ok"] in ("0", "1")
+
+
+def test_inverse_fold_without_a_summary_or_an_alphabet_says_so():
+    with tempfile.TemporaryDirectory(prefix="redaa_inv3_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        pipe = StubPipeline(_make_config(tmp))
+        pipe.ref_path = ref
+        try:
+            pipe.inverse_fold(num_seq=5, n_folds=2)
+        except SystemExit as exc:
+            assert "produced nothing" in str(exc) or "BATCH_SUMMARY" in str(exc)
+        else:
+            raise AssertionError("expected a clear refusal")
 
 
 def main():
