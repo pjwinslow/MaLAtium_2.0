@@ -369,6 +369,14 @@ the process exits with status 2. Completed replicates are marked with an
 atomically-written `COMPLETED` sentinel, so re-running the same command resumes
 rather than redoing work.
 
+Each replicate also records what it found in `run_<n>/result.json`, so a run
+finished across several sessions — the normal case on Colab — reports **all**
+of its replicates in `BATCH_SUMMARY.csv`, not only the ones the last session
+happened to run. A replicate from a run made before that file existed is
+rebuilt from its own `alphabet_building_log.csv` and
+`esmfold_validation_log.csv` and marked `resumed_reconstructed`, because
+recovering numbers already on disk beats re-running hours of GPU time.
+
 ### 8. Smaller things
 
 - TF32 matmul and cuDNN autotuning on; `torch.inference_mode()` throughout.
