@@ -282,7 +282,11 @@ class MPNNEngine:
         if "chain_mask" not in protein_dict:
             import numpy as _np
 
-            letters = list(protein_dict.get("chain_letters", []) or [])
+            # parse_PDB returns chain_letters as a NumPy array of strings, so
+            # `or []` on it raises "truth value of an array is ambiguous"
+            # rather than falling back -- it has to be length-tested.
+            raw_letters = protein_dict.get("chain_letters")
+            letters = [] if raw_letters is None else list(raw_letters)
             if letters:
                 # Mirror run.py: design every chain present in the file.
                 designing = set(letters)

@@ -37,6 +37,11 @@ from .structure import AA3_TO_1, _OK_ALTLOC
 USER_AGENT = "redaa-finder/1.0 (structure fetch; python-urllib)"
 BACKBONE_ATOMS = ("N", "CA", "C")
 
+# Heteroatom components never worth converting out of an mmCIF.  Everything
+# else is carried across and then filtered by name in :func:`prepare`, since
+# which heteroatom is "the ligand" is the caller's call, not this module's.
+_CIF_DROP_COMPONENTS = frozenset({"HOH", "DOD", "D2O", "WAT"})
+
 # AlphaFold DB bumps its model version periodically (v4 through v6 so far) and
 # serves only the current one, so the API is asked for the real URL first and
 # these are only a fallback ladder.
@@ -335,13 +340,26 @@ def _split_cif_row(line: str) -> list[str]:
 
 
 def cif_to_pdb(text: str) -> str:
-    """Convert the ``_atom_site`` loop of an mmCIF file into PDB ATOM records.
+    """Convert the ``_atom_site`` loop of an mmCIF file into PDB records.
 
     Only what this pipeline needs is carried across: the first model, protein
-    ``ATOM`` records, author chain and residue numbering (so chain IDs match
-    what a user expects from the PDB entry).  Multi-character mmCIF chain IDs
-    are mapped onto single characters, since the PDB format has only one
-    column for them.
+    ``ATOM`` records, heteroatom groups other than water, author chain and
+    residue numbering (so chain IDs match what a user expects from the PDB
+    entry).  Multi-character mmCIF chain IDs are mapped onto single
+    characters, since the PDB format has only one column for them.
+
+    Heteroatoms are carried across because :func:`prepare` selects ligands
+    from the converted text, not from the original file.  Dropping them here
+    made ``keep_ligands`` silently impossible for any mmCIF input -- which is
+    every AlphaFold 3 model and every entry too large for the PDB format --
+    and the failure surfaced much later, as a ligand model with no ligand.
+    Water is still dropped: nothing downstream can use it, and an entry's
+    waters outnumber its protein atoms.
+
+    Occupancy and B-factor are carried across as well.  For a predicted
+    structure the B-factor column *is* the per-atom pLDDT, so hardcoding it
+    threw away the model's own confidence estimate before anything could read
+    it.
     """
     lines = text.splitlines()
     fields: list[str] = []
@@ -386,9 +404,11 @@ def cif_to_pdb(text: str) -> str:
     first_model = None
     out: list[str] = []
     serial = 0
+    n_protein = 0
 
     for row in rows:
-        if get(row, "group_PDB", default="ATOM") != "ATOM":
+        group = get(row, "group_PDB", default="ATOM").strip().upper()
+        if group not in ("ATOM", "HETATM"):
             continue
         model = get(row, "pdbx_PDB_model_num", default="1")
         if first_model is None:
@@ -396,8 +416,12 @@ def cif_to_pdb(text: str) -> str:
         if model != first_model:
             continue
         resname = get(row, "label_comp_id", "auth_comp_id").strip()
-        if resname not in AA3_TO_1:
-            continue
+        # A polymer residue is an ATOM row with a standard residue name.
+        # Everything else is a heteroatom group, kept unless it is water.
+        is_protein = group == "ATOM" and resname in AA3_TO_1
+        if not is_protein:
+            if group != "HETATM" or resname.upper() in _CIF_DROP_COMPONENTS:
+                continue
 
         raw_chain = get(row, "auth_asym_id", "label_asym_id", default="A").strip()
         chain = chain_map.get(raw_chain)
@@ -423,17 +447,42 @@ def cif_to_pdb(text: str) -> str:
             continue
 
         atom = get(row, "label_atom_id", "auth_atom_id").strip().strip('"')
-        name = f" {atom:<3s}" if len(atom) < 4 else atom[:4]
         element = get(row, "type_symbol", default=atom[:1]).strip()[:2]
+        # Atom names are left-padded by one column unless the element symbol
+        # itself is two characters (ZN, FE, MG), which starts in column 13.
+        if len(atom) >= 4:
+            name = atom[:4]
+        elif len(element) == 2 and atom[:2].upper() == element.upper():
+            name = f"{atom:<4s}"
+        else:
+            name = f" {atom:<3s}"
+
+        # A predicted model's B-factor column is its per-atom pLDDT; a '?' or
+        # '.' for either value falls back to the PDB-format default.
+        try:
+            occ = float(get(row, "occupancy", default="1.0"))
+        except ValueError:
+            occ = 1.0
+        try:
+            bfac = float(get(row, "B_iso_or_equiv", default="0.0"))
+        except ValueError:
+            bfac = 0.0
+
+        record = "ATOM  " if is_protein else "HETATM"
+        n_protein += is_protein
         serial += 1
 
         out.append(
-            f"ATOM  {serial % 100000:>5d} {name}{altloc}{resname:>3s} "
+            f"{record}{serial % 100000:>5d} {name}{altloc}{resname:>3s} "
             f"{chain}{resseq:>4d}{icode}   "
-            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{occ:>6.2f}{bfac:>6.2f}          "
             f"{element:>2s}"
         )
 
+    # Callers treat an empty return as "no usable protein here", so a file
+    # that converted to nothing but heteroatoms must not look like a hit.
+    if not n_protein:
+        return ""
     return "\n".join(out) + ("\n" if out else "")
 
 

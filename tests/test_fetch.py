@@ -299,6 +299,40 @@ ATOM 8 C CA . VAL AAA 3 ? 7.000 7.000 7.000 3 A 2
 """
 
 
+# A minimal predicted-model-shaped mmCIF: protein chain plus a ligand on its
+# own chain, with occupancy and B-factor columns present.
+_CIF_LIGAND = """data_TEST
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N . ALA A 1 ? 1.000 2.000 3.000 0.80 91.25 1 A 1
+ATOM 2 C CA . ALA A 1 ? 1.500 2.000 3.000 1.00 90.00 1 A 1
+ATOM 3 C C . ALA A 1 ? 2.000 2.000 3.000 1.00 90.00 1 A 1
+ATOM 4 N N . GLY A 2 ? 4.000 2.000 3.000 1.00 88.00 2 A 1
+ATOM 5 C CA . GLY A 2 ? 4.500 2.000 3.000 1.00 88.00 2 A 1
+ATOM 6 C C . GLY A 2 ? 5.000 2.000 3.000 1.00 88.00 2 A 1
+HETATM 7 P PG . ATP B . ? 3.000 3.000 3.500 1.00 70.00 1 B 1
+HETATM 8 O O1G . ATP B . ? 3.500 3.500 3.500 1.00 70.00 1 B 1
+HETATM 9 O O . HOH C . ? 9.000 9.000 9.000 1.00 30.00 99 C 1
+#
+"""
+
+
 def test_cif_to_pdb_extracts_first_model_protein_atoms():
     text = F.cif_to_pdb(_CIF)
     lines = [line for line in text.splitlines() if line.startswith("ATOM")]
@@ -310,6 +344,52 @@ def test_cif_to_pdb_extracts_first_model_protein_atoms():
     assert [(c.chain, c.n_residues) for c in chains] == [("A", 2)]
     assert chains[0].sequence == "AG"
     assert abs(float(lines[0][30:38]) - 1.0) < 1e-6
+
+
+def test_cif_to_pdb_keeps_heteroatoms_so_a_ligand_can_be_selected():
+    # prepare() picks ligands out of the *converted* text, so a conversion
+    # that drops HETATM makes keep_ligands silently impossible for every
+    # mmCIF input -- which is every AlphaFold 3 model.
+    text = F.cif_to_pdb(_CIF_LIGAND)
+    het = [line for line in text.splitlines() if line.startswith("HETATM")]
+    assert len(het) == 2, text
+    assert all(line[17:20].strip() == "ATP" for line in het)
+    assert "HOH" not in text          # water is still dropped
+    assert het[0][21] == "B"          # the ligand keeps its own chain
+
+
+def test_cif_to_pdb_preserves_occupancy_and_bfactor():
+    # For a predicted model the B-factor column is the per-atom pLDDT.
+    line = F.cif_to_pdb(_CIF_LIGAND).splitlines()[0]
+    assert abs(float(line[54:60]) - 0.80) < 1e-6, line
+    assert abs(float(line[60:66]) - 91.25) < 1e-6, line
+
+
+def test_cif_to_pdb_reports_nothing_when_only_heteroatoms_convert():
+    # Callers read an empty return as "no usable protein here"; a file of
+    # pure heteroatoms must not look like a successful conversion.
+    only_het = "\n".join(
+        line for line in _CIF_LIGAND.splitlines() if not line.startswith("ATOM ")
+    )
+    assert F.cif_to_pdb(only_het) == ""
+
+
+def test_cif_ligand_survives_preparation_end_to_end():
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "model.cif")
+        with open(src, "w") as fh:
+            fh.write(_CIF_LIGAND)
+        out = os.path.join(tmp, "prepared.pdb")
+        report = F.prepare(
+            F.read_structure_text(src), out, chain="A", keep_ligands=("ATP",)
+        )
+        assert report["ligands_kept"] == [("ATP", 2)], report
+        body = open(out).read()
+        assert body.count("HETATM") == 2
+        assert "not present" not in " ".join(report["ligand_notes"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_cif_row_splitter_handles_quotes():
