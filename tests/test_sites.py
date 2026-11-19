@@ -817,7 +817,11 @@ def test_gate_roles_split_the_site_into_gated_and_recorded():
         plan = S.site_plan(site, policies, gate_roles=("catalytic", "contact"))
         assert plan.gated == frozenset(pocket)
         assert plan.recorded == frozenset(iface)
+        # The line has to say which it is: a group with its own thresholds is
+        # gated, and calling it "recorded only" would misreport the run.
         assert "recorded only" in plan.describe()
+        assert "loosely gated" in plan.describe(rest_gated=True)
+        assert "recorded only" not in plan.describe(rest_gated=True)
 
         # No gate_roles means every position is gated, as before.
         plan = S.site_plan(site, policies)
@@ -860,6 +864,58 @@ def test_measure_site_gates_a_subset_and_records_the_rest():
         assert pooled.recorded is None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_rest_thresholds_gate_the_second_group_independently():
+    """The interface has a real requirement, just a looser one."""
+    tight = S.SiteMetrics(
+        bb_rmsd=0.8, local_rmsd=0.6, cb_rms_dev=1.1, n_positions=20
+    )
+    tight.recorded = S.SiteMetrics(
+        bb_rmsd=2.4, local_rmsd=2.2, cb_rms_dev=1.9, n_positions=48
+    )
+    tight.n_recorded = 48
+
+    # The pocket clears its tight gate either way.
+    assert tight.passed(1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=2.0)
+    # Loose thresholds on the second group: in the same spot, so it passes.
+    assert tight.rest_passed(3.0, 2.5, 0.0, 3.0)
+    # Tight thresholds on the second group would reject it -- which is why it
+    # gets its own numbers rather than sharing the pocket's.
+    assert not tight.rest_passed(1.5, 1.0, 0.0, 2.0)
+    # All zero is measurement only: no claim, so nothing to fail.
+    assert tight.rest_passed(0.0, 0.0, 0.0, 0.0)
+
+
+def test_rest_thresholds_reject_a_displaced_second_group():
+    m = S.SiteMetrics(bb_rmsd=0.5, local_rmsd=0.4, cb_rms_dev=0.9, n_positions=20)
+    m.recorded = S.SiteMetrics(
+        bb_rmsd=7.0, local_rmsd=6.2, cb_rms_dev=5.5, n_positions=48
+    )
+    m.n_recorded = 48
+    # The pocket is perfect and the interface has moved across the protein.
+    # "In the same spot" is a requirement, so this must not pass.
+    assert m.passed(1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=2.0)
+    assert not m.rest_passed(3.0, 2.5, 0.0, 3.0)
+
+
+def test_rest_thresholds_on_an_empty_second_group_cannot_fail():
+    """No positions outside the gate means no claim being made about them."""
+    m = S.SiteMetrics(bb_rmsd=0.5, local_rmsd=0.4, n_positions=20)
+    assert m.recorded is None
+    assert m.rest_passed(3.0, 2.5, 0.0, 3.0)
+
+
+def test_glyrs_preset_gates_the_interface_loosely_not_at_all():
+    """The pocket is held and judged tightly; the interface is free but placed."""
+    settings = dict(S.preset("glyrs").settings)
+    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
+    # The interface is gated -- "in the same spot" is a requirement.
+    assert float(settings["SITE_REST_MAX_BB_RMSD"]) > 0
+    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 0
+    # ...and more loosely than the pocket, which does the chemistry.
+    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 1.0
+    assert float(settings["SITE_REST_MAX_BB_RMSD"]) > 1.5
 
 
 def test_config_roles_match_the_site_roles():

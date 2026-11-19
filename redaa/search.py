@@ -394,6 +394,11 @@ class Validator:
                     self.cfg.site_max_cb_dev,
                     require_identity=self.require_identity,
                     max_cb_rms_dev=self.cfg.site_max_cb_rms_dev,
+                ) and sm.rest_passed(
+                    self.cfg.site_rest_max_bb_rmsd,
+                    self.cfg.site_rest_max_local_rmsd,
+                    self.cfg.site_rest_max_cb_dev,
+                    self.cfg.site_rest_max_cb_rms_dev,
                 )
                 if ok_site:
                     metrics.num_site_pass += 1

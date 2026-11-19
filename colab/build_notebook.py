@@ -793,11 +793,22 @@ which is exactly how a GlyRS run drove its alphabet to 19 letters. For
 anything bigger than a few positions, set `SITE_MAX_CB_DEV=0` and gate
 `SITE_MAX_CB_RMS_DEV` instead. The run warns when you have not.
 
-**`SITE_GATE_ROLES`** limits which roles the thresholds apply to. A site with
-a 20-residue pocket and a 48-residue interface spanning the whole chain cannot
-be judged by one set of numbers: gating `catalytic,contact` tests the pocket,
-while the interface is still measured and reported in the `rec*` columns. The
-console shows whichever CB column is actually gated, so a `PASS` is never
+**`SITE_GATE_ROLES`** names the roles judged by the tight `SITE_MAX_*`
+thresholds; the roles left out are judged by `SITE_REST_MAX_*` instead, which
+default to 0 — measured, not gated. The reason for two sets is scientific, not
+statistical: a catalytic pocket has to put side chains within bonding distance
+of a substrate, while an interface to a 75-nucleotide RNA has to be in roughly
+the right place and present roughly the right surface. Both are measured
+identically — on the 5E6M site the pocket and the interface report
+`Site_BB_RMSD` within 0.1 Å of each other at a given backbone accuracy — so
+the looser numbers reflect the requirement, not the metric.
+
+On these coordinates the interface shows `BB_RMSD` 2.48 Å and `Local_RMSD`
+2.30 Å under 1.5 Å of backbone error, and about 4.3 / 3.9 Å under 2.5 Å, so
+`SITE_REST_MAX_BB_RMSD=3.0` with `SITE_REST_MAX_LOCAL_RMSD=2.5` accepts an
+interface placed correctly to within roughly 2 Å and rejects one that has
+drifted — "in the same spot", with no constraint on which residues are there.
+The console shows whichever CB column is actually gated, so a `PASS` is never
 printed next to a number that had no say in it.
 
 These are a necessary condition for a working site, not a sufficient one. They
@@ -832,6 +843,14 @@ SITE_MAX_CB_DEV = 1.5 #@param {type:"number"}
 #@markdown some roles; the rest are still measured and reported.
 SITE_MAX_CB_RMS_DEV = 0.0 #@param {type:"number"}
 SITE_GATE_ROLES = "" #@param ["", "catalytic,contact", "catalytic"] {allow-input: true}
+#@markdown The roles left out of `SITE_GATE_ROLES` are judged by these
+#@markdown instead. 0 means measured but not gated. Set them when a site's
+#@markdown second half has a real but looser requirement — a tRNA interface
+#@markdown that must be in the right place, with no constraint on which
+#@markdown residues are there.
+SITE_REST_MAX_BB_RMSD = 0.0 #@param {type:"number"}
+SITE_REST_MAX_LOCAL_RMSD = 0.0 #@param {type:"number"}
+SITE_REST_MAX_CB_RMS_DEV = 0.0 #@param {type:"number"}
 SITE_REQUIRE_IDENTITY = True #@param {type:"boolean"}
 
 import os
@@ -854,6 +873,9 @@ _applied = rc.configure_site(
     max_cb_dev=SITE_MAX_CB_DEV,
     max_cb_rms_dev=SITE_MAX_CB_RMS_DEV,
     gate_roles=SITE_GATE_ROLES,
+    rest_max_bb_rmsd=SITE_REST_MAX_BB_RMSD,
+    rest_max_local_rmsd=SITE_REST_MAX_LOCAL_RMSD,
+    rest_max_cb_rms_dev=SITE_REST_MAX_CB_RMS_DEV,
     require_identity=SITE_REQUIRE_IDENTITY,
     mpnn_model_type=MPNN_MODEL_TYPE,
 )

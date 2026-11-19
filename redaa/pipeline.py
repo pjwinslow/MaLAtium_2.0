@@ -80,7 +80,13 @@ def _site_fields(metrics, cfg=None) -> str:
     # does not mean losing sight of the rest.
     rec = getattr(metrics, "site_rec_bb_rmsd", None)
     if rec is not None:
-        out += f"recBB={_fmt(rec, '0.2f')} "
+        tag = "rest" if (cfg is not None and cfg.site_rest_gated) else "rec"
+        out += f"{tag}BB={_fmt(rec, '0.2f')} "
+        if cfg is not None and cfg.site_rest_max_local_rmsd > 0:
+            out += (
+                f"{tag}Local="
+                f"{_fmt(getattr(metrics, 'site_rec_local_rmsd', None), '0.2f')} "
+            )
     return out
 
 
@@ -1420,6 +1426,11 @@ class Pipeline:
                         cfg.site_max_cb_dev,
                         require_identity=cfg.site_require_identity,
                         max_cb_rms_dev=cfg.site_max_cb_rms_dev,
+                    ) and best.rest_passed(
+                        cfg.site_rest_max_bb_rmsd,
+                        cfg.site_rest_max_local_rmsd,
+                        cfg.site_rest_max_cb_dev,
+                        cfg.site_rest_max_cb_rms_dev,
                     )
                     detail = (
                         f"{best.describe()} -- the ceiling for any design here"
@@ -1654,7 +1665,7 @@ class Pipeline:
             print(f"    resolved  : {site.describe()}")
             print(f"    positions : {', '.join(site.labels())}")
             print(f"    types     : {''.join(sorted(site.residue_types))}")
-            print(f"    policy    : {site_plan_obj.describe()}")
+            print(f"    policy    : {site_plan_obj.describe(cfg.site_rest_gated)}")
             if site.ligands:
                 counts = ", ".join(
                     f"{k} ({v} atoms)" for k, v in sorted(site.ligand_atom_counts.items())
@@ -1687,7 +1698,7 @@ class Pipeline:
                 fh.write(f"  Spec: {site.spec_text}\n")
                 fh.write(f"  Residues: {', '.join(site.labels())}\n")
                 fh.write(f"  Types: {''.join(sorted(site.residue_types))}\n")
-                fh.write(f"  Policy: {site_plan_obj.describe()}\n")
+                fh.write(f"  Policy: {site_plan_obj.describe(cfg.site_rest_gated)}\n")
                 for w in site.warnings:
                     fh.write(f"  WARNING: {w}\n")
 
@@ -2128,6 +2139,11 @@ class Pipeline:
                         cfg.site_max_cb_dev,
                         require_identity=validator.require_identity,
                         max_cb_rms_dev=cfg.site_max_cb_rms_dev,
+                    ) and metrics.rest_passed(
+                        cfg.site_rest_max_bb_rmsd,
+                        cfg.site_rest_max_local_rmsd,
+                        cfg.site_rest_max_cb_dev,
+                        cfg.site_rest_max_cb_rms_dev,
                     )
                 gate_site = True if ok_site is None else bool(ok_site)
                 if not (site is not None and cfg.site_gate):

@@ -381,6 +381,23 @@ class RedAAConfig:
     site_max_cb_rms_dev: float = field(
         default_factory=lambda: _env_float("SITE_MAX_CB_RMS_DEV", 0.0)
     )
+    # Thresholds for the roles NOT named in SITE_GATE_ROLES. All 0 by
+    # default, which is measurement without gating -- the old behaviour. Set
+    # them when a site's second half has a real but looser requirement: a
+    # tRNA interface that has to be in the right place, with no constraint on
+    # how precisely, is gated here while the pocket is gated above.
+    site_rest_max_bb_rmsd: float = field(
+        default_factory=lambda: _env_float("SITE_REST_MAX_BB_RMSD", 0.0)
+    )
+    site_rest_max_local_rmsd: float = field(
+        default_factory=lambda: _env_float("SITE_REST_MAX_LOCAL_RMSD", 0.0)
+    )
+    site_rest_max_cb_dev: float = field(
+        default_factory=lambda: _env_float("SITE_REST_MAX_CB_DEV", 0.0)
+    )
+    site_rest_max_cb_rms_dev: float = field(
+        default_factory=lambda: _env_float("SITE_REST_MAX_CB_RMS_DEV", 0.0)
+    )
     site_require_identity: bool = field(
         default_factory=lambda: _env_bool("SITE_REQUIRE_IDENTITY", True)
     )
@@ -457,6 +474,16 @@ class RedAAConfig:
         return tuple(dict.fromkeys(x.strip().upper() for x in raw if x.strip()))
 
     @property
+    def site_rest_gated(self) -> bool:
+        """Whether the roles outside SITE_GATE_ROLES are gated at all."""
+        return any((
+            self.site_rest_max_bb_rmsd > 0,
+            self.site_rest_max_local_rmsd > 0,
+            self.site_rest_max_cb_dev > 0,
+            self.site_rest_max_cb_rms_dev > 0,
+        ))
+
+    @property
     def gate_role_tuple(self) -> tuple[str, ...]:
         raw = (self.site_gate_roles or "").replace(",", " ").split()
         named = tuple(dict.fromkeys(x.strip().lower() for x in raw if x.strip()))
@@ -476,6 +503,10 @@ class RedAAConfig:
         "SITE_MAX_LOCAL_RMSD": "site_max_local_rmsd",
         "SITE_MAX_CB_DEV": "site_max_cb_dev",
         "SITE_MAX_CB_RMS_DEV": "site_max_cb_rms_dev",
+        "SITE_REST_MAX_BB_RMSD": "site_rest_max_bb_rmsd",
+        "SITE_REST_MAX_LOCAL_RMSD": "site_rest_max_local_rmsd",
+        "SITE_REST_MAX_CB_DEV": "site_rest_max_cb_dev",
+        "SITE_REST_MAX_CB_RMS_DEV": "site_rest_max_cb_rms_dev",
         "SITE_REQUIRE_IDENTITY": "site_require_identity",
         "SITE_CONTACT_MAX": "site_contact_max",
         "MPNN_MODEL_TYPE": "mpnn_model_type",
@@ -510,6 +541,13 @@ class RedAAConfig:
             )
         _policies, policy_problems = parse_site_policy(self.site_residue_policy)
         problems.extend(policy_problems)
+        if self.site_rest_gated and not self.site_gate_roles.strip():
+            problems.append(
+                "SITE_REST_MAX_* thresholds apply to the roles left out of "
+                "SITE_GATE_ROLES, but SITE_GATE_ROLES is empty, so every role "
+                "is in the tight gate and these would never be used. Name the "
+                "tightly-gated roles, e.g. SITE_GATE_ROLES=catalytic,contact"
+            )
         bad_roles = [
             r for r in (self.site_gate_roles or "").replace(",", " ").split()
             if r.strip().lower() not in SITE_ROLES

@@ -367,6 +367,15 @@ def test_site_step_exposes_the_size_stable_cb_gate():
     assert "gate_roles=" in site
 
 
+def test_site_step_exposes_the_loose_thresholds_for_ungated_roles():
+    site = next(c for c in _code_cells() if "Mode and functional site" in c)
+    for name in ("SITE_REST_MAX_BB_RMSD", "SITE_REST_MAX_LOCAL_RMSD",
+                 "SITE_REST_MAX_CB_RMS_DEV"):
+        assert name in site, name
+    assert "rest_max_bb_rmsd=" in site
+    assert "rest_max_local_rmsd=" in site
+
+
 def test_markdown_warns_that_cb_dev_is_not_size_comparable():
     """The trap that drove a real run's alphabet to 19 letters."""
     md = "\n".join(_markdown_cells())

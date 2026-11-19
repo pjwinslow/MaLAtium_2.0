@@ -709,7 +709,13 @@ class SitePlan:
     def any_fixed(self) -> bool:
         return bool(self.fixed)
 
-    def describe(self) -> str:
+    def describe(self, rest_gated: bool = False) -> str:
+        """One line saying what the policies do to this site.
+
+        *rest_gated* says whether the roles outside the tight gate have
+        thresholds of their own, which changes what the line can honestly
+        claim about them.
+        """
         roles = ", ".join(f"{r}={p}" for r, p in sorted(self.by_role.items()))
         bits = [roles] if roles else []
         bits.append(f"{len(self.fixed)} held")
@@ -720,8 +726,9 @@ class SitePlan:
         if self.n_measured:
             bits.append(f"{self.n_measured} free but measured")
         if self.recorded:
+            how = "loosely gated" if rest_gated else "recorded only"
             bits.append(
-                f"{len(self.gated)} gated, {len(self.recorded)} recorded only"
+                f"{len(self.gated)} tightly gated, {len(self.recorded)} {how}"
             )
         return "; ".join(bits)
 
@@ -834,6 +841,38 @@ class SiteMetrics:
             if value > limit:
                 return False
         return True
+
+    def rest_passed(
+        self,
+        max_bb_rmsd: float,
+        max_local_rmsd: float,
+        max_cb_dev: float = 0.0,
+        max_cb_rms_dev: float = 0.0,
+    ) -> bool:
+        """Whether the roles outside the tight gate clear their own thresholds.
+
+        Two threshold sets exist because the two halves of a site are asked
+        for different things, not because one is measured differently. A
+        catalytic pocket has to put side chains within bonding distance of a
+        substrate, so its geometry is judged tightly. An interface to a
+        75-nucleotide RNA has to be in roughly the right place and present
+        roughly the right surface; demanding Angstrom precision there tests
+        the fold model, not the design.
+
+        With every threshold at 0 this is measurement only, which is the
+        default and the old behaviour.
+        """
+        if self.recorded is None:
+            # Nothing outside the gate. Thresholds on an empty group cannot
+            # fail: there is no claim being made.
+            return True
+        return self.recorded.passed(
+            max_bb_rmsd,
+            max_local_rmsd,
+            max_cb_dev,
+            require_identity=False,
+            max_cb_rms_dev=max_cb_rms_dev,
+        )
 
     def describe(self) -> str:
         def f(v, spec="0.2f"):
@@ -1085,6 +1124,19 @@ PRESETS: dict[str, SitePreset] = {
             # check is switched off and the size-stable one gated instead.
             ("SITE_MAX_CB_DEV", "0"),
             ("SITE_MAX_CB_RMS_DEV", "2.0"),
+            # The interface IS gated, on its own looser numbers. The two
+            # halves are asked for different things: the pocket has to put
+            # side chains within bonding distance of an adenylate, while the
+            # interface has to be in the right place and present the right
+            # surface to a 75-nucleotide RNA. Measured on these coordinates,
+            # the interface shows BB 2.48 A / local 2.30 A / cbRMS 1.94 A
+            # under 1.5 A of correlated backbone error and roughly 4 / 3.9 /
+            # 3.4 under 2.5 A, so these thresholds accept a domain that is
+            # placed correctly to within about 2 A and reject one that has
+            # drifted further.
+            ("SITE_REST_MAX_BB_RMSD", "3.0"),
+            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
+            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
         ),
         title="Glycyl-adenylate pocket + tRNA interface -- human GlyRS (5E6M, 2.93 A)",
         notes=(

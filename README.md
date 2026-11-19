@@ -699,15 +699,37 @@ worst-pair check is still active, and the console prints whichever CB column
 is actually gated — so a `PASS` never appears next to a number that had no say
 in it.
 
-#### Gating part of a site
+#### Two threshold sets, because a site's halves are asked different things
 
-`SITE_GATE_ROLES` limits the thresholds to some roles. A site with a compact
-pocket and an interface spanning the whole chain cannot be judged by one set
-of numbers: `Site_Local_RMSD ≤ 1.0 Å` over a chain-spanning 48-residue set is
-a *harder* test than the global fold gate. Gating `catalytic,contact` tests
-the pocket, while the interface is still measured and reported in the
-`site_rec_*` / `best_seq_site_rec_*` columns and the `recBB` console field.
-Leaving it empty gates everything, which is right for a compact site.
+`SITE_GATE_ROLES` names the roles judged by the tight `SITE_MAX_*`
+thresholds. The roles left out are judged by `SITE_REST_MAX_*`, which default
+to 0 — measured and reported, not gated. Leaving `SITE_GATE_ROLES` empty
+gates everything on one set of numbers, which is right for a compact site.
+
+The reason for two sets is scientific, not statistical. A catalytic pocket
+has to put side chains within bonding distance of a substrate, so its
+geometry is judged tightly. An interface to a 75-nucleotide RNA has to be in
+roughly the right place and present roughly the right surface; demanding
+Angstrom precision there tests the fold model rather than the design. Both
+halves are measured identically — on the 5E6M site, at a given backbone
+accuracy, the pocket and the interface report `Site_BB_RMSD` within 0.1 Å of
+each other — so the difference in thresholds reflects the requirement, not
+the metric.
+
+What the interface thresholds buy, measured on these coordinates:
+
+| backbone error | interface `BB_RMSD` | `Local_RMSD` | `cb_rms_dev` |
+|---|---|---|---|
+| 1.0 Å | 1.63 Å | 1.51 Å | 1.38 Å |
+| 1.5 Å | 2.48 Å | 2.30 Å | 1.94 Å |
+| 2.5 Å | 4.27 Å | 3.94 Å | 3.41 Å |
+
+So `SITE_REST_MAX_BB_RMSD=3.0` with `SITE_REST_MAX_LOCAL_RMSD=2.5` accepts an
+interface placed correctly to within about 2 Å and rejects one that has
+drifted further — "in the same spot", with no constraint on which residues
+are there. The ungated-or-loosely-gated group's numbers appear in the
+`site_rec_*` / `best_seq_site_rec_*` columns and the `restBB` / `recBB`
+console fields, so loosening a gate never means losing the measurement.
 
 **The fold gate and the site gate are separate, and a verdict says which
 bound.** A candidate line reads
@@ -916,7 +938,10 @@ resolved values. The ones you are most likely to touch:
 | `SITE_MAX_LOCAL_RMSD` | `1.0` | Å, site backbone after site-only superposition |
 | `SITE_MAX_CB_DEV` | `1.5` | Å, **worst** site CB–CB distance error; grows with site size, so set `0` past a few positions |
 | `SITE_MAX_CB_RMS_DEV` | `0` (off) | Å, **RMS** site CB–CB distance error; size-stable, prefer it for a large site |
-| `SITE_GATE_ROLES` | all | Roles the thresholds apply to, e.g. `catalytic,contact`; the rest are measured, not gated |
+| `SITE_GATE_ROLES` | all | Roles judged by the tight `SITE_MAX_*` thresholds, e.g. `catalytic,contact` |
+| `SITE_REST_MAX_BB_RMSD` | `0` (off) | Å, same-place threshold for the roles left out of `SITE_GATE_ROLES` |
+| `SITE_REST_MAX_LOCAL_RMSD` | `0` (off) | Å, same-shape threshold for those roles |
+| `SITE_REST_MAX_CB_RMS_DEV` | `0` (off) | Å, RMS CB–CB threshold for those roles |
 | `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
 | `FOLD_PRECISION` | `auto` | `auto` asks the GPU: bf16 where supported, else fp16; fp32 on CPU. Also `bf16`, `fp16`, `fp32` |

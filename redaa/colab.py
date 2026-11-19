@@ -551,6 +551,9 @@ def configure_site(
     max_local_rmsd: float = 1.0,
     max_cb_dev: float = 1.5,
     max_cb_rms_dev: float = 0.0,
+    rest_max_bb_rmsd: float = 0.0,
+    rest_max_local_rmsd: float = 0.0,
+    rest_max_cb_rms_dev: float = 0.0,
     require_identity: bool = True,
     mpnn_model_type: str = "",
 ) -> dict:
@@ -590,6 +593,9 @@ def configure_site(
             "SITE_MAX_CB_RMS_DEV": (0.0, max_cb_rms_dev),
             "SITE_MAX_BB_RMSD": (1.5, max_bb_rmsd),
             "SITE_MAX_LOCAL_RMSD": (1.0, max_local_rmsd),
+            "SITE_REST_MAX_BB_RMSD": (0.0, rest_max_bb_rmsd),
+            "SITE_REST_MAX_LOCAL_RMSD": (0.0, rest_max_local_rmsd),
+            "SITE_REST_MAX_CB_RMS_DEV": (0.0, rest_max_cb_rms_dev),
         }
         for key, value in chosen.settings:
             if key not in _defaults:
@@ -612,6 +618,12 @@ def configure_site(
                 max_bb_rmsd = float(value)
             elif key == "SITE_MAX_LOCAL_RMSD":
                 max_local_rmsd = float(value)
+            elif key == "SITE_REST_MAX_BB_RMSD":
+                rest_max_bb_rmsd = float(value)
+            elif key == "SITE_REST_MAX_LOCAL_RMSD":
+                rest_max_local_rmsd = float(value)
+            elif key == "SITE_REST_MAX_CB_RMS_DEV":
+                rest_max_cb_rms_dev = float(value)
 
     policies, problems = parse_site_policy(policy)
     if problems:
@@ -640,6 +652,9 @@ def configure_site(
         "SITE_MAX_LOCAL_RMSD": str(float(max_local_rmsd)),
         "SITE_MAX_CB_DEV": str(float(max_cb_dev)),
         "SITE_MAX_CB_RMS_DEV": str(float(max_cb_rms_dev)),
+        "SITE_REST_MAX_BB_RMSD": str(float(rest_max_bb_rmsd)),
+        "SITE_REST_MAX_LOCAL_RMSD": str(float(rest_max_local_rmsd)),
+        "SITE_REST_MAX_CB_RMS_DEV": str(float(rest_max_cb_rms_dev)),
         "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
     }
     settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()
