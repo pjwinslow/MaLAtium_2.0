@@ -1198,6 +1198,122 @@ def test_the_token_is_not_among_the_settings_the_report_dumps():
         assert name.upper() not in ("HF_TOKEN", "GITHUB_TOKEN")
 
 
+# ---------------------------------------------------------------------------
+# Partner chains in the preview and in configure_site
+# ---------------------------------------------------------------------------
+
+
+def _partner_input(tmp):
+    """A prepared input with a ligand AND a retained partner chain."""
+    lines = []
+    serial = 1
+    for i in range(1, 7):
+        for name, dx in ((" N  ", -0.6), (" CA ", 0.0), (" C  ", 0.7)):
+            lines.append(
+                f"ATOM  {serial:>5d} {name} ALA A{i:>4d}    "
+                f"{3.8 * i + dx:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+            )
+            serial += 1
+    for k in range(3):
+        lines.append(
+            f"HETATM{serial:>5d}  C{k:<2d} ATP A 900    "
+            f"{3.8 + 0.5 * k:>8.3f}{3.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+        )
+        serial += 1
+    for n, i in enumerate((4, 5), start=1):
+        for k, name in enumerate((" P  ", " C1'", " N9 ")):
+            lines.append(
+                f"HETATM{serial:>5d} {name}   G D{n:>4d}    "
+                f"{3.8 * i:>8.3f}{3.0:>8.3f}{0.3 * k:>8.3f}  1.00  0.00"
+            )
+            serial += 1
+    lines.append("END")
+    out = os.path.join(tmp, "x.pdb")
+    F.prepare("\n".join(lines) + "\n", out, chain="A",
+              keep_ligands=("ATP",), keep_partners=("D",), spec="x_A")
+    return out
+
+
+def test_preview_separates_a_partner_chain_from_the_ligands():
+    """A 75-nucleotide tRNA reported as "75 ligands" would be useless."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _partner_input(tmp)
+        out = C.preview_site(path, "ligand:ATP@4.0 partner:D@4.0")
+        assert "ligands in file: ATP (3 atoms)" in out, out
+        assert "partners in file: chain D (2 residues, 6 atoms)" in out, out
+        assert "interface residues to chain D" in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_warns_about_a_kept_chain_nothing_refers_to():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _partner_input(tmp)
+        out = C.preview_site(path, "ligand:ATP@4.0")
+        assert "kept but no partner: token refers to them" in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_reports_the_policy_in_positions_not_in_the_abstract():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _partner_input(tmp)
+        out = C.preview_site(
+            path, "ligand:ATP@4.0 partner:D@4.0",
+            policy="exempt,interface=measure_only",
+        )
+        assert "policy   :" in out, out
+        assert "interface=measure_only" in out, out
+        assert "free but measured" in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_preview_rejects_an_unparseable_policy_rather_than_ignoring_it():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _partner_input(tmp)
+        out = C.preview_site(path, "ligand:ATP@4.0", policy="interface=oops")
+        assert "ERROR" in out and "oops" in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_configure_site_takes_the_presets_partners_and_policy():
+    saved = {k: os.environ.get(k) for k in
+             ("SITE_KEEP_PARTNERS", "SITE_RESIDUE_POLICY")}
+    try:
+        applied = C.configure_site(mode="site_aware", preset="glyrs")
+        assert applied["SITE_KEEP_PARTNERS"] == "E"
+        assert applied["SITE_RESIDUE_POLICY"] == "exempt,interface=measure_only"
+        assert os.environ["SITE_KEEP_PARTNERS"] == "E"
+        # Anything typed still wins over the preset's recommendation.
+        applied = C.configure_site(
+            mode="site_aware", preset="glyrs", policy="measure_only",
+            keep_partners="C",
+        )
+        assert applied["SITE_RESIDUE_POLICY"] == "measure_only"
+        assert applied["SITE_KEEP_PARTNERS"] == "C"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_configure_site_rejects_a_malformed_per_role_policy():
+    try:
+        C.configure_site(mode="site_aware", spec="H46", policy="iface=exempt")
+    except ValueError as exc:
+        assert "iface" in str(exc), exc
+    else:
+        raise AssertionError("a bad role name should have been rejected")
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

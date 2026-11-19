@@ -50,6 +50,11 @@ from . import structure as st
 # packing.
 ROLE_CATALYTIC = "catalytic"
 ROLE_CONTACT = "contact"
+# Residues contacting a retained partner *chain* -- another protein subunit,
+# or a nucleic acid. Distinguished from a small-molecule contact because the
+# failure modes differ: a partner interface is usually larger, and part of it
+# may belong to a subunit a single-chain design cannot reconstitute.
+ROLE_INTERFACE = "interface"
 
 # Solvent, cryoprotectants, buffers and crystallisation additives.  Present in
 # the coordinates, not part of the protein's function, and a disaster if they
@@ -77,6 +82,18 @@ SOLVENT_COMPONENTS = frozenset({
 ION_COMPONENTS = frozenset({
     "ZN", "MG", "MN", "CA", "NA", "K", "FE", "FE2", "CU", "CU1", "CO",
     "NI", "CD", "HG", "LI", "SR", "BA", "CS", "RB", "AL", "W", "MO",
+})
+
+
+# Standard nucleic-acid residues. Excluded from small-molecule ligand
+# auto-detection: a tRNA is not a ligand, and advertising its 75 nucleotides
+# as 75 candidate "ligands" would bury the real ones. A nucleic acid is kept
+# as a partner chain instead, which is what it is.
+NUCLEIC_COMPONENTS = frozenset({
+    "A", "U", "G", "C", "I",
+    "DA", "DT", "DG", "DC", "DU", "DI",
+    "PSU", "5MC", "5MU", "1MA", "2MG", "M2G", "7MG", "OMC", "OMG",
+    "H2U", "4SU", "YG", "QUO", "UR3", "G7M", "MIA",
 })
 
 
@@ -124,20 +141,33 @@ class LigandToken:
 
 
 @dataclass(frozen=True)
+class PartnerToken:
+    """A chain whose interface with the designed chain defines part of a site."""
+
+    chain: str
+    cutoff: float = 4.5
+
+    def describe(self) -> str:
+        return f"partner:{self.chain}@{self.cutoff:g}"
+
+
+@dataclass(frozen=True)
 class SiteSpec:
     """A parsed, unresolved site specification."""
 
     residues: tuple[ResidueToken, ...] = ()
     ligands: tuple[LigandToken, ...] = ()
+    partners: tuple[PartnerToken, ...] = ()
     name: str = "site"
     default_chain: str | None = None
 
     def __bool__(self) -> bool:
-        return bool(self.residues or self.ligands)
+        return bool(self.residues or self.ligands or self.partners)
 
     def describe(self) -> str:
         parts = [t.describe() for t in self.residues]
         parts += [t.describe() for t in self.ligands]
+        parts += [t.describe() for t in self.partners]
         return " ".join(parts) if parts else "(empty)"
 
 
@@ -149,6 +179,10 @@ _RES_RE = re.compile(
     r"(?P<aa>[A-Za-z])?"
     r"(?P<num>-?\d+)"
     r"(?P<icode>[A-Za-z])?$"
+)
+_PARTNER_RE = re.compile(
+    r"^partner\s*[:=]\s*(?P<chain>[A-Za-z0-9])(?:\s*@\s*(?P<cut>[0-9.]+))?$",
+    re.IGNORECASE,
 )
 _LIG_RE = re.compile(
     r"^ligand\s*[:=]\s*(?P<comp>[A-Za-z0-9]{1,5})(?:\s*@\s*(?P<cut>[0-9.]+))?$",
@@ -178,6 +212,9 @@ def parse_site_spec(
         range:110-116    an inclusive span of residue numbers
         ligand:ATP       every residue within 4.5 A of any ATP atom
         ligand:ATP@6.0   the same, at a 6 A cutoff
+        partner:E        every residue within 4.5 A of retained chain E --
+                         another subunit, or a nucleic acid such as a tRNA
+        partner:E@5.0    the same, at a 5 A cutoff
 
     Naming the expected residue is optional but worth doing: it is what turns
     a numbering mismatch into an error message instead of a silently wrong
@@ -185,11 +222,22 @@ def parse_site_spec(
     """
     residues: list[ResidueToken] = []
     ligands: list[LigandToken] = []
+    partners: list[PartnerToken] = []
 
     cleaned = re.sub(r"#[^\n]*", " ", text or "")
     tokens = [t for t in re.split(r"[,\s]+", cleaned) if t]
 
     for token in tokens:
+        part = _PARTNER_RE.match(token)
+        if part:
+            cut = float(part.group("cut")) if part.group("cut") else 4.5
+            if not 1.0 <= cut <= 15.0:
+                raise SiteError(
+                    f"partner cutoff {cut} A out of range (1-15) in {token!r}"
+                )
+            partners.append(PartnerToken(part.group("chain").upper(), cut))
+            continue
+
         lig = _LIG_RE.match(token)
         if lig:
             comp = lig.group("comp").upper()
@@ -249,6 +297,7 @@ def parse_site_spec(
     return SiteSpec(
         residues=tuple(unique),
         ligands=tuple(dict.fromkeys(ligands)),
+        partners=tuple(dict.fromkeys(partners)),
         name=name,
         default_chain=default_chain,
     )
@@ -287,6 +336,8 @@ class ResolvedSite:
     positions: tuple[SitePosition, ...] = ()
     ligands: tuple[str, ...] = ()
     ligand_atom_counts: dict[str, int] = field(default_factory=dict)
+    partners: tuple[str, ...] = ()
+    partner_atom_counts: dict[str, int] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     spec_text: str = ""
 
@@ -305,6 +356,10 @@ class ResolvedSite:
         return tuple(p.index for p in self.positions if p.role == ROLE_CATALYTIC)
 
     @property
+    def interface_indices(self) -> tuple[int, ...]:
+        return tuple(p.index for p in self.positions if p.role == ROLE_INTERFACE)
+
+    @property
     def native_aas(self) -> str:
         return "".join(p.native_aa for p in self.positions)
 
@@ -321,12 +376,19 @@ class ResolvedSite:
             return "no site"
         cat = [p for p in self.positions if p.role == ROLE_CATALYTIC]
         con = [p for p in self.positions if p.role == ROLE_CONTACT]
+        iface = [p for p in self.positions if p.role == ROLE_INTERFACE]
         bits = []
         if cat:
             bits.append(f"catalytic {'+'.join(p.label for p in cat)}")
         if con:
             bits.append(
                 f"{len(con)} contact residues ({''.join(sorted(p.native_aa for p in con))})"
+            )
+        if iface:
+            bits.append(
+                f"{len(iface)} interface residues to chain "
+                f"{'+'.join(self.partners) or '?'} "
+                f"({''.join(sorted(p.native_aa for p in iface))})"
             )
         return "; ".join(bits)
 
@@ -391,13 +453,28 @@ def contact_shell(
     if lig_xyz.size == 0:
         return [], [f"ligand(s) {', '.join(comp_ids)} have no usable coordinates"]
 
+    found, warns = _shell_from_atoms(
+        poly, lig_xyz, cutoff, max_residues, f"ligand shell for {', '.join(comp_ids)}"
+    )
+    return found, warnings + warns
+
+
+def _shell_from_atoms(
+    poly: list[st.ResidueRecord],
+    other_xyz: np.ndarray,
+    cutoff: float,
+    max_residues: int,
+    label: str,
+) -> tuple[list[tuple[int, float, int]], list[str]]:
+    """Polymer residues within *cutoff* of any row of *other_xyz*."""
+    warnings: list[str] = []
     found: list[tuple[int, float, int]] = []
     cut2 = cutoff * cutoff
     for i, rec in enumerate(poly):
         if not rec.atoms:
             continue
         prot = np.asarray(list(rec.atoms.values()), dtype=np.float64)
-        d2 = ((prot[:, None, :] - lig_xyz[None, :, :]) ** 2).sum(axis=2)
+        d2 = ((prot[:, None, :] - other_xyz[None, :, :]) ** 2).sum(axis=2)
         n_close = int((d2 <= cut2).sum())
         if n_close:
             found.append((i, float(np.sqrt(d2.min())), n_close))
@@ -405,12 +482,55 @@ def contact_shell(
     found.sort(key=lambda t: (t[1], -t[2]))
     if max_residues and len(found) > max_residues:
         warnings.append(
-            f"ligand shell for {', '.join(comp_ids)} had {len(found)} residues "
-            f"within {cutoff:g} A; kept the {max_residues} closest "
-            "(SITE_CONTACT_MAX)"
+            f"{label} had {len(found)} residues within {cutoff:g} A; kept the "
+            f"{max_residues} closest (SITE_CONTACT_MAX)"
         )
         found = found[:max_residues]
     return found, warnings
+
+
+def partner_atoms(
+    records: list[st.ResidueRecord], chain: str
+) -> list[st.ResidueRecord]:
+    """Retained partner-chain groups: heteroatom records on *chain*.
+
+    ``prepare()`` writes a retained partner chain as HETATM records keeping
+    its original chain id, so it is invisible to the polymer parsers (and so
+    never folded, designed or scored) while remaining visible here and to
+    LigandMPNN's atom context.
+    """
+    want = chain.upper()
+    return [
+        rec for rec in records
+        if rec.is_hetatm and rec.chain.upper() == want
+    ]
+
+
+def partner_shell(
+    records: list[st.ResidueRecord],
+    chain: str,
+    cutoff: float = 4.5,
+    max_residues: int = 0,
+) -> tuple[list[tuple[int, float, int]], list[str]]:
+    """Residues of the designed chain contacting retained partner *chain*."""
+    poly = _author_index(records)
+    groups = partner_atoms(records, chain)
+    if not groups:
+        kept = sorted({r.chain for r in records if r.is_hetatm})
+        have = ", ".join(kept) if kept else "none"
+        return [], [
+            f"partner chain {chain} has no retained atoms (retained "
+            f"non-polymer chains: {have}) -- was it kept by SITE_KEEP_PARTNERS "
+            "when the input was prepared?"
+        ]
+    xyz = np.asarray(
+        [c for g in groups for c in g.atoms.values()], dtype=np.float64
+    )
+    if xyz.size == 0:
+        return [], [f"partner chain {chain} has no usable coordinates"]
+    return _shell_from_atoms(
+        poly, xyz, cutoff, max_residues, f"partner shell for chain {chain}"
+    )
 
 
 def resolve_site(
@@ -504,6 +624,30 @@ def resolve_site(
                 min_distance=dist, n_contacts=n_atoms,
             )
 
+    # -- partner-chain interfaces -------------------------------------
+    partner_counts: dict[str, int] = {}
+    for part in spec.partners:
+        groups = partner_atoms(records, part.chain)
+        partner_counts[part.chain] = sum(len(g.atoms) for g in groups)
+        found, warns = partner_shell(
+            records, part.chain, part.cutoff, max_residues=contact_max
+        )
+        warnings.extend(warns)
+        for i, dist, n_atoms in found:
+            rec = poly[i]
+            existing = by_role.get(i)
+            if existing is not None:
+                if existing.min_distance is None or dist < existing.min_distance:
+                    by_role[i] = replace(
+                        existing, min_distance=dist, n_contacts=n_atoms
+                    )
+                continue
+            by_role[i] = SitePosition(
+                index=i, chain=rec.chain, resseq=rec.resseq, icode=rec.icode,
+                native_aa=rec.aa, role=ROLE_INTERFACE,
+                min_distance=dist, n_contacts=n_atoms,
+            )
+
     positions = tuple(by_role[i] for i in sorted(by_role))
 
     # A site that covers most of the protein is not a site, and silently
@@ -523,8 +667,89 @@ def resolve_site(
         positions=positions,
         ligands=tuple(l.comp_id for l in spec.ligands),
         ligand_atom_counts=atom_counts,
+        partners=tuple(p.chain for p in spec.partners),
+        partner_atom_counts=partner_counts,
         warnings=tuple(warnings),
         spec_text=spec.describe(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Turning a resolved site plus its policies into the three sets that matter
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SitePlan:
+    """What a resolved site and its per-role policies ask of the search.
+
+    Three sets, derived once, used everywhere.  The pipeline used to compare
+    a single policy string at seven different places, which worked only while
+    every site position was governed by the same policy.  With a catalytic
+    pocket held exactly and a nucleic-acid interface left free, that is no
+    longer true.
+
+    ``fixed``   positions MPNN must leave at their native identity.
+    ``exempt``  positions not counted against the reported alphabet.
+    ``forced_types``  letters the alphabet must contain, because a position
+                counted against it is held at that residue.
+    """
+
+    fixed: dict[int, str] = field(default_factory=dict)
+    exempt: frozenset[int] = frozenset()
+    forced_types: frozenset[str] = frozenset()
+    by_role: dict[str, str] = field(default_factory=dict)
+    n_measured: int = 0
+
+    @property
+    def any_fixed(self) -> bool:
+        return bool(self.fixed)
+
+    def describe(self) -> str:
+        roles = ", ".join(f"{r}={p}" for r, p in sorted(self.by_role.items()))
+        bits = [roles] if roles else []
+        bits.append(f"{len(self.fixed)} held")
+        if self.exempt:
+            bits.append(f"{len(self.exempt)} uncounted")
+        if self.forced_types:
+            bits.append(f"requires {''.join(sorted(self.forced_types))}")
+        if self.n_measured:
+            bits.append(f"{self.n_measured} free but measured")
+        return "; ".join(bits)
+
+
+def site_plan(site: ResolvedSite | None, policies: dict[str, str]) -> SitePlan:
+    """Resolve *site* against a role -> policy map.
+
+    Policies, per position, by its role:
+
+    ``exempt``        held at native identity, not counted in the alphabet
+    ``in_alphabet``   held at native identity, and its residue type counted
+    ``measure_only``  designed freely; only the geometry is judged
+    """
+    if site is None or not site.positions:
+        return SitePlan(by_role=dict(policies))
+
+    fixed: dict[int, str] = {}
+    exempt: set[int] = set()
+    forced: set[str] = set()
+    measured = 0
+    for pos in site.positions:
+        policy = policies.get(pos.role, "exempt")
+        if policy == "measure_only":
+            measured += 1
+            continue
+        fixed[pos.index] = pos.native_aa
+        if policy == "in_alphabet":
+            forced.add(pos.native_aa)
+        else:
+            exempt.add(pos.index)
+    return SitePlan(
+        fixed=fixed,
+        exempt=frozenset(exempt),
+        forced_types=frozenset(forced),
+        by_role=dict(policies),
+        n_measured=measured,
     )
 
 
@@ -583,6 +808,7 @@ def measure_site(
     ref_frames: np.ndarray,
     pred_frames: np.ndarray,
     designed_seq: str | None = None,
+    held: "dict[int, str] | None" = None,
 ) -> SiteMetrics:
     """Compare a prediction's site geometry with the reference's.
 
@@ -608,33 +834,58 @@ def measure_site(
     )
 
     if designed_seq is not None:
-        metrics.identity_kept = site_identity_kept(site, designed_seq)
+        # Only the positions the plan holds. A position left free by policy
+        # is *supposed* to change, so counting it as lost identity would
+        # condemn every design.
+        metrics.identity_kept = site_identity_kept(site, designed_seq, only=held)
     return metrics
 
 
-def site_identity_kept(site: ResolvedSite, sequence: str) -> bool:
-    """Whether *sequence* still carries the native residue at every site position."""
-    for pos in site.positions:
-        if pos.index >= len(sequence):
+def site_identity_kept(
+    site: ResolvedSite,
+    sequence: str,
+    only: "dict[int, str] | None" = None,
+) -> bool:
+    """Whether *sequence* carries the native residue where it was meant to.
+
+    With *only* -- a ``SitePlan.fixed`` map -- just those positions are
+    checked.  Checking the rest would fail by definition: under
+    ``measure_only`` the design is supposed to choose its own residues there.
+    """
+    wanted = (
+        only if only is not None
+        else {pos.index: pos.native_aa for pos in site.positions}
+    )
+    for index, aa in wanted.items():
+        if index >= len(sequence):
             return False
-        if sequence[pos.index] != pos.native_aa:
+        if sequence[index] != aa:
             return False
     return True
 
 
-def apply_site_to_sequence(site: ResolvedSite, sequence: str) -> str:
-    """Force the native residue at each site position.
+def apply_site_to_sequence(
+    site: ResolvedSite,
+    sequence: str,
+    only: "dict[int, str] | None" = None,
+) -> str:
+    """Force the native residue at each held site position.
 
     Used when grafting a site onto a sequence designed without it, and as a
     belt-and-braces step after a design run that was supposed to hold those
-    positions fixed.
+    positions fixed.  With *only*, positions left free by policy are not
+    overwritten.
     """
-    if not site.positions:
+    wanted = (
+        only if only is not None
+        else {pos.index: pos.native_aa for pos in site.positions}
+    )
+    if not wanted:
         return sequence
     chars = list(sequence)
-    for pos in site.positions:
-        if pos.index < len(chars):
-            chars[pos.index] = pos.native_aa
+    for index, aa in wanted.items():
+        if index < len(chars):
+            chars[index] = aa
     return "".join(chars)
 
 
@@ -654,16 +905,26 @@ class SitePreset:
     mpnn_model_type: str
     title: str
     notes: str
+    # Whole chains to retain as binding context.
+    keep_partners: tuple[str, ...] = ()
+    # The policy this case needs, when the blanket default would be wrong.
+    # Empty means "whatever the user or the default says".
+    site_policy: str = ""
 
     def describe(self) -> str:
-        return (
-            f"{self.key}: {self.title}\n"
-            f"    structure : {self.fetch_spec}\n"
-            f"    site      : {self.site_spec}\n"
-            f"    ligands   : {', '.join(self.keep_ligands) or 'none'}\n"
-            f"    mpnn      : {self.mpnn_model_type}\n"
-            f"    {self.notes}"
-        )
+        lines = [
+            f"{self.key}: {self.title}",
+            f"    structure : {self.fetch_spec}",
+            f"    site      : {self.site_spec}",
+            f"    ligands   : {', '.join(self.keep_ligands) or 'none'}",
+        ]
+        if self.keep_partners:
+            lines.append(f"    partners  : {', '.join(self.keep_partners)}")
+        lines.append(f"    mpnn      : {self.mpnn_model_type}")
+        if self.site_policy:
+            lines.append(f"    policy    : {self.site_policy}")
+        lines.append(f"    {self.notes}")
+        return "\n".join(lines)
 
 
 # Both of these were checked against the deposited coordinates rather than
@@ -713,6 +974,45 @@ PRESETS: dict[str, SitePreset] = {
             "His46 NE2-Cys151 SG is 4.02 A, so the triad is intact and the "
             "numbering is the one the spec uses. No ligand is kept, so this "
             "case runs on protein_mpnn."
+        ),
+    ),
+    "glyrs": SitePreset(
+        key="glyrs",
+        # Chain A, whole. 519 modelled residues numbered 7-678 with 4 gaps.
+        # File numbering + 54 = UniProt P41250 numbering, so literature
+        # residue numbers do NOT match the spec below: the deposited
+        # construct is UNP 55-739 renumbered from 1. The LEHHHHHH tag at
+        # 686-693 is unmodelled, so nothing has to be trimmed.
+        fetch_spec="5e6m_A",
+        # Two sites from one structure, which is the reason for using this
+        # entry: the adenylate pocket derived from the bound glycyl-adenylate,
+        # and the tRNA interface derived from the tRNA that chain A binds.
+        site_spec="ligand:GAP@4.5 partner:E@4.5",
+        keep_ligands=("GAP",),
+        keep_partners=("E",),
+        mpnn_model_type="ligand_mpnn",
+        # One blanket policy cannot serve both halves. The 4.5 A shell around
+        # the adenylate is 20 residues; the tRNA interface is 48, and between
+        # them they use 18 of the 20 amino acids. Held under in_alphabet the
+        # "minimal" alphabet would be 18 letters before the search began.
+        site_policy="exempt,interface=measure_only",
+        title="Glycyl-adenylate pocket + tRNA interface -- human GlyRS (5E6M, 2.93 A)",
+        notes=(
+            "Human wild-type GlyRS (GARS, P41250, EC 6.1.1.14) with "
+            "tRNA-Gly; chains A and B are the protein, C and E the tRNA. "
+            "Computed from the deposited file, not recalled: GAP is "
+            "glycyl-adenylate -- the reaction intermediate itself, 27 atoms, "
+            "its glycyl N/CA/C/O, the alpha-phosphate and the whole "
+            "adenosine -- and all 27 of its atoms lie within 4.5 A of chain "
+            "A while none come within 11 A of chain B, so the catalytic "
+            "pocket is entirely intra-subunit and a single-chain design can "
+            "reconstitute it. The tRNA is not: chain E contacts 75 residues "
+            "of chain A and 21 of chain B at 6 A, so about a fifth of that "
+            "interface belongs to the other subunit and cannot be reproduced "
+            "by a monomer. GlyRS is an obligate dimer in any case (chain B "
+            "contacts 98 residues of chain A), so treat a result here as one "
+            "subunit of a dimer rather than a free-standing protein. Chain E "
+            "is paired with chain A deliberately: chain C binds chain B."
         ),
     ),
 }

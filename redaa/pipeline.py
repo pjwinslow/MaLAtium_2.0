@@ -29,6 +29,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 
+from . import fetch as fetchmod
 from . import sites as sitemod
 from . import structure as st
 from .chemistry import analyze_requirements
@@ -37,8 +38,7 @@ from .config import (
     MODE_ALPHABET_ONLY,
     MODE_SCAFFOLD_THEN_SITE,
     MODE_SITE_AWARE,
-    POLICY_IN_ALPHABET,
-    POLICY_MEASURE_ONLY,
+    parse_site_policy,
 )
 from .foldcache import FoldCache
 from .folding import FoldEngine
@@ -76,6 +76,16 @@ def _verdict(validation) -> str:
         return "PASS"
     reason = getattr(validation, "reason", "")
     return f"fail[{reason}]" if reason else "fail"
+
+
+def plan_for(cfg, site) -> "sitemod.SitePlan":
+    """The three sets a resolved site asks of the search, under *cfg*.
+
+    Config validation has already rejected a malformed policy string, so the
+    problems list is dropped here.
+    """
+    policies, _ = parse_site_policy(cfg.site_residue_policy)
+    return sitemod.site_plan(site, policies)
 
 
 class _SkipCheck(Exception):
@@ -403,14 +413,11 @@ class Pipeline:
 
         # Positions MPNN must not redesign, and the residue each must keep.
         # Empty under measure_only: there the design picks its own residues and
-        # only the geometry is judged.
+        # only the geometry is judged. With per-role policies this can hold a
+        # catalytic pocket while leaving an interface free.
         fixed: dict[int, str] = {}
-        if (
-            site is not None
-            and mode == MODE_SITE_AWARE
-            and cfg.site_residue_policy != POLICY_MEASURE_ONLY
-        ):
-            fixed = {p.index: p.native_aa for p in site.positions}
+        if site is not None and mode == MODE_SITE_AWARE:
+            fixed = dict(plan_for(cfg, site).fixed)
 
         def design(alphabet, **kw):
             """MPNN call that carries this mode's fixed positions."""
@@ -831,6 +838,10 @@ class Pipeline:
             ),
         }
         if site is not None:
+            # How many positions were HELD rather than merely measured is the
+            # number that decides what the reported alphabet means, so it goes
+            # in the summary next to the alphabet rather than in a log.
+            plan = plan_for(cfg, site)
             result.update(
                 site_name=site.name,
                 site_spec=site.spec_text,
@@ -838,6 +849,11 @@ class Pipeline:
                 site_residues="+".join(site.labels()),
                 site_residue_types="".join(sorted(site.residue_types)),
                 site_policy=cfg.site_residue_policy,
+                site_partners="+".join(site.partners),
+                site_n_interface=len(site.interface_indices),
+                site_n_held=len(plan.fixed),
+                site_n_measured=plan.n_measured,
+                site_forced_types="".join(sorted(plan.forced_types)),
             )
         result.update(graft)
 
@@ -1124,6 +1140,39 @@ class Pipeline:
                    f"{n_lig} atoms" if n_lig else
                    "none -- keep a ligand or use protein_mpnn")
 
+            # A retained partner chain is context only if MPNN's own parser
+            # kept it. It is written as HETATM, which every parser we control
+            # treats as non-polymer -- but LigandMPNN parses the file itself,
+            # and a parser that recognised nucleic residues and dropped them
+            # would leave the ligand count non-zero and the tRNA absent. That
+            # failure is invisible: the run completes and the interface was
+            # never designed against anything.
+            prov = fetchmod.read_provenance(pdb_path)
+            if prov.get("partners"):
+                expected = 0
+                shown = []
+                for field_text in prov["partners"].split(","):
+                    bits = field_text.split(":")
+                    n_atoms = 0
+                    for bit in bits:
+                        if bit.endswith("atoms"):
+                            try:
+                                n_atoms = int(bit[: -len("atoms")])
+                            except ValueError:
+                                n_atoms = 0
+                    expected += n_atoms
+                    shown.append(f"{bits[0]} ({n_atoms} atoms)")
+                seen_enough = n_lig >= expected
+                record(
+                    "MPNN sees the retained partner chain(s)", seen_enough,
+                    f"{n_lig} atoms in context, {expected} from "
+                    f"{', '.join(shown)}" if seen_enough else
+                    f"only {n_lig} atoms in context but {expected} were "
+                    f"retained from {', '.join(shown)} -- LigandMPNN's parser "
+                    "dropped the partner, so the interface would be designed "
+                    "against nothing",
+                )
+
         try:
             designs = self.mpnn.design(pdb_path, list("AGLV"), num_seq=2)
             ok = bool(designs.pairs)
@@ -1140,21 +1189,22 @@ class Pipeline:
         # configured. Folding an unfixed design instead would make the site
         # checks meaningless -- it would not carry the site at all.
         probe = designs.pairs[0][1]
-        if site is not None and cfg.site_residue_policy == POLICY_MEASURE_ONLY:
+        pf_plan = plan_for(cfg, site)
+        if site is not None and not pf_plan.any_fixed:
             record(
                 "site positions are free (measure_only)", True,
                 "MPNN chooses its own residues there; only the geometry is "
                 "gated",
             )
         elif site is not None:
-            fixed = {p.index: p.native_aa for p in site.positions}
+            fixed = dict(pf_plan.fixed)
             try:
                 held = self.mpnn.design(
                     pdb_path, list("AGLV"), num_seq=2, fixed=fixed
                 )
                 bad = [
                     seq for _sc, seq in held.pairs
-                    if not sitemod.site_identity_kept(site, seq)
+                    if not sitemod.site_identity_kept(site, seq, only=fixed)
                 ]
                 record("fixed site positions hold", not bad,
                        "every design carries the native site residues"
@@ -1545,6 +1595,7 @@ class Pipeline:
         # -- functional site ----------------------------------------------
         site = None
         ref_frames = None
+        site_plan_obj = plan_for(cfg, None)
         if cfg.site_enabled:
             try:
                 site, ref_frames = self.resolve_domain_site(pdb_path, ref_seq)
@@ -1555,6 +1606,7 @@ class Pipeline:
                      "status": f"skipped_site_unresolved: {exc}"}
                 )
                 return
+            site_plan_obj = plan_for(cfg, site)
             if site is None or not len(site):
                 print(
                     "  ERROR: the site spec resolved to no residues in this "
@@ -1571,7 +1623,7 @@ class Pipeline:
             print(f"    resolved  : {site.describe()}")
             print(f"    positions : {', '.join(site.labels())}")
             print(f"    types     : {''.join(sorted(site.residue_types))}")
-            print(f"    policy    : {cfg.site_residue_policy}")
+            print(f"    policy    : {site_plan_obj.describe()}")
             if site.ligands:
                 counts = ", ".join(
                     f"{k} ({v} atoms)" for k, v in sorted(site.ligand_atom_counts.items())
@@ -1586,15 +1638,15 @@ class Pipeline:
                 fh.write(f"  Spec: {site.spec_text}\n")
                 fh.write(f"  Residues: {', '.join(site.labels())}\n")
                 fh.write(f"  Types: {''.join(sorted(site.residue_types))}\n")
-                fh.write(f"  Policy: {cfg.site_residue_policy}\n")
+                fh.write(f"  Policy: {site_plan_obj.describe()}\n")
                 for w in site.warnings:
                     fh.write(f"  WARNING: {w}\n")
 
-            # Under the in_alphabet policy the site's residue types have to
-            # survive in the reported alphabet, so they join the protected set
-            # and the seed -- pruning must not take them out.
-            if cfg.site_residue_policy == POLICY_IN_ALPHABET:
-                protected |= set(site.residue_types)
+            # Residue types counted against the alphabet have to survive in
+            # it, so they join the protected set and the seed -- pruning must
+            # not take them out. Under per-role policies this is only the
+            # types of the roles set to in_alphabet.
+            protected |= set(site_plan_obj.forced_types)
 
         # An excluded residue that this structure chemically needs is a
         # contradiction only the structure can reveal -- config validation
@@ -1613,35 +1665,39 @@ class Pipeline:
                 "constraint rather than a reproduction of the native."
             )
             protected -= barred
-        if site is not None and cfg.site_residue_policy != POLICY_IN_ALPHABET:
-            # Exempt positions are held at their NATIVE identity, so an exempt
-            # site residue whose type is barred puts that residue back into the
+        if site is not None and barred:
+            # A held position keeps its NATIVE identity, so a held site
+            # residue whose type is barred puts that residue back into the
             # protein -- silently defeating the exclusion. Anyone excluding a
             # residue wants it gone from the sequence, not gone from the
             # alphabet while surviving at the positions that matter most.
+            # Positions left free by policy are not held, so they are fine.
             held = [
-                p for p in site.positions if p.native_aa in barred
-            ] if cfg.site_residue_policy != POLICY_MEASURE_ONLY else []
+                p for p in site.positions
+                if p.index in site_plan_obj.fixed and p.native_aa in barred
+            ]
             if held:
                 where = ", ".join(p.label for p in held)
+                roles = sorted({p.role for p in held})
+                free = ",".join(f"{r}=measure_only" for r in roles)
                 print(
                     f"\n  WARNING: EXCLUDE_AAS bars "
                     f"{''.join(sorted({p.native_aa for p in held}))}, but the "
-                    f"site holds {where} at native identity under "
-                    "SITE_RESIDUE_POLICY=exempt.\n"
+                    f"site holds {where} at native identity.\n"
                     f"    The designed protein will still contain "
                     f"{len(held)} of them. If the point is to remove the "
                     "residue entirely, drop those positions from SITE_SPEC or "
-                    "use SITE_RESIDUE_POLICY=measure_only."
+                    f"set SITE_RESIDUE_POLICY={free}."
                 )
-        if site is not None and cfg.site_residue_policy == POLICY_IN_ALPHABET:
-            site_clash = sorted(set(site.residue_types) & barred)
+        if site is not None:
+            site_clash = sorted(set(site_plan_obj.forced_types) & barred)
             if site_clash:
                 print(
-                    f"  ERROR: SITE_RESIDUE_POLICY=in_alphabet needs "
-                    f"{', '.join(site_clash)} for the site, but EXCLUDE_AAS "
-                    "bars them -- skipping this domain. Use "
-                    "SITE_RESIDUE_POLICY=exempt, or stop excluding them."
+                    f"  ERROR: SITE_RESIDUE_POLICY needs "
+                    f"{', '.join(site_clash)} in the alphabet for the site, "
+                    "but EXCLUDE_AAS bars them -- skipping this domain. Set "
+                    "that role to exempt or measure_only, or stop excluding "
+                    "them."
                 )
                 self.results.append(
                     {"pdb": domain, "replicate": 0,
@@ -1844,6 +1900,8 @@ class Pipeline:
         "search_mode", "excluded_aas", "excluded_present", "excluded_count",
         "site_name", "site_spec", "site_n_positions",
         "site_residues", "site_residue_types", "site_policy",
+        "site_partners", "site_n_interface", "site_n_held", "site_n_measured",
+        "site_forced_types",
         "best_seq_site_bb_rmsd", "best_seq_site_local_rmsd",
         "best_seq_site_cb_dev", "best_seq_site_ok",
         # scaffold_then_site only
@@ -1973,12 +2031,8 @@ class Pipeline:
                 continue
 
             fixed: dict[int, str] = {}
-            if (
-                site is not None
-                and cfg.search_mode == MODE_SITE_AWARE
-                and cfg.site_residue_policy != POLICY_MEASURE_ONLY
-            ):
-                fixed = {p.index: p.native_aa for p in site.positions}
+            if site is not None and cfg.search_mode == MODE_SITE_AWARE:
+                fixed = dict(plan_for(cfg, site).fixed)
 
             validator = Validator(
                 cfg, self.folder, ref_xyz, ref_seq,

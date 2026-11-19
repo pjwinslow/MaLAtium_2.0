@@ -9,6 +9,7 @@ a six-month-old output directory and need to know what produced it.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, fields
 
 ALL_AAS = tuple("ACDEFGHIKLMNPQRSTVWY")
@@ -61,6 +62,77 @@ POLICY_EXEMPT = "exempt"
 POLICY_IN_ALPHABET = "in_alphabet"
 POLICY_MEASURE_ONLY = "measure_only"
 SITE_POLICIES = (POLICY_EXEMPT, POLICY_IN_ALPHABET, POLICY_MEASURE_ONLY)
+
+# The site roles a policy can be set for. Mirrors redaa.sites.ROLE_*, which
+# this module deliberately does not import (sites pulls in numpy and the
+# structure parser; config is meant to be importable on its own). A test keeps
+# the two lists in step.
+SITE_ROLES = ("catalytic", "contact", "interface")
+
+
+def parse_site_policy(text: str) -> tuple[dict[str, str], list[str]]:
+    """Resolve ``SITE_RESIDUE_POLICY`` to one policy per role.
+
+    Accepts a bare policy for every role::
+
+        exempt
+
+    or per-role overrides, with or without a bare default in front::
+
+        exempt,interface=measure_only
+        catalytic=exempt,contact=in_alphabet,interface=measure_only
+
+    Per-role control is not a nicety.  A ligand pocket is a handful of
+    residues whose side chains do the chemistry; an interface to a nucleic
+    acid is fifty residues spanning nearly every amino acid.  Holding both
+    under one policy either freezes a sixth of the protein or forces an
+    eighteen-letter alphabet, and neither answers the question the search is
+    asking.
+
+    Returns ``(role -> policy, problems)``.
+    """
+    default = POLICY_EXEMPT
+    overrides: dict[str, str] = {}
+    problems: list[str] = []
+    seen_bare = False
+
+    for tok in (t for t in re.split(r"[,\s]+", text or "") if t):
+        if "=" in tok:
+            role, _, policy = tok.partition("=")
+            role = role.strip().lower()
+            policy = policy.strip()
+            if role not in SITE_ROLES:
+                problems.append(
+                    f"SITE_RESIDUE_POLICY names role {role!r}, which is not "
+                    f"one of {', '.join(SITE_ROLES)}"
+                )
+                continue
+            if policy not in SITE_POLICIES:
+                problems.append(
+                    f"SITE_RESIDUE_POLICY sets {role}={policy!r}, which is "
+                    f"not one of {', '.join(SITE_POLICIES)}"
+                )
+                continue
+            overrides[role] = policy
+            continue
+        if tok not in SITE_POLICIES:
+            problems.append(
+                f"SITE_RESIDUE_POLICY={tok!r} is not one of "
+                f"{', '.join(SITE_POLICIES)}, and is not a role=policy pair"
+            )
+            continue
+        if seen_bare:
+            problems.append(
+                f"SITE_RESIDUE_POLICY gives two blanket policies ({default}, "
+                f"{tok}); give one, then per-role overrides such as "
+                "'exempt,interface=measure_only'"
+            )
+            continue
+        default = tok
+        seen_bare = True
+
+    resolved = {role: overrides.get(role, default) for role in SITE_ROLES}
+    return resolved, problems
 
 # Every environment variable this module reads. Exported so a caller can
 # report the settings actually in effect without pattern-matching os.environ
@@ -263,11 +335,20 @@ class RedAAConfig:
     site_keep_ligands: str = field(
         default_factory=lambda: _env_str("SITE_KEEP_LIGANDS", "")
     )
+    # Whole chains to retain as binding context -- a second subunit, or a
+    # nucleic acid such as a tRNA. Retained as heteroatom records, so they are
+    # never folded or designed; they define an interface and give LigandMPNN
+    # something to design against.
+    site_keep_partners: str = field(
+        default_factory=lambda: _env_str("SITE_KEEP_PARTNERS", "")
+    )
     # Cap on a ligand-derived contact shell, closest residues first. 0 keeps
     # the whole shell.
     site_contact_max: int = field(
         default_factory=lambda: _env_int("SITE_CONTACT_MAX", 0)
     )
+    # One policy for every site role, or per-role overrides. See
+    # parse_site_policy for the accepted forms.
     site_residue_policy: str = field(
         default_factory=lambda: _env_str("SITE_RESIDUE_POLICY", POLICY_EXEMPT)
     )
@@ -358,6 +439,11 @@ class RedAAConfig:
         raw = (self.site_keep_ligands or "").replace(",", " ").split()
         return tuple(dict.fromkeys(x.strip().upper() for x in raw if x.strip()))
 
+    @property
+    def keep_partner_tuple(self) -> tuple[str, ...]:
+        raw = (self.site_keep_partners or "").replace(",", " ").split()
+        return tuple(dict.fromkeys(x.strip() for x in raw if x.strip()))
+
     def validate(self) -> list[str]:
         """Return a list of configuration problems, empty if all is well."""
         problems: list[str] = []
@@ -366,24 +452,23 @@ class RedAAConfig:
                 f"SEARCH_MODE={self.search_mode!r} is not one of "
                 f"{', '.join(SEARCH_MODES)}"
             )
-        if self.site_residue_policy not in SITE_POLICIES:
-            problems.append(
-                f"SITE_RESIDUE_POLICY={self.site_residue_policy!r} is not one "
-                f"of {', '.join(SITE_POLICIES)}"
-            )
+        _policies, policy_problems = parse_site_policy(self.site_residue_policy)
+        problems.extend(policy_problems)
         if self.site_enabled and not (self.site_spec or self.site_preset):
             problems.append(
                 f"SEARCH_MODE={self.search_mode} needs a site: set SITE_SPEC "
                 "or SITE_PRESET"
             )
         if (
-            self.site_residue_policy == POLICY_MEASURE_ONLY
-            and self.search_mode == MODE_SCAFFOLD_THEN_SITE
+            self.search_mode == MODE_SCAFFOLD_THEN_SITE
+            and not policy_problems
+            and all(p == POLICY_MEASURE_ONLY for p in _policies.values())
         ):
             problems.append(
                 "SITE_RESIDUE_POLICY=measure_only has nothing to graft, so it "
                 "cannot be combined with SEARCH_MODE=scaffold_then_site; use "
-                "SEARCH_MODE=site_aware"
+                "SEARCH_MODE=site_aware, or hold one role (for example "
+                "'catalytic=exempt,interface=measure_only')"
             )
         barred = set(self.exclude_aas)
         if barred:

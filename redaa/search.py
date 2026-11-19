@@ -234,15 +234,19 @@ class Validator:
         # satisfy the site thresholds as well as the TM gate.
         self.site = site if (site and len(site)) else None
         self.ref_frames = ref_frames
-        self.exempt: frozenset[int] = frozenset()
-        if self.site is not None and cfg.site_residue_policy == "exempt":
-            self.exempt = frozenset(self.site.indices)
-        # Under measure_only the design picks its own residues at the site, so
-        # requiring the native ones there would fail every candidate by
-        # definition.
+        # One resolved plan, rather than a policy string compared ad hoc.
+        # With per-role policies the same site can hold a pocket exactly and
+        # leave an interface free, so "the policy" is no longer a single value.
+        from .config import parse_site_policy
+
+        policies, _ = parse_site_policy(cfg.site_residue_policy)
+        self.plan = sitemod.site_plan(self.site, policies)
+        self.exempt: frozenset[int] = self.plan.exempt
+        # Identity is required only where the plan holds a position. Under
+        # measure_only the design picks its own residues there, so checking
+        # them would fail every candidate by definition.
         self.require_identity = bool(
-            cfg.site_require_identity
-            and cfg.site_residue_policy != "measure_only"
+            cfg.site_require_identity and self.plan.any_fixed
         )
 
     @property
@@ -256,7 +260,9 @@ class Validator:
         frames = getattr(result, "site_frames", None)
         if frames is None:
             return sitemod.SiteMetrics(n_positions=len(self.site))
-        return sitemod.measure_site(self.site, self.ref_frames, frames, seq)
+        return sitemod.measure_site(
+            self.site, self.ref_frames, frames, seq, held=self.plan.fixed
+        )
 
     def validate(
         self,

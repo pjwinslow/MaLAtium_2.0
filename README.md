@@ -490,6 +490,8 @@ backbones and that shifts every later index.
 | `range:148-151` | an inclusive span |
 | `ligand:ATP` | every residue within 4.5 Å of any ATP atom |
 | `ligand:ATP@6.0` | the same at a 6 Å cutoff |
+| `partner:E` | every residue within 4.5 Å of retained chain `E` |
+| `partner:E@6.0` | the same at a 6 Å cutoff |
 
 Naming the expected residue is optional and worth doing every time: it turns a
 numbering mismatch into an error instead of a silently wrong run. Naming a
@@ -512,6 +514,46 @@ Solvent, cryoprotectants and lone ions are left out of that list, and a copy
 bound to a different chain of the crystal is not advertised as this chain's.
 Asking for a code the entry does not have says which ones it does.
 
+### Binding partners that are whole chains
+
+A tRNA is not a ligand, and neither is a second subunit. `SITE_KEEP_PARTNERS`
+names **chain ids** to retain as context; `partner:<chain>` then derives the
+interface from coordinates exactly as `ligand:` derives a pocket.
+
+A retained partner is written into the prepared file as HETATM records
+keeping its original chain id. That is the whole trick: every polymer parser
+here reads ATOM records, so the partner is never folded, never designed and
+never scored as part of the chain, while remaining visible to the
+contact-shell code and to LigandMPNN's atom context. A nucleic acid is also
+excluded from small-molecule ligand detection, so a 75-nucleotide tRNA is not
+offered as 75 candidate ligands.
+
+As with ligands, you do not need to know which chain in advance. Preparing an
+input lists the chains that touch the one you chose, with their contact
+counts — and the counts are the point, because they say which subunit a
+partner actually binds:
+
+```
+  ok    5E6M_A: chain A, 519 residues  [GAP kept (27 atoms)]
+        partner: chain B (protein, 507 residues) contacts 98 residues of chain A
+                 -- keep it with SITE_KEEP_PARTNERS=B to derive an interface site
+        partner: chain E (nucleic, 75 residues) contacts 75 residues of chain A
+                 -- keep it with SITE_KEEP_PARTNERS=E to derive an interface site
+        partner: chain C (nucleic, 75 residues) contacts 19 residues of chain A
+```
+
+Two limits are stated rather than implied. A partner is **rigid** context: it
+is never redesigned, so a result says the designed chain can present that
+interface to *this* conformation of *this* partner. And where a partner also
+touches another subunit, preparing the input says what fraction of the
+interface a single-chain design can never reproduce:
+
+```
+        partner: partner E also contacts 21 residues of chain B (vs 75 of A):
+                 22% of its interface belongs to another subunit and cannot be
+                 reproduced by a single-chain design
+```
+
 ```bash
 # See the two verified test cases
 python run_redaa.py --list-presets
@@ -533,8 +575,8 @@ actual file.
 
 ### Do the site's residues count as alphabet letters?
 
-`SITE_RESIDUE_POLICY` decides, and the two answers are both publishable
-framings of different claims:
+`SITE_RESIDUE_POLICY` decides, and the answers are all publishable framings of
+different claims:
 
 - **`exempt`** (default) — site positions are held at native identity and are
   *not* alphabet letters. A result reads "5 letters plus 6 exempt positions".
@@ -552,6 +594,31 @@ framings of different claims:
 positions is not a 3-letter protein — so the exempt count and residue types
 are always reported beside the alphabet, and a site covering more than a
 quarter of the chain warns.
+
+#### One policy per role
+
+A site with two halves of different kinds cannot be served by one policy.
+Write a blanket policy, then overrides:
+
+```bash
+SITE_RESIDUE_POLICY="exempt,interface=measure_only"
+SITE_RESIDUE_POLICY="catalytic=exempt,contact=in_alphabet,interface=measure_only"
+```
+
+The roles are `catalytic` (residues you named), `contact` (derived from a
+`ligand:` token) and `interface` (derived from a `partner:` token).
+
+The reason is concrete. For the `glyrs` preset the adenylate pocket is 20
+residues and the tRNA interface 48, and between them they use **18 of the 20
+amino acids**. Under a blanket `in_alphabet` the "minimal" alphabet is 18
+letters before the search starts, and the result describes the site rather
+than the fold. `--preview-site` says so outright when a policy forces 12 or
+more letters. Holding the pocket and leaving the interface free asks a
+question that has an answer.
+
+The summary CSV carries `site_n_held`, `site_n_measured` and
+`site_forced_types` beside the alphabet, so which of those a given row
+reports is never a matter of remembering the settings.
 
 ### Ligand-shaped design without preserving any identity
 
@@ -640,13 +707,41 @@ MPNN scores in that run are means over a different position set than intended.
 
 ### The verified test cases
 
-Both were checked by computing them from the deposited coordinates, not taken
-from memory.
+All three were checked by computing them from the deposited coordinates, not
+taken from memory.
 
 | preset | structure | site | notes |
 |---|---|---|---|
 | `atp` | `5etn_A` — *E. coli* HPPK, 1.4 Å, 159 residues | `ligand:ATP@4.5` → 17 residues | **Monomeric**, which is the whole reason for this choice |
 | `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
+| `glyrs` | `5e6m_A` — human GlyRS·tRNA-Gly, 2.93 Å, 519 residues | `ligand:GAP@4.5 partner:E@4.5` → 20 + 48 residues | Catalytic site **and** tRNA interface from one structure |
+
+**Why 5E6M.** `GAP` is glycyl-adenylate — the reaction intermediate itself,
+27 atoms covering the glycyl N/CA/C/O, the α-phosphate and the whole
+adenosine — so the catalytic site is derived from coordinates rather than
+transcribed. All 27 of its atoms lie within 4.5 Å of chain A and none come
+within 11 Å of chain B, so that pocket is **entirely intra-subunit** and a
+single-chain design can reconstitute it in full.
+
+The tRNA is not. Each tRNA binds predominantly one subunit, and the pairing
+matters:
+
+| | contacts on protein A | contacts on protein B |
+|---|---|---|
+| tRNA chain C | 11 | **62** |
+| tRNA chain E | **58** | 14 |
+
+(at 4.5 Å; at the 6 Å preparation cutoff, 75 and 21 for chain E). So the
+preset pairs chain A with chain E deliberately — keeping chain C instead would
+resolve a small, wrong interface and still run to completion — and roughly a
+fifth of that interface belongs to the other subunit and cannot be reproduced
+by a monomer. GlyRS is an obligate dimer in any case (chain B contacts 98
+residues of chain A), so a result here describes **one subunit of a dimer**,
+not a free-standing protein. The preset says all of this in `--list-presets`.
+
+One more trap worth knowing before running it: the file renumbers the
+construct from 1, so **file number + 54 = UniProt P41250 numbering**. Residue
+numbers from the literature do not match a spec written against this file.
 
 **Why 5ETN and not an obvious small ATP protein.** The small, high-resolution
 single-chain ATP structures that a search turns up first — PII/SbtB, `6MM2`
@@ -763,12 +858,13 @@ resolved values. The ones you are most likely to touch:
 | `MPNN_MODEL_TYPE` | `protein_mpnn` | Also `soluble_mpnn`, `ligand_mpnn`; selects the checkpoint |
 | `MPNN_CHECKPOINT` | by model type | Override only to use your own weights |
 | `SEARCH_MODE` | `alphabet_only` | Also `site_aware`, `scaffold_then_site` |
-| `SITE_PRESET` | — | `atp` or `tev`; fills in spec, ligands and model type |
-| `SITE_SPEC` | — | Site in author numbering, e.g. `H46 D81 C151` or `ligand:ATP@4.5` |
+| `SITE_PRESET` | — | `atp`, `tev` or `glyrs`; fills in spec, ligands, partners, model type and (where it matters) policy |
+| `SITE_SPEC` | — | Site in author numbering, e.g. `H46 D81 C151`, `ligand:ATP@4.5` or `partner:E@4.5` |
 | `SITE_CHAIN` | — | Default chain for spec tokens that do not name one |
 | `SITE_KEEP_LIGANDS` | — | Components to retain through cleaning, e.g. `ATP` |
+| `SITE_KEEP_PARTNERS` | — | Whole chains to retain as context, e.g. `E` for a bound tRNA |
 | `SITE_CONTACT_MAX` | `0` (all) | Cap a ligand contact shell, closest first |
-| `SITE_RESIDUE_POLICY` | `exempt` | Also `in_alphabet`, `measure_only` |
+| `SITE_RESIDUE_POLICY` | `exempt` | Also `in_alphabet`, `measure_only`, or per-role: `exempt,interface=measure_only` |
 | `SITE_GATE` | `1` | `0` records site metrics without gating on them |
 | `SITE_MAX_BB_RMSD` | `1.5` | Å, site backbone after global superposition; `0` disables |
 | `SITE_MAX_LOCAL_RMSD` | `1.0` | Å, site backbone after site-only superposition |

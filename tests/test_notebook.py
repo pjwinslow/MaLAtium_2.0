@@ -67,6 +67,12 @@ def _code_cells():
     ]
 
 
+def _markdown_cells():
+    return [
+        "".join(c["source"]) for c in _cells() if c["cell_type"] == "markdown"
+    ]
+
+
 def _bootstrap_source(cell: str) -> str:
     """The bootstrap block, lifted out of a cell."""
     start = cell.index("# --- bootstrap")
@@ -312,7 +318,7 @@ def test_site_step_precedes_the_run_and_offers_both_modes():
     # Every mode reachable from the form, and the presets offered by name.
     for mode in ("alphabet_only", "site_aware", "scaffold_then_site"):
         assert mode in site, mode
-    for key in ("atp", "tev"):
+    for key in ("atp", "tev", "glyrs"):
         assert f'"{key}"' in site, key
     assert "rc.configure_site(" in site
     # The site is resolved and shown against the real inputs before any GPU
@@ -325,6 +331,41 @@ def test_inputs_step_can_keep_ligands_and_load_a_preset():
     assert "KEEP_LIGANDS" in inputs
     assert "keep_ligands=" in inputs
     assert "rc.preset(" in inputs
+
+
+def test_inputs_step_can_keep_partner_chains():
+    inputs = next(c for c in _code_cells() if "Fetch and/or upload inputs" in c)
+    assert "KEEP_PARTNERS" in inputs
+    assert "keep_partners=" in inputs
+    # It has to reach the run, not just the local variable.
+    assert 'os.environ["SITE_KEEP_PARTNERS"]' in inputs
+    # A preset that names partner chains must fill them in like its ligands.
+    assert "_preset.keep_partners" in inputs
+    assert '"glyrs"' in inputs
+
+
+def test_site_step_passes_partners_and_policy_to_the_preview():
+    site = next(c for c in _code_cells() if "Mode and functional site" in c)
+    assert "keep_partners=" in site
+    # The policy is what decides whether a site forces most of the alphabet,
+    # so the preview has to be told it or the warning can never fire.
+    assert "policy=_applied" in site
+
+
+def test_site_step_offers_per_role_policies_and_allows_typing_one():
+    site = next(c for c in _code_cells() if "Mode and functional site" in c)
+    assert "interface=measure_only" in site
+    # A fixed dropdown could not express an arbitrary role=policy string.
+    assert "allow-input: true" in site
+
+
+def test_site_spec_table_documents_the_partner_token():
+    md = "\n".join(_markdown_cells())
+    assert "`partner:E`" in md
+    assert "`partner:E@6.0`" in md
+    # And says what it needs, since a partner token without a kept chain is
+    # the obvious way to get an empty interface.
+    assert "KEEP_PARTNERS" in md
 
 
 def test_results_step_shows_site_columns_only_in_a_site_run():

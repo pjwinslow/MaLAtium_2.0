@@ -1791,6 +1791,88 @@ def test_reconstruction_survives_a_replicate_with_no_logs_at_all():
         assert "final_alphabet" not in out
 
 
+# ---------------------------------------------------------------------------
+# Per-role site policies
+# ---------------------------------------------------------------------------
+
+
+def test_policy_accepts_a_blanket_value_and_per_role_overrides():
+    from redaa.config import parse_site_policy
+
+    resolved, problems = parse_site_policy("exempt")
+    assert problems == []
+    assert set(resolved.values()) == {"exempt"}
+
+    resolved, problems = parse_site_policy("exempt,interface=measure_only")
+    assert problems == []
+    assert resolved == {
+        "catalytic": "exempt",
+        "contact": "exempt",
+        "interface": "measure_only",
+    }
+
+    # Order must not matter: an override before the blanket default still wins.
+    resolved, problems = parse_site_policy("catalytic=exempt in_alphabet")
+    assert problems == []
+    assert resolved == {
+        "catalytic": "exempt",
+        "contact": "in_alphabet",
+        "interface": "in_alphabet",
+    }
+
+    # An empty setting is the old default, not an error.
+    assert parse_site_policy("") == (
+        {"catalytic": "exempt", "contact": "exempt", "interface": "exempt"},
+        [],
+    )
+
+
+def test_policy_rejects_nonsense_by_name():
+    from redaa.config import parse_site_policy
+
+    for text, needle in (
+        ("bogus", "is not one of"),
+        ("foo=exempt", "which is not one of catalytic"),
+        ("interface=sideways", "interface='sideways'"),
+        ("exempt,measure_only", "two blanket policies"),
+    ):
+        _resolved, problems = parse_site_policy(text)
+        assert problems, text
+        assert any(needle in p for p in problems), (text, problems)
+
+
+def test_config_validate_reports_a_bad_role_policy():
+    cfg = RedAAConfig()
+    cfg.site_residue_policy = "interface=sideways"
+    problems = cfg.validate()
+    assert any("sideways" in p for p in problems), problems
+
+    cfg.site_residue_policy = "exempt,interface=measure_only"
+    assert not [p for p in cfg.validate() if "POLICY" in p]
+
+
+def test_scaffold_then_site_rejects_only_an_all_free_policy():
+    """Grafting needs something to graft -- but one held role is enough."""
+    cfg = RedAAConfig()
+    cfg.search_mode = "scaffold_then_site"
+    cfg.site_spec = "H46"
+
+    cfg.site_residue_policy = "measure_only"
+    assert any("nothing to graft" in p for p in cfg.validate()), cfg.validate()
+
+    cfg.site_residue_policy = "catalytic=exempt,interface=measure_only"
+    assert not [p for p in cfg.validate() if "nothing to graft" in p]
+
+
+def test_summary_has_a_column_for_every_site_number_that_matters():
+    """An alphabet means nothing without how many positions were held."""
+    for name in (
+        "site_policy", "site_partners", "site_n_interface",
+        "site_n_held", "site_n_measured", "site_forced_types",
+    ):
+        assert name in Pipeline.SUMMARY_FIELDS, name
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

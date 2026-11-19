@@ -208,6 +208,7 @@ def main(argv=None) -> int:
     # the structure to fetch when none was named. Anything set explicitly on
     # the command line or in the environment still wins.
     keep_ligands = cfg.keep_ligand_tuple
+    keep_partners = cfg.keep_partner_tuple
     if args.preset:
         from redaa.sites import preset as _load_preset
 
@@ -220,6 +221,17 @@ def main(argv=None) -> int:
         if not keep_ligands:
             keep_ligands = chosen.keep_ligands
             cfg.site_keep_ligands = ",".join(chosen.keep_ligands)
+        if not keep_partners:
+            keep_partners = chosen.keep_partners
+            cfg.site_keep_partners = ",".join(chosen.keep_partners)
+        # A case whose two halves need different policies says so, and the
+        # blanket default would quietly make its search meaningless.
+        if chosen.site_policy and "SITE_RESIDUE_POLICY" not in os.environ:
+            cfg.site_residue_policy = chosen.site_policy
+            print(
+                f"NOTE: this preset needs SITE_RESIDUE_POLICY="
+                f"{chosen.site_policy}; using it.\n"
+            )
         if "MPNN_MODEL_TYPE" not in os.environ:
             cfg.mpnn_model_type = chosen.mpnn_model_type
         if args.fetch is None:
@@ -238,6 +250,7 @@ def main(argv=None) -> int:
         reports = gather_inputs(
             specs=args.fetch, input_dir=cfg.input_pdb_dir, chain=args.chain,
             keep_ligands=keep_ligands or None,
+            keep_partners=keep_partners or None,
         )
         if not reports:
             print("\nNo inputs could be prepared.")

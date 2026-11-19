@@ -708,6 +708,190 @@ def test_a_ligand_on_another_chain_is_not_advertised_for_this_one():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Polymer partners: a second subunit, or a nucleic acid
+# ---------------------------------------------------------------------------
+
+
+def _partner_pdb():
+    """Three chains ~5 A apart in a triangle, plus a modified nucleotide.
+
+    Chain A is the protein to design, chain B a second protein subunit, chain
+    D a short RNA.  Every pair is about 5 A apart, so the RNA genuinely
+    contacts both subunits -- which is the situation that makes single-chain
+    design of an interface only partly possible, and the thing the warning
+    has to catch.
+    """
+    lines = []
+    serial = 1
+
+    def put(record, name, resname, chain, resseq, xyz):
+        nonlocal serial
+        lines.append(_atom(serial, name, resname, chain, resseq, xyz,
+                           record=record))
+        serial += 1
+
+    for i in range(1, 7):  # chain A: y=0, z=0
+        for name, dx in ((" N  ", -0.6), (" CA ", 0.0), (" C  ", 0.7)):
+            put("ATOM  ", name, "ALA", "A", i, (3.8 * i + dx, 0.0, 0.0))
+    for i in range(1, 5):  # chain B: y=0, z=5
+        for name, dx in ((" N  ", -0.6), (" CA ", 0.0), (" C  ", 0.7)):
+            put("ATOM  ", name, "LEU", "B", i, (3.8 * i + dx, 0.0, 5.0))
+    for i, base in ((2, "  G"), (3, "  A"), (4, "  U")):  # RNA: y=4.33, z=2.5
+        for name, dx in ((" P  ", -0.6), (" C1'", 0.0), (" N9 ", 0.7)):
+            put("ATOM  ", name, base, "D", i, (3.8 * i + dx, 4.33, 2.5))
+    # A modified base, coded HETATM as depositions often do, right beside the
+    # protein. Without the nucleic exclusion this is advertised as a ligand.
+    put("HETATM", " C1'", "PSU", "D", 5, (3.8 * 5, 4.33, 2.5))
+    put("HETATM", " O  ", "HOH", "A", 800, (50.0, 50.0, 50.0))
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def test_partner_chains_are_reported_when_none_are_kept():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A")
+        assert report["partners_kept"] == []
+        notes = " | ".join(report["partner_notes"])
+        assert "chain D (nucleic, 4 residues)" in notes, notes
+        assert "chain B (protein, 4 residues)" in notes, notes
+        # The note has to say how to act on it, with the chain id filled in.
+        assert "SITE_KEEP_PARTNERS=D" in notes, notes
+        # A chain-selection list is still protein-only: a tRNA is not a
+        # candidate for the chain to design.
+        assert [c for c, _n in report["chains_available"]] == ["A", "B"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_nucleic_chain_is_not_advertised_as_a_ligand():
+    """75 nucleotides offered as 75 candidate ligands would bury the real one."""
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A")
+        notes = " ".join(report["ligand_notes"])
+        assert "PSU" not in notes, notes
+        assert "G" not in notes.split() and "U" not in notes.split(), notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_kept_partner_is_written_as_hetatm_keeping_its_chain():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A", keep_partners=("D",))
+        assert len(report["partners_kept"]) == 1
+        chain, kind, n_res, n_atoms, n_contacts = report["partners_kept"][0]
+        assert (chain, kind, n_res) == ("D", "nucleic", 4)
+        assert n_atoms == 10  # 3 nucleotides x 3 atoms, plus the PSU atom
+        # All six of chain A: the RNA runs alongside it, and at the 6 A
+        # default even the diagonal neighbours are 5.6 A away.
+        assert n_contacts == 6
+
+        text = open(out).read()
+        partner = [
+            l for l in text.splitlines()
+            if l.startswith(("ATOM", "HETATM")) and len(l) > 21 and l[21] == "D"
+        ]
+        assert len(partner) == 10
+        # Every one a HETATM, every one still on chain D. Both matter: the
+        # record name is what keeps the polymer parsers away from it, and the
+        # chain id is what the partner spec selects on.
+        assert all(l.startswith("HETATM") for l in partner), partner[:2]
+        assert all(l[21] == "D" for l in partner)
+        # Columns must not have shifted when the record name was rewritten.
+        assert all(l[17:20].strip() in ("G", "A", "U", "PSU") for l in partner)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_kept_partner_is_invisible_to_the_polymer_parser():
+    """A partner must never be folded, designed or scored as part of the chain."""
+    from redaa import structure as st
+
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        F.prepare(_partner_pdb(), out, chain="A", keep_partners=("D", "B"))
+        text = open(out).read()
+        poly = st.parse_residues_from_text(text, atom_names=None)
+        assert len(poly) == 6, [r.resname for r in poly]
+        assert {r.chain for r in poly} == {"A"}
+        with_het = st.parse_residues_from_text(
+            text, atom_names=None, include_hetatm=True
+        )
+        assert len(with_het) == 6 + 4 + 4
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_partner_binding_another_subunit_too_is_flagged():
+    """The honest limit of single-chain design, stated rather than implied."""
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A", keep_partners=("D",))
+        notes = " | ".join(report["partner_notes"])
+        assert "also contacts" in notes, notes
+        assert "chain B" in notes, notes
+        assert "cannot be reproduced by a single-chain design" in notes, notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_partner_that_is_not_there_is_named_not_ignored():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A", keep_partners=("Z",))
+        assert report["partners_kept"] == []
+        notes = " | ".join(report["partner_notes"])
+        assert "'Z' requested but not in the entry" in notes, notes
+        assert "A, B, D" in notes, notes
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_the_designed_chain_cannot_be_its_own_partner():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        report = F.prepare(_partner_pdb(), out, chain="A", keep_partners=("A",))
+        assert report["partners_kept"] == []
+        assert any(
+            "is the chain being designed" in n for n in report["partner_notes"]
+        ), report["partner_notes"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_kept_partners_are_recorded_in_the_provenance():
+    tmp = tempfile.mkdtemp()
+    try:
+        out = os.path.join(tmp, "o.pdb")
+        F.prepare(_partner_pdb(), out, chain="A", keep_partners=("D",),
+                  spec="synthetic_A")
+        info = F.read_provenance(out)
+        assert info["partners"].startswith("D:nucleic:"), info
+        line = F.describe_provenance(out)
+        # What context a file carries decides what a run can attempt, so it
+        # belongs on the one line that identifies the file.
+        assert "partners D" in line, line
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chain_classification():
+    assert F._classify_chain(["ALA", "GLY", "SER"]) == "protein"
+    assert F._classify_chain(["G", "A", "U", "PSU"]) == "nucleic"
+    assert F._classify_chain(["ATP", "HEM"]) == "other"
+    assert F._classify_chain([]) == "other"
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

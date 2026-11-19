@@ -13,6 +13,7 @@ about mismatches being caught as about the happy path working.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 
@@ -417,17 +418,48 @@ def test_incomplete_backbone_at_a_site_residue_is_unmeasurable():
 
 
 def test_presets_exist_and_parse():
-    assert set(S.PRESETS) == {"atp", "tev"}
+    assert set(S.PRESETS) == {"atp", "tev", "glyrs"}
+    from redaa.config import parse_site_policy
+
     for key in S.PRESETS:
         pre = S.preset(key)
         spec = S.parse_site_spec(pre.site_spec)
         assert spec, key
         assert pre.fetch_spec and pre.title and pre.notes
         assert pre.mpnn_model_type in ("protein_mpnn", "soluble_mpnn", "ligand_mpnn")
-        # A ligand-aware model is only meaningful if a ligand is kept.
+        # A ligand-aware model is only meaningful if a ligand is kept, or a
+        # partner chain is -- either gives it atoms to design against.
         if pre.mpnn_model_type == "ligand_mpnn":
-            assert pre.keep_ligands, key
+            assert pre.keep_ligands or pre.keep_partners, key
+        # A spec cannot name a partner chain the preset does not retain: the
+        # shell would resolve to nothing and the site would silently shrink.
+        for tok in spec.partners:
+            assert tok.chain in [c.upper() for c in pre.keep_partners], key
+        # Conversely, retaining a chain and never referring to it would carry
+        # a tRNA through every fold for no reason.
+        for chain in pre.keep_partners:
+            assert any(t.chain == chain.upper() for t in spec.partners), key
+        # A recommended policy has to be one the config layer accepts.
+        if pre.site_policy:
+            _resolved, problems = parse_site_policy(pre.site_policy)
+            assert not problems, (key, problems)
         assert key.lower() in S.describe_presets().lower()
+
+
+def test_glyrs_preset_pairs_chain_a_with_the_trna_it_binds():
+    """The pairing is the whole point, and getting it backwards is silent.
+
+    In 5E6M each tRNA binds predominantly one subunit: chain E binds protein
+    A, chain C binds protein B. Fetching chain A and keeping chain C would
+    resolve a small, wrong interface and still run to completion.
+    """
+    pre = S.preset("glyrs")
+    assert pre.fetch_spec.endswith("_A")
+    spec = S.parse_site_spec(pre.site_spec)
+    assert [t.chain for t in spec.partners] == ["E"]
+    assert [t.comp_id for t in spec.ligands] == ["GAP"]
+    # One blanket policy would force 18 letters before the search starts.
+    assert "interface=measure_only" in pre.site_policy
 
 
 def test_atp_preset_is_a_ligand_derived_pocket():
@@ -456,6 +488,241 @@ def test_unknown_preset_names_the_alternatives():
         assert "atp" in str(exc) and "tev" in str(exc)
     else:
         raise AssertionError("expected SiteError")
+
+
+# ---------------------------------------------------------------------------
+# Polymer partners and per-role policies
+# ---------------------------------------------------------------------------
+
+
+def _write_with_partner(path, seq, partner_chain="E", partner_at=(1, 2)):
+    """A chain plus a short nucleic partner written as HETATM, as prepare does."""
+    _write(path, seq)
+    lines = open(path).read().splitlines()
+    lines = [l for l in lines if l != "END"]
+    serial = 5000
+    for n, i in enumerate(partner_at, start=1):
+        for k, name in enumerate(("P", "C1'", "N9")):
+            lines.append(
+                f"HETATM{serial:>5d}  {name:<3s}   G {partner_chain}{n:>4d}    "
+                f"{3.8 * i:>8.3f}{3.0:>8.3f}{0.3 * k:>8.3f}  1.00  0.00"
+            )
+            serial += 1
+    lines.append("END")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+def test_parse_partner_token_forms():
+    spec = S.parse_site_spec("partner:E partner=c@6.5")
+    assert [(t.chain, t.cutoff) for t in spec.partners] == [("E", 4.5), ("C", 6.5)]
+    assert spec.describe() == "partner:E@4.5 partner:C@6.5"
+    assert bool(S.parse_site_spec("partner:E"))
+
+
+def test_partner_cutoff_out_of_range_is_rejected():
+    for text in ("partner:E@0.5", "partner:E@40"):
+        try:
+            S.parse_site_spec(text)
+        except S.SiteError as exc:
+            assert "out of range" in str(exc), exc
+        else:
+            raise AssertionError(f"{text} should have been rejected")
+
+
+def test_partner_shell_finds_the_interface():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _write_with_partner(os.path.join(tmp, "p.pdb"), "ACDEFGH")
+        recs = _records(path)
+        assert sum(len(g.atoms) for g in S.partner_atoms(recs, "E")) == 6
+        # Chain letters are matched case-insensitively, as elsewhere.
+        assert S.partner_atoms(recs, "e")
+        # 3.5 A, not 4: at 4 the straight-line fixture puts residue 0 in the
+        # shell too, which says nothing about partner handling.
+        found, warns = S.partner_shell(recs, "E", cutoff=3.5)
+        assert warns == []
+        assert sorted(i for i, _d, _n in found) == [1, 2]
+        assert all(2.5 < d < 2.7 for _i, d, _n in found), found
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_partner_shell_says_so_when_the_chain_was_never_retained():
+    """The quiet failure this replaces: an interface silently resolving to nothing."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _write(os.path.join(tmp, "p.pdb"), "ACDEFGH",
+                      ligand=[("ATP", (3.8, 3.0, 0.0), 3)])
+        found, warns = S.partner_shell(_records(path), "E")
+        assert found == []
+        assert len(warns) == 1
+        assert "no retained atoms" in warns[0], warns
+        assert "SITE_KEEP_PARTNERS" in warns[0], warns
+        # Naming what IS retained is what turns this into a fixable message.
+        assert "retained non-polymer chains: A" in warns[0], warns
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_resolve_site_gives_partner_contacts_the_interface_role():
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _write_with_partner(os.path.join(tmp, "p.pdb"), "ACDEFGH")
+        recs = _records(path)
+        site = S.resolve_site(S.parse_site_spec("partner:E@3.5"), recs)
+        assert site.indices == (1, 2)
+        assert {p.role for p in site.positions} == {S.ROLE_INTERFACE}
+        assert site.interface_indices == (1, 2)
+        assert site.partners == ("E",)
+        assert site.partner_atom_counts == {"E": 6}
+        assert "interface residues to chain E" in site.describe()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_a_catalytic_residue_in_the_interface_keeps_its_role():
+    """Roles decide policy, so the stronger claim has to win."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = _write_with_partner(os.path.join(tmp, "p.pdb"), "ACDEFGH")
+        site = S.resolve_site(
+            S.parse_site_spec("C2 partner:E@3.5"), _records(path)
+        )
+        by_index = {p.index: p for p in site.positions}
+        assert by_index[1].role == S.ROLE_CATALYTIC
+        assert by_index[1].min_distance is not None  # gained the measurement
+        assert by_index[2].role == S.ROLE_INTERFACE
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _plan_fixture(tmp):
+    path = _write_with_partner(
+        os.path.join(tmp, "p.pdb"), "ACDEFGH", partner_at=(4, 5)
+    )
+    # ATP beside residues 0-1, partner beside residues 4-5.
+    lines = open(path).read().splitlines()
+    lines = [l for l in lines if l != "END"]
+    serial = 7000
+    for k in range(3):
+        lines.append(
+            f"HETATM{serial + k:>5d}  C{k:<2d} ATP A 900    "
+            f"{0.6 * k:>8.3f}{3.0:>8.3f}{0.0:>8.3f}  1.00  0.00"
+        )
+    lines.append("END")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return S.resolve_site(
+        S.parse_site_spec("ligand:ATP@3.5 partner:E@3.5"), _records(path)
+    )
+
+
+def test_site_plan_splits_held_from_free_by_role():
+    from redaa.config import parse_site_policy
+
+    tmp = tempfile.mkdtemp()
+    try:
+        site = _plan_fixture(tmp)
+        contacts = set(site.indices) - set(site.interface_indices)
+        iface = set(site.interface_indices)
+        assert contacts and iface, (contacts, iface)
+
+        policies, problems = parse_site_policy("exempt,interface=measure_only")
+        assert problems == []
+        plan = S.site_plan(site, policies)
+        # The pocket is held; the interface is free but still measured.
+        assert set(plan.fixed) == contacts
+        assert plan.exempt == frozenset(contacts)
+        assert plan.forced_types == frozenset()
+        assert plan.n_measured == len(iface)
+        assert plan.any_fixed
+
+        # in_alphabet on the pocket alone forces only the pocket's letters.
+        policies, _ = parse_site_policy(
+            "contact=in_alphabet,interface=measure_only"
+        )
+        plan = S.site_plan(site, policies)
+        assert set(plan.fixed) == contacts
+        assert plan.exempt == frozenset()
+        assert plan.forced_types == frozenset(
+            p.native_aa for p in site.positions if p.index in contacts
+        )
+
+        # measure_only everywhere holds nothing at all.
+        plan = S.site_plan(site, parse_site_policy("measure_only")[0])
+        assert plan.fixed == {}
+        assert not plan.any_fixed
+        assert plan.n_measured == len(site)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_site_plan_of_no_site_is_empty_but_reports_its_policies():
+    from redaa.config import parse_site_policy
+
+    plan = S.site_plan(None, parse_site_policy("in_alphabet")[0])
+    assert plan.fixed == {} and not plan.any_fixed
+    assert plan.by_role["interface"] == "in_alphabet"
+
+
+def test_identity_is_only_required_where_the_plan_holds_a_position():
+    """Under measure_only the design is SUPPOSED to change those residues."""
+    tmp = tempfile.mkdtemp()
+    try:
+        site = _plan_fixture(tmp)
+        native = "ACDEFGH"
+        # Mutate one interface position and one held position.
+        iface_i = site.interface_indices[0]
+        held_i = (set(site.indices) - set(site.interface_indices)).pop()
+        mutated_iface = list(native)
+        mutated_iface[iface_i] = "W"
+        mutated_iface = "".join(mutated_iface)
+
+        assert not S.site_identity_kept(site, mutated_iface)
+        held = {
+            i: native[i] for i in site.indices
+            if i not in site.interface_indices
+        }
+        assert S.site_identity_kept(site, mutated_iface, only=held)
+
+        mutated_held = list(native)
+        mutated_held[held_i] = "W"
+        assert not S.site_identity_kept(site, "".join(mutated_held), only=held)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_apply_site_leaves_free_positions_alone():
+    tmp = tempfile.mkdtemp()
+    try:
+        site = _plan_fixture(tmp)
+        designed = "WWWWWWW"
+        held = {
+            i: "ACDEFGH"[i] for i in site.indices
+            if i not in site.interface_indices
+        }
+        out = S.apply_site_to_sequence(site, designed, only=held)
+        for i in held:
+            assert out[i] == held[i]
+        for i in site.interface_indices:
+            assert out[i] == "W"
+        # Without `only` every site position is forced, as before.
+        full = S.apply_site_to_sequence(site, designed)
+        for i in site.indices:
+            assert full[i] == "ACDEFGH"[i]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_config_roles_match_the_site_roles():
+    """Two lists that have to agree, kept out of each other's imports."""
+    from redaa.config import SITE_ROLES
+
+    assert set(SITE_ROLES) == {
+        S.ROLE_CATALYTIC, S.ROLE_CONTACT, S.ROLE_INTERFACE
+    }
 
 
 def main():

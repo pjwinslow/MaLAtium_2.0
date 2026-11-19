@@ -290,6 +290,80 @@ def test_default_checkpoint_path_follows_the_model_type():
     assert _os.path.dirname(p_protein).endswith("model_params")
 
 
+# ---------------------------------------------------------------------------
+# The validator under per-role policies
+# ---------------------------------------------------------------------------
+
+
+class _FakeSitePos:
+    def __init__(self, index, aa, role):
+        self.index, self.native_aa, self.role = index, aa, role
+        self.chain, self.resseq, self.icode = "A", index + 1, ""
+        self.min_distance, self.n_contacts, self.expect_aa = 1.0, 1, None
+
+
+class _FakeSite:
+    """Two pocket residues and two interface residues, nothing else needed."""
+
+    def __init__(self):
+        self.positions = (
+            _FakeSitePos(1, "C", "contact"),
+            _FakeSitePos(2, "D", "contact"),
+            _FakeSitePos(5, "G", "interface"),
+            _FakeSitePos(6, "H", "interface"),
+        )
+        self.name, self.ligands, self.partners = "s", (), ("E",)
+
+    def __len__(self):
+        return len(self.positions)
+
+    @property
+    def indices(self):
+        return tuple(p.index for p in self.positions)
+
+
+def _validator(policy):
+    cfg = RedAAConfig()
+    cfg.site_residue_policy = policy
+    return se.Validator(
+        cfg, None, np.zeros((8, 3)), "ACDEFGHI",
+        site=_FakeSite(), ref_frames=np.zeros((8, 3, 3)),
+    )
+
+
+def test_validator_exempts_only_the_roles_the_policy_exempts():
+    v = _validator("exempt,interface=measure_only")
+    # Held and uncounted: the pocket. Free: the interface.
+    assert v.exempt == frozenset({1, 2})
+    assert set(v.plan.fixed) == {1, 2}
+    assert v.plan.n_measured == 2
+    # Something is held, so identity is still required -- at those two only.
+    assert v.require_identity
+
+
+def test_validator_requires_no_identity_when_nothing_is_held():
+    v = _validator("measure_only")
+    assert v.exempt == frozenset()
+    assert v.plan.fixed == {}
+    assert not v.require_identity
+
+
+def test_in_alphabet_positions_are_held_but_not_exempt():
+    """Held so MPNN keeps them; counted so the alphabet stays honest."""
+    v = _validator("in_alphabet")
+    assert set(v.plan.fixed) == {1, 2, 5, 6}
+    assert v.exempt == frozenset()
+    assert v.plan.forced_types == frozenset("CDGH")
+
+
+def test_in_alphabet_check_ignores_exempt_positions_only():
+    """A letter outside the alphabet is a failure unless the plan exempts it."""
+    seq = "ACDEFGHI"
+    assert not se.in_alphabet(seq, set("ADEFHI"), frozenset())
+    # Exempting the two positions holding C and G makes the rest in-alphabet.
+    assert se.in_alphabet(seq, set("ADEFHI"), frozenset({1, 5}))
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

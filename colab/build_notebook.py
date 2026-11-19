@@ -592,17 +592,26 @@ code_with_bootstrap(
 #@markdown Pick a `SITE_PRESET` to load a verified test case and leave
 #@markdown `PDB_SPECS` alone — it fills in the structure and the ligands to
 #@markdown keep. `none` uses whatever you type.
-SITE_PRESET = "none" #@param ["none", "atp", "tev"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs"]
 INPUT_MODE = "fetch" #@param ["fetch", "upload", "drive_folder", "both"]
 PDB_SPECS = "1ubq_A\\n2gb1_A" #@param {type:"string"}
 CHAIN_OVERRIDE = "" #@param {type:"string"}
 KEEP_LIGANDS = "" #@param {type:"string"}
+KEEP_PARTNERS = "" #@param {type:"string"}
 DRIVE_INPUT_FOLDER = "redaa/inputs" #@param {type:"string"}
 #@markdown `KEEP_LIGANDS` is a comma-separated list of PDB component ids
 #@markdown (`ATP`), kept through cleaning. Everything else, water included, is
 #@markdown still stripped. A ligand-binding search needs this: without it
 #@markdown LigandMPNN designs against a bare backbone and no pocket can be
 #@markdown derived from coordinates.
+#@markdown
+#@markdown `KEEP_PARTNERS` is a comma-separated list of **chain ids** to keep
+#@markdown as binding context — a bound tRNA, or a second subunit. They are
+#@markdown stored as heteroatom records, so nothing folds or designs them;
+#@markdown they exist so an interface can be derived from coordinates and so
+#@markdown LigandMPNN has something to design against. Leave it blank the
+#@markdown first time: the chains that touch yours are listed below, with
+#@markdown their contact counts, which is how you find out which to name.
 
 import os
 
@@ -621,6 +630,9 @@ if SITE_PRESET != "none":
     if not KEEP_LIGANDS.strip() and _preset.keep_ligands:
         KEEP_LIGANDS = ",".join(_preset.keep_ligands)
         print("keeping the preset's ligand(s): %s" % KEEP_LIGANDS)
+    if not KEEP_PARTNERS.strip() and _preset.keep_partners:
+        KEEP_PARTNERS = ",".join(_preset.keep_partners)
+        print("keeping the preset's partner chain(s): %s" % KEEP_PARTNERS)
     print()
 
 if INPUT_MODE in ("upload", "both"):
@@ -645,6 +657,9 @@ specs = PDB_SPECS if INPUT_MODE in ("fetch", "both") else ""
 _keep = tuple(
     x.strip().upper() for x in KEEP_LIGANDS.replace(",", " ").split() if x.strip()
 )
+_partners = tuple(
+    x.strip() for x in KEEP_PARTNERS.replace(",", " ").split() if x.strip()
+)
 
 reports = rc.gather_inputs(
     specs=specs,
@@ -652,12 +667,14 @@ reports = rc.gather_inputs(
     input_dir=INPUT_DIR,
     chain=CHAIN_OVERRIDE.strip() or None,
     keep_ligands=_keep or None,
+    keep_partners=_partners or None,
 )
 
 print()
 print(rc.describe_inputs(reports))
 os.environ["INPUT_PDB_DIR"] = INPUT_DIR
 os.environ["SITE_KEEP_LIGANDS"] = ",".join(_keep)
+os.environ["SITE_KEEP_PARTNERS"] = ",".join(_partners)
 if _preset is not None:
     os.environ["SITE_PRESET"] = SITE_PRESET
 """
@@ -700,11 +717,21 @@ the entry:
 | `range:148-151` | an inclusive span |
 | `ligand:ATP` | every residue within 4.5 Å of any ATP atom |
 | `ligand:ATP@6.0` | the same at a 6 Å cutoff |
+| `partner:E` | every residue within 4.5 Å of retained chain `E` |
+| `partner:E@6.0` | the same at a 6 Å cutoff |
 
 Naming the expected residue is optional and worth doing every time: it is what
 turns a numbering mismatch into an error instead of a silently wrong run.
 Naming a *ligand* instead of residues derives the pocket from the coordinates,
 which beats transcribing a list and is specific to the structure in hand.
+
+A `partner:` token needs that chain kept by `KEEP_PARTNERS` in step 4; if it
+was not, the spec resolves to nothing and says so rather than quietly shrinking
+the site. Partners cover both a bound nucleic acid and a second protein
+subunit. Two limits are worth knowing before you read a result: a partner is
+**rigid** context — it is never folded or redesigned — and where it also
+touches another subunit, the step-4 report says what fraction of the interface
+a single-chain design can never reproduce.
 
 **`SITE_RESIDUE_POLICY`** decides whether the site's residue types count as
 alphabet letters:
@@ -725,6 +752,22 @@ alphabet letters:
 `exempt` is the default, but it can flatter a result — the exempt count and
 residue types are always reported next to the alphabet, and a site covering
 more than a quarter of the chain warns.
+
+**Policies can be set per role**, which matters as soon as a site has two
+halves of different kinds. Write a blanket policy, then overrides:
+
+```
+exempt,interface=measure_only
+catalytic=exempt,contact=in_alphabet,interface=measure_only
+```
+
+The roles are `catalytic` (residues you named), `contact` (derived from a
+ligand) and `interface` (derived from a partner chain). The reason is concrete:
+for `glyrs` the adenylate pocket is 20 residues and the tRNA interface 48, and
+between them they use 18 of the 20 amino acids. Under one blanket
+`in_alphabet` the "minimal" alphabet is 18 letters before the search starts.
+Holding the pocket and leaving the interface free asks a question that has an
+answer.
 
 **Site preservation is measured on the backbone**, with CB derived from N–CA–C
 rather than read, so it works for glycine and does not depend on a predicted
@@ -748,10 +791,12 @@ code_with_bootstrap(
     """
 #@title Step 5 — Mode and functional site
 SEARCH_MODE = "alphabet_only" #@param ["alphabet_only", "site_aware", "scaffold_then_site"]
-SITE_PRESET = "none" #@param ["none", "atp", "tev"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs"]
 SITE_SPEC = "" #@param {type:"string"}
 SITE_CHAIN = "" #@param {type:"string"}
-SITE_RESIDUE_POLICY = "exempt" #@param ["exempt", "in_alphabet", "measure_only"]
+#@markdown One policy for every role, or a blanket policy plus per-role
+#@markdown overrides, e.g. `exempt,interface=measure_only`.
+SITE_RESIDUE_POLICY = "exempt" #@param ["exempt", "in_alphabet", "measure_only", "exempt,interface=measure_only", "catalytic=exempt,contact=in_alphabet,interface=measure_only"] {allow-input: true}
 SITE_CONTACT_MAX = 0 #@param {type:"integer"}
 MPNN_MODEL_TYPE = "" #@param ["", "protein_mpnn", "soluble_mpnn", "ligand_mpnn"]
 #@markdown Gate thresholds in Angstroms. Set any to 0 to record the number
@@ -774,6 +819,7 @@ _applied = rc.configure_site(
     preset="" if SITE_PRESET == "none" else SITE_PRESET,
     chain=SITE_CHAIN,
     keep_ligands=os.environ.get("SITE_KEEP_LIGANDS", ""),
+    keep_partners=os.environ.get("SITE_KEEP_PARTNERS", ""),
     contact_max=SITE_CONTACT_MAX,
     policy=SITE_RESIDUE_POLICY,
     gate=SITE_GATE,
@@ -806,6 +852,7 @@ if _applied["SEARCH_MODE"] != "alphabet_only" and _applied["SITE_SPEC"]:
         chain=_applied["SITE_CHAIN"] or None,
         contact_max=SITE_CONTACT_MAX,
         mpnn_model_type=_applied.get("MPNN_MODEL_TYPE", ""),
+        policy=_applied.get("SITE_RESIDUE_POLICY", ""),
     ))
 """
 )

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from . import fetch as F
 from . import sites as S
 from . import structure as ST
+from .config import parse_site_policy
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +358,7 @@ def gather_inputs(
     cache_dir: str | None = None,
     verbose: bool = True,
     keep_ligands: tuple[str, ...] | None = None,
+    keep_partners: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Turn accessions and/or local files into pipeline-ready input PDBs.
 
@@ -373,6 +375,11 @@ def gather_inputs(
     search and wrong for a ligand-binding one: LigandMPNN would design
     against a bare backbone and a pocket could not be derived from
     coordinates at all.
+
+    *keep_partners* names whole chains to retain as context -- ``("E",)`` for
+    a bound tRNA, or the id of a second subunit.  Leave it unset and the
+    chains that touch the chosen one are listed instead, with their contact
+    counts, which is how to find out which one to name.
 
     Returns one report dict per prepared input; failures are reported and
     skipped rather than aborting the batch, so one dead accession in a list of
@@ -411,7 +418,8 @@ def gather_inputs(
     for spec in parsed:
         try:
             report = F.fetch_and_prepare(
-                spec, input_dir, cache_dir=cache_dir, keep_ligands=keep_ligands
+                spec, input_dir, cache_dir=cache_dir,
+                keep_ligands=keep_ligands, keep_partners=keep_partners,
             )
         except (F.FetchError, ValueError) as exc:
             errors.append(f"{spec.raw}: {exc}")
@@ -427,6 +435,10 @@ def gather_inputs(
                 extra.append(f"{report['gaps']} chain gap(s)")
             for comp, n_atoms in report.get("ligands_kept") or []:
                 extra.append(f"{comp} kept ({n_atoms} atoms)")
+            for chain, kind, nres, natoms, ncon in report.get("partners_kept") or []:
+                extra.append(
+                    f"partner {chain} ({kind}, {nres} res, {ncon} contacts)"
+                )
             suffix = f"  [{', '.join(extra)}]" if extra else ""
             print(
                 f"  ok    {report['name']}: chain {report['chain']}, "
@@ -437,6 +449,11 @@ def gather_inputs(
             # so it is said out loud here rather than left in the report.
             for note in report.get("ligand_notes") or []:
                 print(f"        ligand: {note}")
+            # Which chain a partner mostly binds decides whether a
+            # single-chain design can reconstitute the interface at all, so
+            # it is said out loud rather than left in the report.
+            for note in report.get("partner_notes") or []:
+                print(f"        partner: {note}")
 
     if verbose:
         print(f"\n{len(reports)} input(s) ready in {input_dir}")
@@ -452,17 +469,22 @@ def describe_inputs(reports: list[dict]) -> str:
     if not reports:
         return "no inputs prepared"
     rows = [
-        ("name", "source", "chain", "residues", "dropped", "gaps", "ligands")
+        ("name", "source", "chain", "residues", "dropped", "gaps", "ligands",
+         "partners")
     ]
     for r in reports:
         ligands = ", ".join(
             f"{c}({n})" for c, n in (r.get("ligands_kept") or [])
         ) or "-"
+        partners = ", ".join(
+            f"{c}({kind[:4]},{ncon}c)"
+            for c, kind, _nres, _natoms, ncon in (r.get("partners_kept") or [])
+        ) or "-"
         rows.append(
             (
                 r["name"], r["source"], r["chain"],
                 str(r["n_residues"]), str(r["dropped_incomplete"]), str(r["gaps"]),
-                ligands,
+                ligands, partners,
             )
         )
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
@@ -520,6 +542,7 @@ def configure_site(
     preset: str = "",
     chain: str = "",
     keep_ligands: str = "",
+    keep_partners: str = "",
     contact_max: int = 0,
     policy: str = "exempt",
     gate: bool = True,
@@ -551,13 +574,17 @@ def configure_site(
         chosen = S.preset(preset)
         spec = spec.strip() or chosen.site_spec
         keep_ligands = keep_ligands.strip() or ",".join(chosen.keep_ligands)
+        keep_partners = keep_partners.strip() or ",".join(chosen.keep_partners)
         mpnn_model_type = mpnn_model_type.strip() or chosen.mpnn_model_type
+        # A case whose halves need different policies carries its own, and the
+        # blanket default would make its search meaningless. Only when the
+        # caller left the default alone: anything typed still wins.
+        if chosen.site_policy and policy.strip() == "exempt":
+            policy = chosen.site_policy
 
-    if policy not in ("exempt", "in_alphabet", "measure_only"):
-        raise ValueError(
-            "policy must be exempt, in_alphabet or measure_only, not "
-            f"{policy!r}"
-        )
+    policies, problems = parse_site_policy(policy)
+    if problems:
+        raise ValueError("; ".join(problems))
 
     # Always decide the model type here, rather than only when one is given.
     # A notebook's cells get re-run in any order: configuring the ATP preset
@@ -573,6 +600,7 @@ def configure_site(
         "SITE_PRESET": preset.strip(),
         "SITE_CHAIN": chain.strip(),
         "SITE_KEEP_LIGANDS": keep_ligands.strip(),
+        "SITE_KEEP_PARTNERS": keep_partners.strip(),
         "SITE_CONTACT_MAX": str(int(contact_max)),
         "SITE_RESIDUE_POLICY": policy,
         "SITE_GATE": "1" if gate else "0",
@@ -604,6 +632,7 @@ def preview_site(
     chain: str | None = None,
     contact_max: int = 0,
     mpnn_model_type: str = "",
+    policy: str = "",
 ) -> str:
     """Resolve a site against a prepared input and describe it, before running.
 
@@ -652,10 +681,46 @@ def preview_site(
         frac = 100.0 * len(site) / max(1, len(poly))
         lines.append(f"  coverage : {frac:.0f}% of the chain")
 
+        # What the policy actually does to this site, in positions rather
+        # than in the abstract. A policy that forces most of the alphabet
+        # before the search begins is visible here and nowhere else.
+        if policy.strip():
+            policies, problems = parse_site_policy(policy)
+            if problems:
+                for prob in problems:
+                    lines.append(f"  ERROR    : {prob}")
+            else:
+                plan = S.site_plan(site, policies)
+                lines.append(f"  policy   : {plan.describe()}")
+                if len(plan.forced_types) >= 12:
+                    lines.append(
+                        f"  warning  : this policy forces "
+                        f"{len(plan.forced_types)} of 20 amino acids into the "
+                        "alphabet before the search starts, so the result "
+                        "would describe the site rather than the fold. Set "
+                        "the larger role to measure_only."
+                    )
+
     het = [r for r in records if r.is_hetatm]
-    if het:
+    # Partner chains are heteroatom records too, so counting them together
+    # with the ligands would report a tRNA as "75 ligands". Split them by what
+    # the file says was retained.
+    prov = F.read_provenance(pdb_path)
+    partner_chains = {
+        f.split(":")[0].upper()
+        for f in (prov.get("partners") or "").split(",") if f.strip()
+    }
+    if not partner_chains:
+        poly_chains = {r.chain.upper() for r in poly}
+        partner_chains = {
+            r.chain.upper() for r in het if r.chain.upper() not in poly_chains
+        }
+    ligand_het = [r for r in het if r.chain.upper() not in partner_chains]
+    partner_het = [r for r in het if r.chain.upper() in partner_chains]
+
+    if ligand_het:
         counts: dict[str, int] = {}
-        for r in het:
+        for r in ligand_het:
             counts[r.resname] = counts.get(r.resname, 0) + len(r.atoms)
         lines.append(
             "  ligands in file: "
@@ -666,6 +731,28 @@ def preview_site(
             "  ligands in file: none (set SITE_KEEP_LIGANDS before fetching "
             "if the site needs one)"
         )
+    if partner_het:
+        per_chain: dict[str, list[int]] = {}
+        for r in partner_het:
+            got = per_chain.setdefault(r.chain.upper(), [0, 0])
+            got[0] += 1
+            got[1] += len(r.atoms)
+        lines.append(
+            "  partners in file: "
+            + ", ".join(
+                f"chain {c} ({n_res} residues, {n_at} atoms)"
+                for c, (n_res, n_at) in sorted(per_chain.items())
+            )
+        )
+        named = {t.chain.upper() for t in parsed.partners}
+        unused = sorted(set(per_chain) - named)
+        if unused:
+            lines.append(
+                "  warning  : chain(s) "
+                + ", ".join(unused)
+                + " are kept but no partner: token refers to them, so they "
+                "add atom context without defining any interface residues"
+            )
 
     # A ligand model on a ligand-free input cannot run at all: LigandMPNN
     # looks for nearest neighbours among zero ligand atoms and dies on an
@@ -708,6 +795,7 @@ def preview_sites(
     chain: str | None = None,
     contact_max: int = 0,
     mpnn_model_type: str = "",
+    policy: str = "",
 ) -> str:
     """:func:`preview_site` over every prepared input in a directory."""
     import glob as _glob
@@ -718,7 +806,7 @@ def preview_sites(
     return "\n\n".join(
         preview_site(
             p, spec, chain=chain, contact_max=contact_max,
-            mpnn_model_type=mpnn_model_type,
+            mpnn_model_type=mpnn_model_type, policy=policy,
         )
         for p in paths
     )

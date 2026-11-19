@@ -520,7 +520,7 @@ def _bindable_components(
     on the chosen chain or sits within *cutoff* of it, so a copy bound to
     another chain of the crystal is not advertised as this chain's ligand.
     """
-    from .sites import ION_COMPONENTS, SOLVENT_COMPONENTS
+    from .sites import ION_COMPONENTS, NUCLEIC_COMPONENTS, SOLVENT_COMPONENTS
 
     prot = [
         xyz for xyz in (_atom_xyz(l) for l in kept_protein_lines)
@@ -538,6 +538,12 @@ def _bindable_components(
             continue
         name = line[17:20].strip().upper()
         if name in SOLVENT_COMPONENTS or name in ION_COMPONENTS:
+            continue
+        # A nucleic acid is not a small-molecule ligand. Depositions code
+        # modified bases as HETATM inside an otherwise ATOM-coded polymer, so
+        # without this a tRNA contributes a dozen "candidate ligands" that
+        # bury the real one.
+        if name in NUCLEIC_COMPONENTS:
             continue
         try:
             resseq = int(line[22:26])
@@ -560,6 +566,229 @@ def _bindable_components(
                 continue
         counts[name] = counts.get(name, 0) + len(atoms)
     return counts
+
+
+def _all_chain_ids(text: str) -> list[str]:
+    """Every chain id in *text*, polymer or not, in order of appearance.
+
+    ``list_chains`` deliberately reports protein chains only -- its residue
+    counts are what picks the chain to design, and a nucleic acid is not a
+    candidate.  Partner handling needs the full list.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        if len(line) < 54 or line[16] not in _OK_ALTLOC:
+            continue
+        if line[21] not in out:
+            out.append(line[21])
+    return out
+
+
+def _chain_atoms(
+    text: str, chain: str
+) -> tuple[list[str], dict[tuple[int, str], str]]:
+    """Every usable atom line on *chain*, and the residue it belongs to."""
+    from .sites import SOLVENT_COMPONENTS
+
+    lines: list[str] = []
+    residues: dict[tuple[int, str], str] = {}
+    for line in text.splitlines():
+        if line.startswith("ENDMDL"):
+            break
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        if len(line) < 54 or line[21] != chain or line[16] not in _OK_ALTLOC:
+            continue
+        name = line[17:20].strip().upper()
+        if name == "HOH" or name in SOLVENT_COMPONENTS:
+            continue
+        try:
+            resseq = int(line[22:26])
+        except ValueError:
+            continue
+        lines.append(line.rstrip("\n"))
+        residues[(resseq, line[26])] = name
+    return lines, residues
+
+
+def _classify_chain(resnames: list[str]) -> str:
+    """``"protein"``, ``"nucleic"`` or ``"other"`` for one chain's residues."""
+    from .sites import NUCLEIC_COMPONENTS
+
+    if not resnames:
+        return "other"
+    prot = sum(1 for n in resnames if n in AA3_TO_1)
+    nuc = sum(1 for n in resnames if n in NUCLEIC_COMPONENTS)
+    if prot >= nuc and prot * 2 >= len(resnames):
+        return "protein"
+    if nuc * 2 >= len(resnames):
+        return "nucleic"
+    return "other"
+
+
+def _count_contacts(
+    partner_lines: list[str], kept_protein_lines: list[str], cutoff: float
+) -> tuple[int, float | None]:
+    """How many designed-chain residues come within *cutoff* of the partner.
+
+    Returns ``(n_residues, min_distance)``.  This is the number that decides
+    whether a partner belongs to the chain being designed: in an obligate
+    dimer each copy of the partner may touch both subunits, and only this
+    says which one it mostly binds.
+    """
+    import numpy as np
+
+    part = [
+        xyz for xyz in (_atom_xyz(l) for l in partner_lines) if xyz is not None
+    ]
+    if not part:
+        return 0, None
+    other = np.asarray(part, dtype=np.float64)
+
+    keys: list[tuple[str, int, str]] = []
+    coords: list[tuple[float, float, float]] = []
+    for line in kept_protein_lines:
+        xyz = _atom_xyz(line)
+        if xyz is None:
+            continue
+        try:
+            resseq = int(line[22:26])
+        except ValueError:
+            continue
+        keys.append((line[21], resseq, line[26]))
+        coords.append(xyz)
+    if not coords:
+        return 0, None
+
+    prot = np.asarray(coords, dtype=np.float64)
+    # Chunked so a whole tRNA against a whole subunit does not allocate a
+    # several-hundred-megabyte distance matrix.
+    per_atom = np.full(len(prot), np.inf)
+    for lo in range(0, len(prot), 2048):
+        block = prot[lo : lo + 2048]
+        d2 = ((block[:, None, :] - other[None, :, :]) ** 2).sum(axis=2)
+        per_atom[lo : lo + len(block)] = d2.min(axis=1)
+
+    close = per_atom <= cutoff * cutoff
+    n_res = len({k for k, c in zip(keys, close) if c})
+    return n_res, float(np.sqrt(per_atom.min()))
+
+
+def _partner_candidates(
+    text: str,
+    chosen_chain: str,
+    kept_protein_lines: list[str],
+    cutoff: float,
+) -> list[tuple[str, str, int, int]]:
+    """Other chains that touch the chosen one: ``(chain, kind, n_res, n_contacts)``.
+
+    Sorted by contact count, descending -- the first entry is the partner the
+    designed chain actually binds.
+    """
+    out = []
+    for chain in _all_chain_ids(text):
+        if chain == chosen_chain:
+            continue
+        lines, residues = _chain_atoms(text, chain)
+        if not residues:
+            continue
+        kind = _classify_chain(list(residues.values()))
+        n_contacts, _ = _count_contacts(lines, kept_protein_lines, cutoff)
+        if not n_contacts:
+            continue
+        out.append((chain, kind, len(residues), n_contacts))
+    out.sort(key=lambda t: (-t[3], t[0]))
+    return out
+
+
+def _collect_partners(
+    text: str,
+    chosen_chain: str,
+    kept_protein_lines: list[str],
+    keep_partners: tuple[str, ...] | None,
+    cutoff: float,
+) -> tuple[list[str], list[tuple[str, str, int, int, int]], list[str]]:
+    """Retain whole partner chains as heteroatom records.
+
+    Returns ``(lines, [(chain, kind, n_res, n_atoms, n_contacts), ...], notes)``.
+
+    A retained partner is written as HETATM keeping its original chain id.
+    That is deliberate: every polymer parser in this pipeline reads ATOM
+    records only, so the partner is never folded, designed or scored, while
+    remaining visible to the contact-shell code and to LigandMPNN's atom
+    context.  A partner is context, not a design target.
+    """
+    notes: list[str] = []
+    candidates = _partner_candidates(text, chosen_chain, kept_protein_lines, cutoff)
+
+    if not keep_partners:
+        for chain, kind, n_res, n_contacts in candidates[:6]:
+            notes.append(
+                f"chain {chain} ({kind}, {n_res} residues) contacts "
+                f"{n_contacts} residues of chain {chosen_chain} -- keep it with "
+                f"SITE_KEEP_PARTNERS={chain} to derive an interface site"
+            )
+        return [], [], notes
+
+    by_chain = {c: (k, n, x) for c, k, n, x in candidates}
+    lines: list[str] = []
+    kept: list[tuple[str, str, int, int, int]] = []
+    for want in keep_partners:
+        want = want.strip()
+        if not want:
+            continue
+        chain_lines, residues = _chain_atoms(text, want)
+        if not residues:
+            seen = _all_chain_ids(text)
+            notes.append(
+                f"partner chain {want!r} requested but not in the entry "
+                f"(chains present: {', '.join(seen)})"
+            )
+            continue
+        if want == chosen_chain:
+            notes.append(
+                f"partner chain {want} is the chain being designed; ignored"
+            )
+            continue
+        kind = _classify_chain(list(residues.values()))
+        n_contacts, min_d = _count_contacts(chain_lines, kept_protein_lines, cutoff)
+        if not n_contacts:
+            far = "" if min_d is None else f" (closest approach {min_d:.1f} A)"
+            notes.append(
+                f"partner chain {want} ({kind}, {len(residues)} residues) has "
+                f"no atom within {cutoff:g} A of chain {chosen_chain}{far}; "
+                "kept anyway, but it defines no interface residues"
+            )
+        # Rewrite as HETATM. 'ATOM  ' and 'HETATM' are both six columns, so
+        # every other field stays in its PDB column.
+        for line in chain_lines:
+            lines.append("HETATM" + line[6:] if line.startswith("ATOM") else line)
+        kept.append((want, kind, len(residues), len(chain_lines), n_contacts))
+
+    # The decisive check for an obligate oligomer: if a retained partner binds
+    # some *other* subunit more than this one, a single-chain design can only
+    # ever reconstitute part of the interface, and the user has to know.
+    for chain, kind, n_res, n_atoms, n_contacts in kept:
+        rival = [
+            (c, x) for c, k, n, x in candidates
+            if c != chain and k == "protein" and x > 0
+        ]
+        for other, _ in rival[:1]:
+            other_lines, _ = _chain_atoms(text, other)
+            cross, _d = _count_contacts(_chain_atoms(text, chain)[0], other_lines, cutoff)
+            if cross > 0.15 * max(n_contacts, 1):
+                notes.append(
+                    f"partner {chain} also contacts {cross} residues of chain "
+                    f"{other} (vs {n_contacts} of {chosen_chain}): "
+                    f"{100.0 * cross / (cross + n_contacts):.0f}% of its "
+                    "interface belongs to another subunit and cannot be "
+                    "reproduced by a single-chain design"
+                )
+    return lines, kept, notes
 
 
 def _collect_ligands(
@@ -713,6 +942,15 @@ def describe_provenance(path: str) -> str:
         bits.append(f"chain {info['chain']}")
     if info.get("range"):
         bits.append(f"residues {info['range']}")
+    # What context the file carries decides what the run can even attempt, so
+    # it belongs on the identifying line rather than only in the remarks.
+    if info.get("ligands"):
+        bits.append(f"ligands {info['ligands']}")
+    if info.get("partners"):
+        bits.append(
+            "partners "
+            + ",".join(f.split(":")[0] for f in info["partners"].split(","))
+        )
     if info.get("prepared"):
         bits.append(f"prepared {info['prepared']}")
     return ", ".join(bits)
@@ -725,6 +963,7 @@ def prepare(
     resid_range: tuple[int, int] | None = None,
     keep_ligands: tuple[str, ...] | None = None,
     ligand_contact_cutoff: float = 6.0,
+    keep_partners: tuple[str, ...] | None = None,
     spec: str = "",
 ) -> dict:
     """Write a single-chain, pipeline-ready PDB and report what was dropped.
@@ -748,6 +987,14 @@ def prepare(
     needed: deposition practice puts a bound ligand sometimes on its
     protein's chain and sometimes on its own, and a copy bound to a different
     chain of the crystal is not part of this chain's site.
+
+    ``keep_partners`` names whole *chains* to retain as binding context --
+    another protein subunit, or a nucleic acid such as a tRNA.  They are
+    written as heteroatom records so no later stage mistakes them for
+    something to fold or design; they exist to define an interface and to give
+    LigandMPNN something to design against.  When nothing is named, the chains
+    that touch the chosen one are reported in ``partner_notes`` instead, with
+    their contact counts, so the right one can be picked.
     """
     chains = list_chains(text)
     if not chains:
@@ -810,6 +1057,9 @@ def prepare(
     ligand_lines, ligands_kept, ligand_notes = _collect_ligands(
         text, chosen, lines, keep_ligands, ligand_contact_cutoff
     )
+    partner_lines, partners_kept, partner_notes = _collect_partners(
+        text, chosen, lines, keep_partners, ligand_contact_cutoff
+    )
 
     # A prepared file is the thing every later stage trusts, and until now it
     # carried no record of what it was. An input directory that outlives the
@@ -830,6 +1080,14 @@ def prepare(
             f"REMARK   1 {PROVENANCE_TAG} ligands "
             + ",".join(f"{c}:{n}" for c, n in ligands_kept)
         )
+    if partners_kept:
+        remarks.append(
+            f"REMARK   1 {PROVENANCE_TAG} partners "
+            + ",".join(
+                f"{c}:{kind}:{nres}res:{natoms}atoms:{ncon}contacts"
+                for c, kind, nres, natoms, ncon in partners_kept
+            )
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     with open(out_path, "w") as fh:
@@ -839,6 +1097,9 @@ def prepare(
         fh.write("\nTER\n")
         if ligand_lines:
             fh.write("\n".join(ligand_lines))
+            fh.write("\n")
+        if partner_lines:
+            fh.write("\n".join(partner_lines))
             fh.write("\n")
         fh.write("END\n")
 
@@ -855,6 +1116,8 @@ def prepare(
         "chains_available": [(c.chain, c.n_residues) for c in chains],
         "ligands_kept": ligands_kept,
         "ligand_notes": ligand_notes,
+        "partners_kept": partners_kept,
+        "partner_notes": partner_notes,
     }
 
 
@@ -863,6 +1126,7 @@ def fetch_and_prepare(
     out_dir: str,
     cache_dir: str | None = None,
     keep_ligands: tuple[str, ...] | None = None,
+    keep_partners: tuple[str, ...] | None = None,
 ) -> dict:
     """Resolve one spec all the way to a pipeline-ready PDB in *out_dir*.
 
@@ -875,7 +1139,8 @@ def fetch_and_prepare(
     out_path = os.path.join(out_dir, f"{parsed.name}.pdb")
     report = prepare(
         text, out_path, parsed.chain, parsed.resid_range,
-        keep_ligands=keep_ligands, spec=parsed.raw,
+        keep_ligands=keep_ligands, keep_partners=keep_partners,
+        spec=parsed.raw,
     )
     report["name"] = parsed.name
     report["source"] = parsed.source
