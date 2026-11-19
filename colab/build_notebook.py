@@ -781,6 +781,25 @@ and which one fails tells you what went wrong:
 - `Site_CB_Dev` — worst error in the site's internal CB–CB distance matrix,
   superposition-free.
 
+**`Site_CB_Dev` is not comparable across site sizes**, and this one has bitten
+a real run. It is a worst-of-all-pairs number and the pair count grows as
+*n*², so at *identical* backbone accuracy it rises with the size of the site.
+Measured on the 5E6M coordinates under 1 Å of correlated backbone error: the
+worst pair averages 2.6 Å over 6 positions and 4.6 Å over 68, while the RMS
+over pairs is 1.38 Å for both. So a 1.5 Å threshold is a fair test on a
+catalytic triad and an impossible one on a twenty-residue pocket — the symptom
+being every candidate failing on `cbDev` while both RMSD numbers look fine,
+which is exactly how a GlyRS run drove its alphabet to 19 letters. For
+anything bigger than a few positions, set `SITE_MAX_CB_DEV=0` and gate
+`SITE_MAX_CB_RMS_DEV` instead. The run warns when you have not.
+
+**`SITE_GATE_ROLES`** limits which roles the thresholds apply to. A site with
+a 20-residue pocket and a 48-residue interface spanning the whole chain cannot
+be judged by one set of numbers: gating `catalytic,contact` tests the pocket,
+while the interface is still measured and reported in the `rec*` columns. The
+console shows whichever CB column is actually gated, so a `PASS` is never
+printed next to a number that had no say in it.
+
 These are a necessary condition for a working site, not a sufficient one. They
 say the scaffold puts the functional residues where they belong; whether the
 chemistry works is a wet-lab question.
@@ -806,6 +825,13 @@ SITE_GATE = True #@param {type:"boolean"}
 SITE_MAX_BB_RMSD = 1.5 #@param {type:"number"}
 SITE_MAX_LOCAL_RMSD = 1.0 #@param {type:"number"}
 SITE_MAX_CB_DEV = 1.5 #@param {type:"number"}
+#@markdown `SITE_MAX_CB_DEV` gates the **worst** CB–CB pair. That statistic
+#@markdown grows with site size at unchanged accuracy, so for anything past a
+#@markdown handful of positions set it to 0 and gate `SITE_MAX_CB_RMS_DEV`
+#@markdown instead, which is size-stable. `SITE_GATE_ROLES` limits the gate to
+#@markdown some roles; the rest are still measured and reported.
+SITE_MAX_CB_RMS_DEV = 0.0 #@param {type:"number"}
+SITE_GATE_ROLES = "" #@param ["", "catalytic,contact", "catalytic"] {allow-input: true}
 SITE_REQUIRE_IDENTITY = True #@param {type:"boolean"}
 
 import os
@@ -826,6 +852,8 @@ _applied = rc.configure_site(
     max_bb_rmsd=SITE_MAX_BB_RMSD,
     max_local_rmsd=SITE_MAX_LOCAL_RMSD,
     max_cb_dev=SITE_MAX_CB_DEV,
+    max_cb_rms_dev=SITE_MAX_CB_RMS_DEV,
+    gate_roles=SITE_GATE_ROLES,
     require_identity=SITE_REQUIRE_IDENTITY,
     mpnn_model_type=MPNN_MODEL_TYPE,
 )

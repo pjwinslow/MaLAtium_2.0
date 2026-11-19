@@ -439,10 +439,18 @@ def test_presets_exist_and_parse():
         # a tRNA through every fold for no reason.
         for chain in pre.keep_partners:
             assert any(t.chain == chain.upper() for t in spec.partners), key
-        # A recommended policy has to be one the config layer accepts.
-        if pre.site_policy:
-            _resolved, problems = parse_site_policy(pre.site_policy)
-            assert not problems, (key, problems)
+        # Every recommended setting has to be one the config layer can take,
+        # with a value it accepts. A preset that cannot be applied is worse
+        # than no preset: it fails after the structure has been fetched.
+        from redaa.config import RedAAConfig
+
+        cfg = RedAAConfig()
+        for env_key, value in pre.settings:
+            assert env_key in RedAAConfig.ENV_TO_FIELD, (key, env_key)
+            cfg.apply_env_setting(env_key, value)
+        assert cfg.validate() == [] or all(
+            "SITE_SPEC" in p or "needs a site" in p for p in cfg.validate()
+        ), (key, cfg.validate())
         assert key.lower() in S.describe_presets().lower()
 
 
@@ -458,8 +466,14 @@ def test_glyrs_preset_pairs_chain_a_with_the_trna_it_binds():
     spec = S.parse_site_spec(pre.site_spec)
     assert [t.chain for t in spec.partners] == ["E"]
     assert [t.comp_id for t in spec.ligands] == ["GAP"]
+    settings = dict(pre.settings)
     # One blanket policy would force 18 letters before the search starts.
-    assert "interface=measure_only" in pre.site_policy
+    assert "interface=measure_only" in settings["SITE_RESIDUE_POLICY"]
+    # The interface spans the whole chain, so it is measured, not gated.
+    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
+    # The worst-pair CB check grows with site size; the RMS one does not.
+    assert float(settings["SITE_MAX_CB_DEV"]) == 0.0
+    assert float(settings["SITE_MAX_CB_RMS_DEV"]) > 0.0
 
 
 def test_atp_preset_is_a_ligand_derived_pocket():
@@ -712,6 +726,138 @@ def test_apply_site_leaves_free_positions_alone():
         full = S.apply_site_to_sequence(site, designed)
         for i in site.indices:
             assert full[i] == "ACDEFGH"[i]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_cb_max_dev_grows_with_site_size_but_the_rms_does_not():
+    """The reason SITE_MAX_CB_RMS_DEV exists, pinned down as a measurement.
+
+    ``cb_max_dev`` is a worst-of-all-pairs statistic and the pair count grows
+    as n^2, so at IDENTICAL backbone accuracy it rises with the size of the
+    site. A threshold calibrated on a six-residue triad is therefore a much
+    harsher test on a twenty-residue pocket -- which is exactly how a real
+    run came to reject every candidate. The RMS over pairs is size-stable.
+    """
+    rng = np.random.default_rng(4)
+    n_res = 120
+    # A plausible backbone: a straight-ish chain with some curvature, so the
+    # CB-CB distance matrix is not degenerate.
+    t = np.arange(n_res)
+    nca = np.stack(
+        [
+            np.stack([3.8 * t + dx, 2.0 * np.sin(t / 6.0), np.cos(t / 9.0)], 1)
+            for dx in (-0.6, 0.0, 0.7)
+        ],
+        axis=1,
+    )
+    ref = st.frames_with_cb(nca)
+
+    def perturbed():
+        """Correlated error: a fold model is not wrong independently per atom."""
+        raw = rng.normal(size=(n_res, 3))
+        k = np.exp(-0.5 * (np.arange(-30, 31) / 10.0) ** 2)
+        k /= k.sum()
+        sm = np.stack(
+            [np.convolve(raw[:, d], k, mode="same") for d in range(3)], 1
+        )
+        sm *= 1.0 / sm.std()
+        return st.frames_with_cb(nca + sm[:, None, :])
+
+    def average(n):
+        maxes, rmss = [], []
+        for _ in range(25):
+            pos = sorted(rng.choice(n_res, size=n, replace=False).tolist())
+            mx, rms = S.st.site_distance_deviation(
+                ref, perturbed(), pos, atom="CB"
+            )
+            maxes.append(mx)
+            rmss.append(rms)
+        return float(np.mean(maxes)), float(np.mean(rmss))
+
+    small_max, small_rms = average(6)
+    large_max, large_rms = average(60)
+
+    # The worst pair gets materially worse with no change in accuracy.
+    assert large_max > small_max * 1.25, (small_max, large_max)
+    # The RMS does not move: that is what makes it comparable across cases.
+    assert abs(large_rms - small_rms) < 0.25 * small_rms, (small_rms, large_rms)
+
+
+def test_the_rms_cb_check_gates_independently():
+    m = S.SiteMetrics(
+        bb_rmsd=0.5, local_rmsd=0.4, cb_max_dev=6.0, cb_rms_dev=1.2,
+        n_positions=20,
+    )
+    # Worst-pair check off, RMS check on: this passes, and should.
+    assert m.passed(1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=2.0)
+    # Tighten the RMS check and it fails on that alone.
+    assert not m.passed(
+        1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=1.0
+    )
+    # Both off: neither CB check can reject it.
+    assert m.passed(1.5, 1.0, 0.0, require_identity=False)
+    # An unmeasurable RMS is not a pass when the check is asked for.
+    blind = S.SiteMetrics(bb_rmsd=0.5, local_rmsd=0.4, n_positions=20)
+    assert not blind.passed(
+        1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=2.0
+    )
+
+
+def test_gate_roles_split_the_site_into_gated_and_recorded():
+    from redaa.config import parse_site_policy
+
+    tmp = tempfile.mkdtemp()
+    try:
+        site = _plan_fixture(tmp)
+        iface = set(site.interface_indices)
+        pocket = set(site.indices) - iface
+        policies, _ = parse_site_policy("exempt,interface=measure_only")
+
+        plan = S.site_plan(site, policies, gate_roles=("catalytic", "contact"))
+        assert plan.gated == frozenset(pocket)
+        assert plan.recorded == frozenset(iface)
+        assert "recorded only" in plan.describe()
+
+        # No gate_roles means every position is gated, as before.
+        plan = S.site_plan(site, policies)
+        assert plan.gated == frozenset(site.indices)
+        assert plan.recorded == frozenset()
+        assert "recorded only" not in plan.describe()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_measure_site_gates_a_subset_and_records_the_rest():
+    """Loosening the gate must not mean losing the measurement."""
+    tmp = tempfile.mkdtemp()
+    try:
+        site = _plan_fixture(tmp)
+        recs = _records(os.path.join(tmp, "p.pdb"))
+        poly = [r for r in recs if not r.is_hetatm]
+        frames, _v = st.frames_from_records(poly)
+        ref = st.frames_with_cb(frames[:, :3, :])
+
+        pocket = frozenset(set(site.indices) - set(site.interface_indices))
+        # Displace the interface badly and leave the pocket alone.
+        pred = ref.copy()
+        for i in site.interface_indices:
+            pred[i] += 6.0
+
+        m = S.measure_site(site, ref, pred, gate_positions=pocket)
+        assert m.n_positions == len(pocket)
+        assert m.n_recorded == len(site.interface_indices)
+        # The gated pocket is untouched, so its local geometry is perfect...
+        assert m.local_rmsd is not None and m.local_rmsd < 1e-6
+        # ...while the recorded half shows the damage rather than hiding it.
+        assert m.recorded is not None
+        assert m.recorded.bb_rmsd > 1.0
+
+        # Without gate_positions the two are pooled and nothing is recorded
+        # separately -- the old behaviour.
+        pooled = S.measure_site(site, ref, pred)
+        assert pooled.n_positions == len(site)
+        assert pooled.recorded is None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

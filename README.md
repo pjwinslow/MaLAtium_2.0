@@ -668,6 +668,47 @@ from a site that has been pulled apart. All three are rigid-body invariant and
 all three are recorded whether or not they gate (`SITE_GATE=0` records without
 gating).
 
+#### `Site_CB_Dev` does not mean the same thing at every site size
+
+It is a worst-of-all-pairs statistic and the pair count grows as *n*², so at
+**identical** backbone accuracy it rises with the size of the site. Measured
+on the 5E6M coordinates under 1 Å of correlated backbone error, averaged over
+40 random subsets per size:
+
+| site size | pairs | `cb_max_dev` | `cb_rms_dev` |
+|---|---|---|---|
+| 6 | 15 | 2.64 Å | 1.34 Å |
+| 20 | 190 | 3.73 Å | 1.38 Å |
+| 68 | 2278 | 4.59 Å | 1.39 Å |
+
+So `SITE_MAX_CB_DEV=1.5` is a fair test on the TEV triad and an impossible one
+on the GlyRS pocket. The symptom is every candidate failing on `cbDev` while
+both RMSD numbers sit comfortably inside their thresholds, and the search
+responding by growing the alphabet until it runs out of letters — which is
+exactly what a real GlyRS run did before this was understood.
+
+For anything past a handful of positions, switch the worst-pair check off and
+gate the size-stable one instead:
+
+```bash
+SITE_MAX_CB_DEV=0 SITE_MAX_CB_RMS_DEV=2.0
+```
+
+A run warns when the gated site is more than eight positions and the
+worst-pair check is still active, and the console prints whichever CB column
+is actually gated — so a `PASS` never appears next to a number that had no say
+in it.
+
+#### Gating part of a site
+
+`SITE_GATE_ROLES` limits the thresholds to some roles. A site with a compact
+pocket and an interface spanning the whole chain cannot be judged by one set
+of numbers: `Site_Local_RMSD ≤ 1.0 Å` over a chain-spanning 48-residue set is
+a *harder* test than the global fold gate. Gating `catalytic,contact` tests
+the pocket, while the interface is still measured and reported in the
+`site_rec_*` / `best_seq_site_rec_*` columns and the `recBB` console field.
+Leaving it empty gates everything, which is right for a compact site.
+
 **The fold gate and the site gate are separate, and a verdict says which
 bound.** A candidate line reads
 
@@ -715,6 +756,11 @@ taken from memory.
 | `atp` | `5etn_A` — *E. coli* HPPK, 1.4 Å, 159 residues | `ligand:ATP@4.5` → 17 residues | **Monomeric**, which is the whole reason for this choice |
 | `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
 | `glyrs` | `5e6m_A` — human GlyRS·tRNA-Gly, 2.93 Å, 519 residues | `ligand:GAP@4.5 partner:E@4.5` → 20 + 48 residues | Catalytic site **and** tRNA interface from one structure |
+
+A preset also carries the settings its case needs where the blanket defaults
+get it wrong, applied only where you have not set them yourself;
+`--list-presets` shows them. For `glyrs` that is the per-role policy, the gate
+scope, and the swap from the worst-pair CB check to the size-stable one.
 
 **Why 5E6M.** `GAP` is glycyl-adenylate — the reaction intermediate itself,
 27 atoms covering the glycyl N/CA/C/O, the α-phosphate and the whole
@@ -868,7 +914,9 @@ resolved values. The ones you are most likely to touch:
 | `SITE_GATE` | `1` | `0` records site metrics without gating on them |
 | `SITE_MAX_BB_RMSD` | `1.5` | Å, site backbone after global superposition; `0` disables |
 | `SITE_MAX_LOCAL_RMSD` | `1.0` | Å, site backbone after site-only superposition |
-| `SITE_MAX_CB_DEV` | `1.5` | Å, worst site CB–CB distance error |
+| `SITE_MAX_CB_DEV` | `1.5` | Å, **worst** site CB–CB distance error; grows with site size, so set `0` past a few positions |
+| `SITE_MAX_CB_RMS_DEV` | `0` (off) | Å, **RMS** site CB–CB distance error; size-stable, prefer it for a large site |
+| `SITE_GATE_ROLES` | all | Roles the thresholds apply to, e.g. `catalytic,contact`; the rest are measured, not gated |
 | `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
 | `FOLD_PRECISION` | `auto` | `auto` asks the GPU: bf16 where supported, else fp16; fp32 on CPU. Also `bf16`, `fp16`, `fp32` |

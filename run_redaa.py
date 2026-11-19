@@ -180,7 +180,29 @@ def main(argv=None) -> int:
             ("pipeline orchestration", test_pipeline),
         ):
             print(f"\n=== {label} ===")
-            failed |= module.main()
+            # Every suite runs in this one process, and most settings here
+            # are read from the environment, so a suite that sets one can
+            # change what a later suite is testing. That is not a
+            # hypothetical: a colab helper that configures a site left
+            # SEARCH_MODE and SITE_SPEC behind, and the pipeline suite then
+            # failed only in the combined run and passed on its own, which is
+            # the worst way for a test to break. Each suite gets the
+            # environment it would have had on its own.
+            before = dict(os.environ)
+            try:
+                failed |= module.main()
+            finally:
+                leaked = sorted(
+                    k for k in set(os.environ) | set(before)
+                    if os.environ.get(k) != before.get(k)
+                )
+                if leaked:
+                    print(
+                        f"  note: {label} changed {', '.join(leaked)}; "
+                        "restored for the next suite"
+                    )
+                os.environ.clear()
+                os.environ.update(before)
         print("\nALL SUITES PASSED" if not failed else "\nSOME SUITES FAILED")
         return failed
 
@@ -226,11 +248,19 @@ def main(argv=None) -> int:
             cfg.site_keep_partners = ",".join(chosen.keep_partners)
         # A case whose two halves need different policies says so, and the
         # blanket default would quietly make its search meaningless.
-        if chosen.site_policy and "SITE_RESIDUE_POLICY" not in os.environ:
-            cfg.site_residue_policy = chosen.site_policy
+        # Settings this case needs that the blanket defaults get wrong.
+        # Anything already set in the environment wins, so a preset is a
+        # starting point rather than an override.
+        applied = []
+        for key, value in chosen.settings:
+            if key in os.environ:
+                continue
+            cfg.apply_env_setting(key, value)
+            applied.append(f"{key}={value}")
+        if applied:
             print(
-                f"NOTE: this preset needs SITE_RESIDUE_POLICY="
-                f"{chosen.site_policy}; using it.\n"
+                "NOTE: this preset also sets " + ", ".join(applied)
+                + ".\n      See --list-presets for why.\n"
             )
         if "MPNN_MODEL_TYPE" not in os.environ:
             cfg.mpnn_model_type = chosen.mpnn_model_type

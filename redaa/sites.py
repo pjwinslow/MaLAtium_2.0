@@ -693,6 +693,8 @@ class SitePlan:
     ``exempt``  positions not counted against the reported alphabet.
     ``forced_types``  letters the alphabet must contain, because a position
                 counted against it is held at that residue.
+    ``gated``   positions the geometry thresholds are applied to.
+    ``recorded``  the rest of the site: measured and reported, not gated.
     """
 
     fixed: dict[int, str] = field(default_factory=dict)
@@ -700,6 +702,8 @@ class SitePlan:
     forced_types: frozenset[str] = frozenset()
     by_role: dict[str, str] = field(default_factory=dict)
     n_measured: int = 0
+    gated: frozenset[int] = frozenset()
+    recorded: frozenset[int] = frozenset()
 
     @property
     def any_fixed(self) -> bool:
@@ -715,10 +719,18 @@ class SitePlan:
             bits.append(f"requires {''.join(sorted(self.forced_types))}")
         if self.n_measured:
             bits.append(f"{self.n_measured} free but measured")
+        if self.recorded:
+            bits.append(
+                f"{len(self.gated)} gated, {len(self.recorded)} recorded only"
+            )
         return "; ".join(bits)
 
 
-def site_plan(site: ResolvedSite | None, policies: dict[str, str]) -> SitePlan:
+def site_plan(
+    site: ResolvedSite | None,
+    policies: dict[str, str],
+    gate_roles: "tuple[str, ...] | None" = None,
+) -> SitePlan:
     """Resolve *site* against a role -> policy map.
 
     Policies, per position, by its role:
@@ -726,6 +738,9 @@ def site_plan(site: ResolvedSite | None, policies: dict[str, str]) -> SitePlan:
     ``exempt``        held at native identity, not counted in the alphabet
     ``in_alphabet``   held at native identity, and its residue type counted
     ``measure_only``  designed freely; only the geometry is judged
+
+    *gate_roles*, when given, limits which roles the geometry thresholds are
+    applied to.  The rest of the site is still measured and reported.
     """
     if site is None or not site.positions:
         return SitePlan(by_role=dict(policies))
@@ -733,9 +748,15 @@ def site_plan(site: ResolvedSite | None, policies: dict[str, str]) -> SitePlan:
     fixed: dict[int, str] = {}
     exempt: set[int] = set()
     forced: set[str] = set()
+    gated: set[int] = set()
+    recorded: set[int] = set()
     measured = 0
     for pos in site.positions:
         policy = policies.get(pos.role, "exempt")
+        if gate_roles is None or pos.role in gate_roles:
+            gated.add(pos.index)
+        else:
+            recorded.add(pos.index)
         if policy == "measure_only":
             measured += 1
             continue
@@ -750,6 +771,8 @@ def site_plan(site: ResolvedSite | None, policies: dict[str, str]) -> SitePlan:
         forced_types=frozenset(forced),
         by_role=dict(policies),
         n_measured=measured,
+        gated=frozenset(gated),
+        recorded=frozenset(recorded),
     )
 
 
@@ -768,6 +791,11 @@ class SiteMetrics:
     cb_rms_dev: float | None = None  # RMS CB-CB distance error
     identity_kept: bool = True  # site residues still the native ones
     n_positions: int = 0
+    # The same three numbers over the positions the gate does NOT cover.
+    # Recorded so a run with a partly ungated site is still informative:
+    # without this, loosening the gate would mean losing the measurement.
+    recorded: "SiteMetrics | None" = None
+    n_recorded: int = 0
 
     def passed(
         self,
@@ -775,13 +803,28 @@ class SiteMetrics:
         max_local_rmsd: float,
         max_cb_dev: float,
         require_identity: bool = True,
+        max_cb_rms_dev: float = 0.0,
     ) -> bool:
+        """Whether this fold clears the configured site thresholds.
+
+        A note on ``max_cb_dev`` versus ``max_cb_rms_dev``. The former gates
+        the *worst* CB-CB pair, and the number of pairs grows as n^2 with the
+        site size, so at identical backbone accuracy it rises with the size
+        of the site: measured on a real 519-residue chain under 1 A of
+        correlated backbone error, the worst pair averages 2.6 A over 6
+        positions and 4.6 A over 68, while the RMS over pairs sits at 1.38 A
+        for both. A threshold calibrated on a catalytic triad is therefore not
+        the same test on a twenty-residue pocket. Gate the max for a small,
+        named site; gate the RMS when the site is large, which is what makes
+        the two comparable across cases.
+        """
         if require_identity and not self.identity_kept:
             return False
         checks = (
             (self.bb_rmsd, max_bb_rmsd),
             (self.local_rmsd, max_local_rmsd),
             (self.cb_max_dev, max_cb_dev),
+            (self.cb_rms_dev, max_cb_rms_dev),
         )
         for value, limit in checks:
             if limit <= 0:
@@ -809,6 +852,7 @@ def measure_site(
     pred_frames: np.ndarray,
     designed_seq: str | None = None,
     held: "dict[int, str] | None" = None,
+    gate_positions: "frozenset[int] | None" = None,
 ) -> SiteMetrics:
     """Compare a prediction's site geometry with the reference's.
 
@@ -817,8 +861,17 @@ def measure_site(
     puts the functional residues where they belong -- not whether a predicted
     rotamer happened to land well.  They are a necessary condition for a
     working site, not a sufficient one.
+
+    With *gate_positions*, the three gated numbers cover only those, and the
+    remaining site positions are measured into ``metrics.recorded``.  A site
+    with a compact pocket and a chain-spanning interface cannot be judged by
+    one set of thresholds, but the ungated half is still worth knowing.
     """
-    positions = list(site.indices)
+    all_positions = list(site.indices)
+    positions = (
+        all_positions if gate_positions is None
+        else [i for i in all_positions if i in gate_positions]
+    )
     metrics = SiteMetrics(n_positions=len(positions))
     if not positions:
         return metrics
@@ -832,6 +885,21 @@ def measure_site(
     metrics.cb_max_dev, metrics.cb_rms_dev = st.site_distance_deviation(
         ref_frames, pred_frames, positions, atom="CB"
     )
+
+    rest = [i for i in all_positions if i not in positions]
+    if rest:
+        other = SiteMetrics(n_positions=len(rest))
+        other.bb_rmsd = st.site_rmsd(
+            ref_frames, pred_frames, rest, superpose="global"
+        )
+        other.local_rmsd = st.site_rmsd(
+            ref_frames, pred_frames, rest, superpose="local"
+        )
+        other.cb_max_dev, other.cb_rms_dev = st.site_distance_deviation(
+            ref_frames, pred_frames, rest, atom="CB"
+        )
+        metrics.recorded = other
+        metrics.n_recorded = len(rest)
 
     if designed_seq is not None:
         # Only the positions the plan holds. A position left free by policy
@@ -907,9 +975,12 @@ class SitePreset:
     notes: str
     # Whole chains to retain as binding context.
     keep_partners: tuple[str, ...] = ()
-    # The policy this case needs, when the blanket default would be wrong.
-    # Empty means "whatever the user or the default says".
-    site_policy: str = ""
+    # Settings this case needs that the blanket defaults get wrong, as
+    # (env var, value) pairs. One mechanism rather than one field per
+    # setting: a case may need a policy, a gate scope and a threshold, and
+    # which it needs is a property of the case, not of the preset format.
+    # Applied only where the user has not set the variable themselves.
+    settings: tuple[tuple[str, str], ...] = ()
 
     def describe(self) -> str:
         lines = [
@@ -921,8 +992,8 @@ class SitePreset:
         if self.keep_partners:
             lines.append(f"    partners  : {', '.join(self.keep_partners)}")
         lines.append(f"    mpnn      : {self.mpnn_model_type}")
-        if self.site_policy:
-            lines.append(f"    policy    : {self.site_policy}")
+        for key, value in self.settings:
+            lines.append(f"    {key:<24s}: {value}")
         lines.append(f"    {self.notes}")
         return "\n".join(lines)
 
@@ -995,7 +1066,26 @@ PRESETS: dict[str, SitePreset] = {
         # the adenylate is 20 residues; the tRNA interface is 48, and between
         # them they use 18 of the 20 amino acids. Held under in_alphabet the
         # "minimal" alphabet would be 18 letters before the search began.
-        site_policy="exempt,interface=measure_only",
+        settings=(
+            # The pocket is 20 residues using 9 amino acids; the tRNA
+            # interface is 48 using 18. One policy for both would force an
+            # 18-letter alphabet before the search started, so the interface
+            # is designed freely and judged on geometry alone.
+            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
+            # The pocket spans sequence indices 158-369; the interface spans
+            # 54-515, essentially the whole chain. A 1.0 A local RMSD over a
+            # chain-spanning 48-residue set is a harder test than the global
+            # fold gate, so gating it would reject everything. The pocket is
+            # gated; the interface is measured and reported.
+            ("SITE_GATE_ROLES", "catalytic,contact"),
+            # Measured on these coordinates under 1 A of correlated backbone
+            # error: the worst CB-CB pair averages 2.6 A over 6 positions and
+            # 3.7 A over this pocket's 20, because the pair count grows as
+            # n^2. The RMS over pairs is 1.38 A either way. So the worst-pair
+            # check is switched off and the size-stable one gated instead.
+            ("SITE_MAX_CB_DEV", "0"),
+            ("SITE_MAX_CB_RMS_DEV", "2.0"),
+        ),
         title="Glycyl-adenylate pocket + tRNA interface -- human GlyRS (5E6M, 2.93 A)",
         notes=(
             "Human wild-type GlyRS (GARS, P41250, EC 6.1.1.14) with "

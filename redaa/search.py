@@ -162,6 +162,11 @@ class Metrics:
     site_bb_rmsd: float | None = None
     site_local_rmsd: float | None = None
     site_cb_dev: float | None = None
+    site_cb_rms_dev: float | None = None
+    # The same, over the positions the gate does not cover.
+    site_rec_bb_rmsd: float | None = None
+    site_rec_local_rmsd: float | None = None
+    site_rec_cb_dev: float | None = None
     num_site_pass: int = 0
 
     def rank_key(self) -> tuple[float, float, float]:
@@ -187,6 +192,9 @@ class BestSequence:
     site_bb_rmsd: float | None = None
     site_local_rmsd: float | None = None
     site_cb_dev: float | None = None
+    site_rec_bb_rmsd: float | None = None
+    site_rec_local_rmsd: float | None = None
+    site_rec_cb_dev: float | None = None
     site_ok: bool | None = None
 
     def rank_key(self) -> tuple[float, float, float]:
@@ -240,7 +248,9 @@ class Validator:
         from .config import parse_site_policy
 
         policies, _ = parse_site_policy(cfg.site_residue_policy)
-        self.plan = sitemod.site_plan(self.site, policies)
+        self.plan = sitemod.site_plan(
+            self.site, policies, gate_roles=cfg.gate_role_tuple
+        )
         self.exempt: frozenset[int] = self.plan.exempt
         # Identity is required only where the plan holds a position. Under
         # measure_only the design picks its own residues there, so checking
@@ -261,7 +271,8 @@ class Validator:
         if frames is None:
             return sitemod.SiteMetrics(n_positions=len(self.site))
         return sitemod.measure_site(
-            self.site, self.ref_frames, frames, seq, held=self.plan.fixed
+            self.site, self.ref_frames, frames, seq, held=self.plan.fixed,
+            gate_positions=self.plan.gated,
         )
 
     def validate(
@@ -350,6 +361,15 @@ class Validator:
             metrics.site_bb_rmsd = min(bb) if bb else None
             metrics.site_local_rmsd = min(loc) if loc else None
             metrics.site_cb_dev = min(cb) if cb else None
+            cbr = [m.cb_rms_dev for m in measured if m.cb_rms_dev is not None]
+            metrics.site_cb_rms_dev = min(cbr) if cbr else None
+            rec = [m.recorded for m in measured if m.recorded is not None]
+            rbb = [m.bb_rmsd for m in rec if m.bb_rmsd is not None]
+            rloc = [m.local_rmsd for m in rec if m.local_rmsd is not None]
+            rcb = [m.cb_max_dev for m in rec if m.cb_max_dev is not None]
+            metrics.site_rec_bb_rmsd = min(rbb) if rbb else None
+            metrics.site_rec_local_rmsd = min(rloc) if rloc else None
+            metrics.site_rec_cb_dev = min(rcb) if rcb else None
 
         passed = False
         site_ok_flags: list[bool | None] = []
@@ -373,6 +393,7 @@ class Validator:
                     self.cfg.site_max_local_rmsd,
                     self.cfg.site_max_cb_dev,
                     require_identity=self.require_identity,
+                    max_cb_rms_dev=self.cfg.site_max_cb_rms_dev,
                 )
                 if ok_site:
                     metrics.num_site_pass += 1
@@ -428,6 +449,15 @@ class Validator:
             site_bb_rmsd=sm.bb_rmsd if sm else None,
             site_local_rmsd=sm.local_rmsd if sm else None,
             site_cb_dev=sm.cb_max_dev if sm else None,
+            site_rec_bb_rmsd=(
+                sm.recorded.bb_rmsd if sm and sm.recorded else None
+            ),
+            site_rec_local_rmsd=(
+                sm.recorded.local_rmsd if sm and sm.recorded else None
+            ),
+            site_rec_cb_dev=(
+                sm.recorded.cb_max_dev if sm and sm.recorded else None
+            ),
             site_ok=site_ok_flags[pick],
         )
         return Validation(

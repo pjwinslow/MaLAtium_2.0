@@ -54,15 +54,34 @@ from .search import (
 DONE_SENTINEL = "COMPLETED"
 
 
-def _site_fields(metrics) -> str:
-    """Site columns for a console line, or nothing when no site is configured."""
+def _site_fields(metrics, cfg=None) -> str:
+    """Site columns for a console line, or nothing when no site is configured.
+
+    Which CB column is shown follows which one is gated.  A log reading
+    ``cbDev=4.76 PASS`` is worse than no column at all: it invites the reader
+    to conclude the threshold is 5 when that check is switched off and a
+    different one decided the verdict.
+    """
     if not getattr(metrics, "site_active", False):
         return ""
-    return (
+    out = (
         f"siteBB={_fmt(metrics.site_bb_rmsd, '0.2f')} "
         f"siteLocal={_fmt(metrics.site_local_rmsd, '0.2f')} "
-        f"cbDev={_fmt(metrics.site_cb_dev, '0.2f')} "
     )
+    gates_rms = cfg is not None and cfg.site_max_cb_rms_dev > 0
+    gates_max = cfg is None or cfg.site_max_cb_dev > 0
+    if gates_max:
+        out += f"cbDev={_fmt(metrics.site_cb_dev, '0.2f')} "
+    if gates_rms:
+        out += f"cbRMS={_fmt(getattr(metrics, 'site_cb_rms_dev', None), '0.2f')} "
+    if not gates_max and not gates_rms:
+        out += f"cbDev={_fmt(metrics.site_cb_dev, '0.2f')}(ungated) "
+    # The ungated remainder of a partly gated site, so loosening the gate
+    # does not mean losing sight of the rest.
+    rec = getattr(metrics, "site_rec_bb_rmsd", None)
+    if rec is not None:
+        out += f"recBB={_fmt(rec, '0.2f')} "
+    return out
 
 
 def _verdict(validation) -> str:
@@ -85,7 +104,7 @@ def plan_for(cfg, site) -> "sitemod.SitePlan":
     problems list is dropped here.
     """
     policies, _ = parse_site_policy(cfg.site_residue_policy)
-    return sitemod.site_plan(site, policies)
+    return sitemod.site_plan(site, policies, gate_roles=cfg.gate_role_tuple)
 
 
 class _SkipCheck(Exception):
@@ -488,6 +507,8 @@ class Pipeline:
             best = {"sequence": None, "alphabet": None, "rmsd": None,
                     "tm": None, "plddt": None, "site_bb_rmsd": None,
                     "site_local_rmsd": None, "site_cb_dev": None,
+                    "site_rec_bb_rmsd": None, "site_rec_local_rmsd": None,
+                    "site_rec_cb_dev": None,
                     "site_ok": None}
 
             def maybe_best(candidate, alphabet: str):
@@ -510,6 +531,9 @@ class Pipeline:
                         site_bb_rmsd=candidate.site_bb_rmsd,
                         site_local_rmsd=candidate.site_local_rmsd,
                         site_cb_dev=candidate.site_cb_dev,
+                        site_rec_bb_rmsd=candidate.site_rec_bb_rmsd,
+                        site_rec_local_rmsd=candidate.site_rec_local_rmsd,
+                        site_rec_cb_dev=candidate.site_rec_cb_dev,
                         site_ok=candidate.site_ok,
                     )
 
@@ -672,7 +696,7 @@ class Pipeline:
                         f"minRMSD={_fmt(v.metrics.min_rmsd, '0.2f')} "
                         f"maxTM={_fmt(v.metrics.max_tm)} "
                         f"maxpLDDT={_fmt(v.metrics.max_plddt, '0.1f')} "
-                        + _site_fields(v.metrics)
+                        + _site_fields(v.metrics, cfg)
                         + _verdict(v)
                         + ("" if aa in promote else "  [screened out]")
                     )
@@ -748,7 +772,7 @@ class Pipeline:
                 f"  full validation: minRMSD={_fmt(full.metrics.min_rmsd, '0.2f')} A "
                 f"maxTM={_fmt(full.metrics.max_tm)} "
                 f"maxpLDDT={_fmt(full.metrics.max_plddt, '0.1f')} "
-                + _site_fields(full.metrics)
+                + _site_fields(full.metrics, cfg)
                 + ("PASSED" if full.passed else _verdict(full).strip())
             )
 
@@ -854,6 +878,11 @@ class Pipeline:
                 site_n_held=len(plan.fixed),
                 site_n_measured=plan.n_measured,
                 site_forced_types="".join(sorted(plan.forced_types)),
+                site_n_gated=len(plan.gated),
+                site_gate_roles=",".join(cfg.gate_role_tuple),
+                best_seq_site_rec_bb_rmsd=best.get("site_rec_bb_rmsd"),
+                best_seq_site_rec_local_rmsd=best.get("site_rec_local_rmsd"),
+                best_seq_site_rec_cb_dev=best.get("site_rec_cb_dev"),
             )
         result.update(graft)
 
@@ -1383,12 +1412,14 @@ class Pipeline:
                 # do with the alphabet.
                 if site is not None and native.site_frames is not None:
                     best = sitemod.measure_site(
-                        site, ref_frames, native.site_frames, ref_seq
+                        site, ref_frames, native.site_frames, ref_seq,
+                        gate_positions=plan_for(cfg, site).gated,
                     )
                     reachable = best.passed(
                         cfg.site_max_bb_rmsd, cfg.site_max_local_rmsd,
                         cfg.site_max_cb_dev,
                         require_identity=cfg.site_require_identity,
+                        max_cb_rms_dev=cfg.site_max_cb_rms_dev,
                     )
                     detail = (
                         f"{best.describe()} -- the ceiling for any design here"
@@ -1633,6 +1664,24 @@ class Pipeline:
                 print(f"    MPNN ligand atoms: {n_lig}")
             for w in site.warnings:
                 print(f"    WARNING: {w}")
+
+            # The worst CB-CB pair grows with site size at fixed accuracy,
+            # because the pair count grows as n^2. A threshold calibrated on
+            # a catalytic triad silently becomes a much harsher test on a
+            # twenty-residue pocket, and the symptom is every candidate
+            # failing on cbDev while the two RMSD numbers look fine.
+            n_gated = len(site_plan_obj.gated)
+            if cfg.site_gate and cfg.site_max_cb_dev > 0 and n_gated > 8:
+                print(
+                    f"    WARNING: SITE_MAX_CB_DEV={cfg.site_max_cb_dev:g} gates "
+                    f"the WORST CB-CB pair over {n_gated} positions "
+                    f"({n_gated * (n_gated - 1) // 2} pairs). That statistic "
+                    "grows with site size at unchanged accuracy, so a "
+                    "threshold set for a small site rejects almost "
+                    "everything here.\n"
+                    "      Prefer the size-stable check: SITE_MAX_CB_DEV=0 "
+                    "with SITE_MAX_CB_RMS_DEV=2.0 (--preset glyrs does this)."
+                )
             with open(info_path, "a") as fh:
                 fh.write("\nFunctional site:\n")
                 fh.write(f"  Spec: {site.spec_text}\n")
@@ -1901,7 +1950,9 @@ class Pipeline:
         "site_name", "site_spec", "site_n_positions",
         "site_residues", "site_residue_types", "site_policy",
         "site_partners", "site_n_interface", "site_n_held", "site_n_measured",
-        "site_forced_types",
+        "site_forced_types", "site_n_gated", "site_gate_roles",
+        "best_seq_site_rec_bb_rmsd", "best_seq_site_rec_local_rmsd",
+        "best_seq_site_rec_cb_dev",
         "best_seq_site_bb_rmsd", "best_seq_site_local_rmsd",
         "best_seq_site_cb_dev", "best_seq_site_ok",
         # scaffold_then_site only
@@ -1917,7 +1968,8 @@ class Pipeline:
     INVERSE_FIELDS = [
         "pdb", "alphabet", "alphabet_size", "rank", "mpnn_score",
         "tm", "rmsd", "plddt", "passed",
-        "site_bb_rmsd", "site_local_rmsd", "site_cb_dev", "site_ok",
+        "site_bb_rmsd", "site_local_rmsd", "site_cb_dev",
+        "site_rec_bb_rmsd", "site_rec_cb_dev", "site_ok",
         "site_identity_kept", "excluded_present", "excluded_count",
         "length", "sequence",
     ]
@@ -2075,6 +2127,7 @@ class Pipeline:
                         cfg.site_max_bb_rmsd, cfg.site_max_local_rmsd,
                         cfg.site_max_cb_dev,
                         require_identity=validator.require_identity,
+                        max_cb_rms_dev=cfg.site_max_cb_rms_dev,
                     )
                 gate_site = True if ok_site is None else bool(ok_site)
                 if not (site is not None and cfg.site_gate):
@@ -2093,6 +2146,14 @@ class Pipeline:
                     "site_bb_rmsd": metrics.bb_rmsd if metrics else None,
                     "site_local_rmsd": metrics.local_rmsd if metrics else None,
                     "site_cb_dev": metrics.cb_max_dev if metrics else None,
+                    "site_rec_bb_rmsd": (
+                        metrics.recorded.bb_rmsd
+                        if metrics is not None and metrics.recorded else None
+                    ),
+                    "site_rec_cb_dev": (
+                        metrics.recorded.cb_max_dev
+                        if metrics is not None and metrics.recorded else None
+                    ),
                     "site_ok": "" if ok_site is None else int(bool(ok_site)),
                     "site_identity_kept": (
                         "" if metrics is None else int(bool(metrics.identity_kept))

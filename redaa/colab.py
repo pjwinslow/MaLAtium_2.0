@@ -545,10 +545,12 @@ def configure_site(
     keep_partners: str = "",
     contact_max: int = 0,
     policy: str = "exempt",
+    gate_roles: str = "",
     gate: bool = True,
     max_bb_rmsd: float = 1.5,
     max_local_rmsd: float = 1.0,
     max_cb_dev: float = 1.5,
+    max_cb_rms_dev: float = 0.0,
     require_identity: bool = True,
     mpnn_model_type: str = "",
 ) -> dict:
@@ -579,8 +581,37 @@ def configure_site(
         # A case whose halves need different policies carries its own, and the
         # blanket default would make its search meaningless. Only when the
         # caller left the default alone: anything typed still wins.
-        if chosen.site_policy and policy.strip() == "exempt":
-            policy = chosen.site_policy
+        # Settings this case needs that the blanket defaults get wrong, each
+        # applied only where the caller left the default alone.
+        _defaults = {
+            "SITE_RESIDUE_POLICY": ("exempt", policy),
+            "SITE_GATE_ROLES": ("", gate_roles),
+            "SITE_MAX_CB_DEV": (1.5, max_cb_dev),
+            "SITE_MAX_CB_RMS_DEV": (0.0, max_cb_rms_dev),
+            "SITE_MAX_BB_RMSD": (1.5, max_bb_rmsd),
+            "SITE_MAX_LOCAL_RMSD": (1.0, max_local_rmsd),
+        }
+        for key, value in chosen.settings:
+            if key not in _defaults:
+                continue
+            default, given = _defaults[key]
+            if isinstance(default, str):
+                if given.strip() != default:
+                    continue
+            elif float(given) != float(default):
+                continue
+            if key == "SITE_RESIDUE_POLICY":
+                policy = value
+            elif key == "SITE_GATE_ROLES":
+                gate_roles = value
+            elif key == "SITE_MAX_CB_DEV":
+                max_cb_dev = float(value)
+            elif key == "SITE_MAX_CB_RMS_DEV":
+                max_cb_rms_dev = float(value)
+            elif key == "SITE_MAX_BB_RMSD":
+                max_bb_rmsd = float(value)
+            elif key == "SITE_MAX_LOCAL_RMSD":
+                max_local_rmsd = float(value)
 
     policies, problems = parse_site_policy(policy)
     if problems:
@@ -604,9 +635,11 @@ def configure_site(
         "SITE_CONTACT_MAX": str(int(contact_max)),
         "SITE_RESIDUE_POLICY": policy,
         "SITE_GATE": "1" if gate else "0",
+        "SITE_GATE_ROLES": gate_roles.strip(),
         "SITE_MAX_BB_RMSD": str(float(max_bb_rmsd)),
         "SITE_MAX_LOCAL_RMSD": str(float(max_local_rmsd)),
         "SITE_MAX_CB_DEV": str(float(max_cb_dev)),
+        "SITE_MAX_CB_RMS_DEV": str(float(max_cb_rms_dev)),
         "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
     }
     settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()

@@ -359,6 +359,21 @@ def test_site_step_offers_per_role_policies_and_allows_typing_one():
     assert "allow-input: true" in site
 
 
+def test_site_step_exposes_the_size_stable_cb_gate():
+    site = next(c for c in _code_cells() if "Mode and functional site" in c)
+    assert "SITE_MAX_CB_RMS_DEV" in site
+    assert "max_cb_rms_dev=" in site
+    assert "SITE_GATE_ROLES" in site
+    assert "gate_roles=" in site
+
+
+def test_markdown_warns_that_cb_dev_is_not_size_comparable():
+    """The trap that drove a real run's alphabet to 19 letters."""
+    md = "\n".join(_markdown_cells())
+    assert "not comparable across site sizes" in md
+    assert "SITE_MAX_CB_RMS_DEV" in md
+
+
 def test_site_spec_table_documents_the_partner_token():
     md = "\n".join(_markdown_cells())
     assert "`partner:E`" in md

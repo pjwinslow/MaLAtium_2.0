@@ -355,6 +355,16 @@ class RedAAConfig:
     # Site-preservation thresholds, in Angstroms. Set any of them to 0 to
     # record the number without gating on it.
     site_gate: bool = field(default_factory=lambda: _env_bool("SITE_GATE", True))
+    # Which site roles the geometry thresholds are applied to. Empty means
+    # all of them, which is the only sensible default for a compact site.
+    # It stops being sensible the moment a site has a compact half and a
+    # sprawling half: thresholds that are right for a 20-residue pocket are
+    # unreachable over a 48-residue interface spanning the whole chain, so
+    # one set of numbers applied to both rejects everything. Roles left out
+    # are still measured and reported, just not gated.
+    site_gate_roles: str = field(
+        default_factory=lambda: _env_str("SITE_GATE_ROLES", "")
+    )
     site_max_bb_rmsd: float = field(
         default_factory=lambda: _env_float("SITE_MAX_BB_RMSD", 1.5)
     )
@@ -363,6 +373,13 @@ class RedAAConfig:
     )
     site_max_cb_dev: float = field(
         default_factory=lambda: _env_float("SITE_MAX_CB_DEV", 1.5)
+    )
+    # RMS rather than worst-case CB-CB distance error. Off by default so
+    # nothing changes for an existing run. Prefer it over SITE_MAX_CB_DEV
+    # whenever the gated site is more than a handful of residues: the worst
+    # pair grows with site size at fixed accuracy, the RMS does not.
+    site_max_cb_rms_dev: float = field(
+        default_factory=lambda: _env_float("SITE_MAX_CB_RMS_DEV", 0.0)
     )
     site_require_identity: bool = field(
         default_factory=lambda: _env_bool("SITE_REQUIRE_IDENTITY", True)
@@ -440,9 +457,48 @@ class RedAAConfig:
         return tuple(dict.fromkeys(x.strip().upper() for x in raw if x.strip()))
 
     @property
+    def gate_role_tuple(self) -> tuple[str, ...]:
+        raw = (self.site_gate_roles or "").replace(",", " ").split()
+        named = tuple(dict.fromkeys(x.strip().lower() for x in raw if x.strip()))
+        return named or SITE_ROLES
+
+    @property
     def keep_partner_tuple(self) -> tuple[str, ...]:
         raw = (self.site_keep_partners or "").replace(",", " ").split()
         return tuple(dict.fromkeys(x.strip() for x in raw if x.strip()))
+
+    # Env var -> config attribute, for the settings a preset may carry.
+    ENV_TO_FIELD = {
+        "SITE_RESIDUE_POLICY": "site_residue_policy",
+        "SITE_GATE_ROLES": "site_gate_roles",
+        "SITE_GATE": "site_gate",
+        "SITE_MAX_BB_RMSD": "site_max_bb_rmsd",
+        "SITE_MAX_LOCAL_RMSD": "site_max_local_rmsd",
+        "SITE_MAX_CB_DEV": "site_max_cb_dev",
+        "SITE_MAX_CB_RMS_DEV": "site_max_cb_rms_dev",
+        "SITE_REQUIRE_IDENTITY": "site_require_identity",
+        "SITE_CONTACT_MAX": "site_contact_max",
+        "MPNN_MODEL_TYPE": "mpnn_model_type",
+    }
+
+    def apply_env_setting(self, key: str, value: str) -> None:
+        """Set one field from its environment-variable name and string value.
+
+        Used to apply a preset's recommended settings without going through
+        the environment, so the reported configuration is what actually ran.
+        """
+        name = self.ENV_TO_FIELD.get(key)
+        if name is None:
+            raise ValueError(f"no configuration field for {key}")
+        current = getattr(self, name)
+        if isinstance(current, bool):
+            setattr(self, name, value.strip().lower() in ("1", "true", "yes", "on"))
+        elif isinstance(current, int):
+            setattr(self, name, int(value))
+        elif isinstance(current, float):
+            setattr(self, name, float(value))
+        else:
+            setattr(self, name, value)
 
     def validate(self) -> list[str]:
         """Return a list of configuration problems, empty if all is well."""
@@ -454,6 +510,15 @@ class RedAAConfig:
             )
         _policies, policy_problems = parse_site_policy(self.site_residue_policy)
         problems.extend(policy_problems)
+        bad_roles = [
+            r for r in (self.site_gate_roles or "").replace(",", " ").split()
+            if r.strip().lower() not in SITE_ROLES
+        ]
+        if bad_roles:
+            problems.append(
+                f"SITE_GATE_ROLES names {', '.join(bad_roles)}, which is not "
+                f"among {', '.join(SITE_ROLES)}"
+            )
         if self.site_enabled and not (self.site_spec or self.site_preset):
             problems.append(
                 f"SEARCH_MODE={self.search_mode} needs a site: set SITE_SPEC "
