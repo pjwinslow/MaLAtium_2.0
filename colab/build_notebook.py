@@ -929,7 +929,12 @@ MIN_TM_SCORE = 0.51 #@param {type:"number"}
 NUM_SEQS_TO_FOLD = 5 #@param {type:"integer"}
 FOLD_STEPS_SCREEN = 50 #@param {type:"integer"}
 FOLD_STEPS_FINAL = 200 #@param {type:"integer"}
-FOLD_MODEL_ID = "Synthyra/ESMFold2-Fast" #@param ["Synthyra/ESMFold2-Fast", "Synthyra/ESMFold2", "Synthyra/ESMFold2-600", "Synthyra/ESMFold2-300"]
+#@markdown `auto` keeps the variant step 2 chose for your VRAM, which is the
+#@markdown setting that matters most: ESMFold2-Fast and ESMFold2 load a
+#@markdown 6.35 B-parameter backbone (~12.7 GB of weights in bf16), while
+#@markdown ESMFold2-600 and -300 use 0.58 B and 0.33 B (~1.2 and ~0.7 GB).
+#@markdown The folding trunk is the same 24 layers in all four.
+FOLD_MODEL_ID = "auto" #@param ["auto", "Synthyra/ESMFold2-Fast", "Synthyra/ESMFold2", "Synthyra/ESMFold2-600", "Synthyra/ESMFold2-300"]
 FOLD_PRECISION = "auto" #@param ["auto", "bf16", "fp16", "fp32"]
 #@markdown `FOLD_CHUNK_SIZE` caps the L² operations that dominate ESMFold2's
 #@markdown memory (the model's own default is 64). Smaller is slower but fits
@@ -964,7 +969,10 @@ _settings = {
     "NUM_SEQS_TO_FOLD": NUM_SEQS_TO_FOLD,
     "FOLD_STEPS_SCREEN": FOLD_STEPS_SCREEN,
     "FOLD_STEPS_FINAL": FOLD_STEPS_FINAL,
-    "FOLD_MODEL_ID": FOLD_MODEL_ID,
+    # "auto" leaves the variant step 2 picked from this GPU's VRAM. Writing
+    # the form default unconditionally overwrote that choice with the 12.7 GB
+    # backbone, which is the thing the GPU cell had just avoided.
+    **({"FOLD_MODEL_ID": FOLD_MODEL_ID} if FOLD_MODEL_ID != "auto" else {}),
     "FOLD_PRECISION": FOLD_PRECISION,
     # 0 means "leave what the GPU cell chose"; anything else overrides it.
     **({"FOLD_CHUNK_SIZE": FOLD_CHUNK_SIZE} if FOLD_CHUNK_SIZE > 0 else {}),

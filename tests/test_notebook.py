@@ -359,12 +359,21 @@ def test_site_step_offers_per_role_policies_and_allows_typing_one():
     assert "allow-input: true" in site
 
 
-def test_search_step_exposes_the_memory_chunk_and_leaves_it_to_the_gpu_cell():
-    """The lever that governs ESMFold2's peak memory, and the one that does not."""
+def test_search_step_does_not_overwrite_what_the_gpu_cell_chose():
+    """Both memory levers are the GPU cell's to set, and were being clobbered.
+
+    Step 2 derives FOLD_MODEL_ID and FOLD_CHUNK_SIZE from VRAM. Step 6 wrote
+    its own form defaults over both, so a card that had just been given a
+    1.2 GB backbone got the 12.7 GB one back and ran out of memory again.
+    """
     step6 = next(c for c in _code_cells() if "Step 6 — Search settings" in c)
+    assert 'FOLD_MODEL_ID = "auto"' in step6, step6
+    assert 'if FOLD_MODEL_ID != "auto" else {}' in step6, "model guard missing"
     assert "FOLD_CHUNK_SIZE = 0" in step6, "0 must mean 'keep the GPU cell's choice'"
-    # Writing it unconditionally would overwrite the VRAM-derived value with 0.
-    assert "if FOLD_CHUNK_SIZE > 0 else {}" in step6, step6[:0] or "guard missing"
+    assert "if FOLD_CHUNK_SIZE > 0 else {}" in step6, "chunk guard missing"
+    # The dropdown has to offer the small-backbone variants by name.
+    for name in ("ESMFold2-600", "ESMFold2-300"):
+        assert name in step6, name
 
 
 def test_site_step_exposes_the_size_stable_cb_gate():
