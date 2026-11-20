@@ -336,13 +336,21 @@ def _split_cif_row(line: str) -> list[str]:
 
 
 def cif_to_pdb(text: str) -> str:
-    """Convert the ``_atom_site`` loop of an mmCIF file into PDB ATOM records.
+    """Convert the ``_atom_site`` loop of an mmCIF file into PDB records.
 
-    Only what this pipeline needs is carried across: the first model, protein
-    ``ATOM`` records, author chain and residue numbering (so chain IDs match
-    what a user expects from the PDB entry).  Multi-character mmCIF chain IDs
-    are mapped onto single characters, since the PDB format has only one
-    column for them.
+    The first model only, with author chain and residue numbering so chain
+    IDs match what a user expects from the PDB entry.  Multi-character mmCIF
+    chain IDs are mapped onto single characters, since the PDB format has
+    only one column for them.
+
+    Everything except water is carried across -- heteroatoms and non-protein
+    polymers included -- because this is a format conversion and not the
+    place to decide what a run needs.  It used to keep protein ``ATOM``
+    records alone, which made a CIF quietly less capable than the same entry
+    in PDB format: a locally prepared CIF lost its ligand and its whole tRNA
+    chain on the way in, so a configured site resolved to nothing and the
+    run went ahead against a bare backbone.  What to keep is ``prepare``'s
+    decision, and it already drops waters, solvent and unrequested ligands.
     """
     lines = text.splitlines()
     fields: list[str] = []
@@ -389,7 +397,8 @@ def cif_to_pdb(text: str) -> str:
     serial = 0
 
     for row in rows:
-        if get(row, "group_PDB", default="ATOM") != "ATOM":
+        record = get(row, "group_PDB", default="ATOM").strip().upper()
+        if record not in ("ATOM", "HETATM"):
             continue
         model = get(row, "pdbx_PDB_model_num", default="1")
         if first_model is None:
@@ -397,8 +406,8 @@ def cif_to_pdb(text: str) -> str:
         if model != first_model:
             continue
         resname = get(row, "label_comp_id", "auth_comp_id").strip()
-        if resname not in AA3_TO_1:
-            continue
+        if resname == "HOH":
+            continue  # never wanted, and a CIF can carry thousands
 
         raw_chain = get(row, "auth_asym_id", "label_asym_id", default="A").strip()
         chain = chain_map.get(raw_chain)
@@ -428,8 +437,13 @@ def cif_to_pdb(text: str) -> str:
         element = get(row, "type_symbol", default=atom[:1]).strip()[:2]
         serial += 1
 
+        # A non-protein residue written as ATOM in the CIF -- a nucleotide of
+        # a bound tRNA, say -- becomes HETATM here. Every polymer parser in
+        # this pipeline reads ATOM records, so emitting it as ATOM would put
+        # a tRNA into the designed chain's sequence.
+        tag = "ATOM  " if (record == "ATOM" and resname in AA3_TO_1) else "HETATM"
         out.append(
-            f"ATOM  {serial % 100000:>5d} {name}{altloc}{resname:>3s} "
+            f"{tag}{serial % 100000:>5d} {name}{altloc}{resname:>3s} "
             f"{chain}{resseq:>4d}{icode}   "
             f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          "
             f"{element:>2s}"

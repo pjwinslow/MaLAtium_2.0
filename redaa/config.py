@@ -170,6 +170,26 @@ def _env_int(name: str, default: int) -> int:
     return default if raw is None or raw == "" else int(raw)
 
 
+def _auto(raw) -> bool:
+    """Whether an environment value means "you decide"."""
+    return raw is None or raw.strip().lower() in ("", "auto")
+
+
+def _env_float_auto(name: str, default: float) -> float:
+    """A float, where "auto" (or unset) leaves the default in place.
+
+    The default is what applies if nothing resolves the setting later, so
+    behaviour without a site is exactly what it was.
+    """
+    raw = os.environ.get(name)
+    return default if _auto(raw) else float(raw)
+
+
+def _env_str_auto(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    return default if _auto(raw) else raw.strip()
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else float(raw)
@@ -350,7 +370,7 @@ class RedAAConfig:
     # One policy for every site role, or per-role overrides. See
     # parse_site_policy for the accepted forms.
     site_residue_policy: str = field(
-        default_factory=lambda: _env_str("SITE_RESIDUE_POLICY", POLICY_EXEMPT)
+        default_factory=lambda: _env_str_auto("SITE_RESIDUE_POLICY", POLICY_EXEMPT)
     )
     # Site-preservation thresholds, in Angstroms. Set any of them to 0 to
     # record the number without gating on it.
@@ -363,7 +383,7 @@ class RedAAConfig:
     # one set of numbers applied to both rejects everything. Roles left out
     # are still measured and reported, just not gated.
     site_gate_roles: str = field(
-        default_factory=lambda: _env_str("SITE_GATE_ROLES", "")
+        default_factory=lambda: _env_str_auto("SITE_GATE_ROLES", "")
     )
     site_max_bb_rmsd: float = field(
         default_factory=lambda: _env_float("SITE_MAX_BB_RMSD", 1.5)
@@ -372,14 +392,14 @@ class RedAAConfig:
         default_factory=lambda: _env_float("SITE_MAX_LOCAL_RMSD", 1.0)
     )
     site_max_cb_dev: float = field(
-        default_factory=lambda: _env_float("SITE_MAX_CB_DEV", 1.5)
+        default_factory=lambda: _env_float_auto("SITE_MAX_CB_DEV", 1.5)
     )
     # RMS rather than worst-case CB-CB distance error. Off by default so
     # nothing changes for an existing run. Prefer it over SITE_MAX_CB_DEV
     # whenever the gated site is more than a handful of residues: the worst
     # pair grows with site size at fixed accuracy, the RMS does not.
     site_max_cb_rms_dev: float = field(
-        default_factory=lambda: _env_float("SITE_MAX_CB_RMS_DEV", 0.0)
+        default_factory=lambda: _env_float_auto("SITE_MAX_CB_RMS_DEV", 0.0)
     )
     # Thresholds for the roles NOT named in SITE_GATE_ROLES. All 0 by
     # default, which is measurement without gating -- the old behaviour. Set
@@ -387,16 +407,16 @@ class RedAAConfig:
     # tRNA interface that has to be in the right place, with no constraint on
     # how precisely, is gated here while the pocket is gated above.
     site_rest_max_bb_rmsd: float = field(
-        default_factory=lambda: _env_float("SITE_REST_MAX_BB_RMSD", 0.0)
+        default_factory=lambda: _env_float_auto("SITE_REST_MAX_BB_RMSD", 0.0)
     )
     site_rest_max_local_rmsd: float = field(
-        default_factory=lambda: _env_float("SITE_REST_MAX_LOCAL_RMSD", 0.0)
+        default_factory=lambda: _env_float_auto("SITE_REST_MAX_LOCAL_RMSD", 0.0)
     )
     site_rest_max_cb_dev: float = field(
-        default_factory=lambda: _env_float("SITE_REST_MAX_CB_DEV", 0.0)
+        default_factory=lambda: _env_float_auto("SITE_REST_MAX_CB_DEV", 0.0)
     )
     site_rest_max_cb_rms_dev: float = field(
-        default_factory=lambda: _env_float("SITE_REST_MAX_CB_RMS_DEV", 0.0)
+        default_factory=lambda: _env_float_auto("SITE_REST_MAX_CB_RMS_DEV", 0.0)
     )
     # Leave a site position free rather than holding a residue EXCLUDE_AAS
     # bars. Off by default: holding the site is usually the point, and
@@ -500,6 +520,96 @@ class RedAAConfig:
     def keep_partner_tuple(self) -> tuple[str, ...]:
         raw = (self.site_keep_partners or "").replace(",", " ").split()
         return tuple(dict.fromkeys(x.strip() for x in raw if x.strip()))
+
+    # Settings derived from the site's shape unless the user names a value.
+    # "auto" is the default for every one of them, following FOLD_PRECISION.
+    SITE_AUTO_ENV = (
+        "SITE_RESIDUE_POLICY",
+        "SITE_GATE_ROLES",
+        "SITE_MAX_CB_DEV",
+        "SITE_MAX_CB_RMS_DEV",
+        "SITE_REST_MAX_BB_RMSD",
+        "SITE_REST_MAX_LOCAL_RMSD",
+        "SITE_REST_MAX_CB_RMS_DEV",
+    )
+
+    # What each derivable setting is when nobody has chosen. A field holding
+    # anything else was set by someone -- through the environment, the CLI, a
+    # preset, or straight onto the object -- and is theirs to keep.
+    SITE_AUTO_DEFAULTS = {
+        "SITE_RESIDUE_POLICY": POLICY_EXEMPT,
+        "SITE_GATE_ROLES": "",
+        "SITE_MAX_CB_DEV": 1.5,
+        "SITE_MAX_CB_RMS_DEV": 0.0,
+        "SITE_REST_MAX_BB_RMSD": 0.0,
+        "SITE_REST_MAX_LOCAL_RMSD": 0.0,
+        "SITE_REST_MAX_CB_RMS_DEV": 0.0,
+    }
+
+    @property
+    def site_explicit(self) -> frozenset[str]:
+        """Which derivable site settings somebody has named a value for.
+
+        Anything at its default, set to "auto", or unset is the pipeline's to
+        decide from the structure. Anything else is the user's, and wins.
+
+        Checking the environment alone was not enough: a value assigned
+        straight onto the config -- which is what the CLI, a preset and any
+        programmatic caller do -- looked unset, so the derivation quietly
+        overruled it.
+        """
+        out = set()
+        for name in self.SITE_AUTO_ENV:
+            raw = os.environ.get(name)
+            if raw is not None and raw.strip().lower() not in ("", "auto"):
+                out.add(name)
+                continue
+            field_name = self.ENV_TO_FIELD.get(name)
+            if field_name is None:
+                continue
+            current = getattr(self, field_name, None)
+            default = self.SITE_AUTO_DEFAULTS.get(name)
+            if isinstance(default, float):
+                if current is not None and abs(float(current) - default) > 1e-9:
+                    out.add(name)
+            elif current != default:
+                out.add(name)
+        return frozenset(out)
+
+    def resolve_site_settings(self, site, n_polymer: int) -> list[str]:
+        """Fill the derivable site settings from the site's shape.
+
+        Returns one line per decision, for the run to print. A setting the
+        user named is left alone and reported as theirs: the point is that a
+        new target needs no preset, not that the pipeline overrules anyone.
+        """
+        from .sites import derive_site_settings
+
+        derived, why = derive_site_settings(
+            site, n_polymer, excluding="".join(self.exclude_aas)
+        )
+        if not derived:
+            return []
+        explicit = self.site_explicit
+        lines: list[str] = []
+        for name in self.SITE_AUTO_ENV:
+            if name not in derived:
+                continue
+            if name in explicit:
+                # Report the field, not the environment: an explicit value
+                # may have been assigned straight onto the config.
+                field_name = self.ENV_TO_FIELD.get(name, "")
+                shown = getattr(self, field_name, "") if field_name else ""
+                lines.append(f"{name}={shown} (yours, kept)")
+                continue
+            value = derived[name]
+            text = (
+                ("1" if value else "0") if isinstance(value, bool)
+                else (f"{value:g}" if isinstance(value, float) else str(value))
+            )
+            self.apply_env_setting(name, text)
+            lines.append(f"{name}={text or '(all roles)'} (derived)")
+        return lines + [f"-> {w}" for w in why]
 
     # Env var -> config attribute, for the settings a preset may carry.
     ENV_TO_FIELD = {

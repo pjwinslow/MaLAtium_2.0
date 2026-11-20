@@ -724,6 +724,41 @@ phi (A503, +56°), against **41 of 73 glycines**. On a fixed backbone there is
 no substitute for Gly at a positive-phi position; there is nothing comparable
 to work around for Ala.
 
+### How to judge a site is derived from the site
+
+Every threshold below has a default calibrated on a six-residue catalytic
+triad, and those defaults are wrong for anything much larger. Rather than
+hand-write them per target, the pipeline measures the site's shape and
+resolves them, printing each decision and its reason. `auto` is the default
+for all of them, following `FOLD_PRECISION`; name a value and yours is kept
+and reported as yours.
+
+```
+    gating    : derived from this site's shape
+      SITE_RESIDUE_POLICY=exempt,interface=measure_only (derived)
+      SITE_GATE_ROLES=contact (derived)
+      SITE_MAX_CB_DEV=0 (derived)
+      SITE_MAX_CB_RMS_DEV=2 (derived)
+      SITE_REST_MAX_BB_RMSD=3 (derived)
+      -> interface spans 389 of 490 residues, so it is judged on placement
+         (3/2.5 A) rather than by the pocket's thresholds, which it could
+         never meet
+      -> 21 gated positions is 210 CB-CB pairs, so the worst pair is not
+         comparable with a small site's; gating the RMS at 2 A instead
+```
+
+The rules, all from measurable properties: a role derived from a partner
+chain is about presenting a surface, so it is `measure_only`; a role group
+spanning more than half the chain is judged on placement with the loose
+thresholds; past eight gated positions the worst-CB-pair statistic stops
+being comparable, so the size-stable RMS is gated instead.
+
+One thing is deliberately *not* derived. `SITE_FREE_EXCLUDED` resolves a
+contradiction between two explicit instructions — "bar this residue" and
+"hold this site" — and settling that by quietly dropping one of them is not a
+derivation. The clash is reported with the switch that fixes it, and the
+choice stays yours.
+
 #### Two threshold sets, because a site's halves are asked different things
 
 `SITE_GATE_ROLES` names the roles judged by the tight `SITE_MAX_*`
@@ -804,7 +839,6 @@ taken from memory.
 | `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
 | `glyrs` | `5e6m_A` — human GlyRS·tRNA-Gly, 2.93 Å, 519 residues | `ligand:GAP@4.5 partner:E@4.5` → 20 + 48 residues | Catalytic site **and** tRNA interface from one structure |
 | `alars` | `3wqy_A` — *A. fulgidus* AlaRS·tRNA-Ala, 3.3 Å, 905 residues | `ligand:A5A@4.5 partner:C@4.5` → 21 + 52 residues | The same, cleaner: no chain gaps, 95% single-subunit interface |
-| `alars_cat` | `3wqy_A:1-490` — the same, 489 residues | the same spec → 21 + 32 residues | For a 24 GB card, where the full 905 will not fold |
 
 **Why 3WQY for AlaRS.** `A5A` is 5'-O-[N-(L-alanyl)sulfamoyl]adenosine, the
 non-hydrolysable alanyl-adenylate analogue — 28 atoms carrying the alanyl
@@ -827,29 +861,18 @@ an out-of-memory error instead of a skip, so this is a hardware fact, not a
 setting — and preflight now fails on it before loading a model rather than
 after resolving the site.
 
-`alars_cat` is the answer for a 24 GB card, and the cut is not arbitrary.
-Severed CB–CB contacts per 100 residues, measured on these coordinates across
-end points from 240 to 560, are lowest at 480–500 (16–17) and worst in the
-240–320 band (46–97) — so there is a clean seam near 490 and **no acceptable
-cut at all near 320**, which is what a 16 GB card would need. At 1–490 the
-construct keeps:
+**905 residues will not fold on a small card**, and the fix is a shorter
+construct rather than a larger cap. The site spans residues 93–883, so no
+truncation keeps all of it; residues 1–490 keep the pocket entire (21/21) and
+32 of 52 interface residues, including the whole 3'-CCA approach to the
+adenylate. Nothing about that needs a preset: point `PDB_SPECS` at
+`3wqy_A:1-490`, or upload your own truncation, and the pipeline derives how to
+judge whatever site resolves.
 
-- the alanyl-adenylate pocket entire (21/21 residues, author 99–249);
-- 32 of 52 tRNA-interface residues, and the right 32 — the N-terminal half
-  contacts the acceptor stem (13 nucleotides) and D-arm (4), while the
-  discarded half contributes only scattered contacts across five regions;
-- the **G3·U70 pair**, the single base pair that makes a tRNA
-  alanine-accepting and the reason this entry was solved. G1603 is read by
-  D450 and S451, U1670 by T422, G453, N359, D450, Y449, H452, S451 and R371 —
-  every one inside 1–490. Only D727, the weakest at 4.2 Å, is lost.
-
-What it gives up is the editing-domain contacts, so report it as the catalytic
-domain rather than as AlaRS.
-
-A preset also carries the settings its case needs where the blanket defaults
-get it wrong, applied only where you have not set them yourself;
-`--list-presets` shows them. For `glyrs` that is the per-role policy, the gate
-scope, and the swap from the worst-pair CB check to the size-stable one.
+A preset carries only what is a property of the *case*: which structure, which
+site spec, which ligands and partner chains to keep, and the MPNN model type.
+It says nothing about how to judge the site, because that is derived from the
+site itself — see below. A new target therefore needs no preset.
 
 **Why 5E6M.** `GAP` is glycyl-adenylate — the reaction intermediate itself,
 27 atoms covering the glycyl N/CA/C/O, the α-phosphate and the whole

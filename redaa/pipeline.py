@@ -1165,6 +1165,8 @@ class Pipeline:
         if cfg.site_enabled:
             try:
                 site, ref_frames = self.resolve_domain_site(pdb_path, ref_seq)
+                for line in cfg.resolve_site_settings(site, len(ref_seq)):
+                    print(f"         {line}")
                 record("resolve site", bool(site and len(site)),
                        f"{len(site)} positions: {site.describe()}")
             except Exception as exc:  # noqa: BLE001
@@ -1670,6 +1672,12 @@ class Pipeline:
                      "status": f"skipped_site_unresolved: {exc}"}
                 )
                 return
+            # Derive how this site should be judged, from its own shape,
+            # before anything reads a threshold. A target needs no preset to
+            # be judged sensibly; the defaults were calibrated on a
+            # six-residue triad and are wrong for anything larger.
+            poly_n = len(ref_seq)
+            decisions = cfg.resolve_site_settings(site, poly_n)
             site_plan_obj = plan_for(cfg, site)
             if site is None or not len(site):
                 print(
@@ -1688,6 +1696,10 @@ class Pipeline:
             print(f"    positions : {', '.join(site.labels())}")
             print(f"    types     : {''.join(sorted(site.residue_types))}")
             print(f"    policy    : {site_plan_obj.describe(cfg.site_rest_gated)}")
+            if decisions:
+                print("    gating    : derived from this site's shape")
+                for line in decisions:
+                    print(f"      {line}")
             if site.ligands:
                 counts = ", ".join(
                     f"{k} ({v} atoms)" for k, v in sorted(site.ligand_atom_counts.items())

@@ -1287,10 +1287,15 @@ def test_configure_site_takes_the_presets_partners_and_policy():
              ("SITE_KEEP_PARTNERS", "SITE_RESIDUE_POLICY")}
     try:
         applied = C.configure_site(mode="site_aware", preset="glyrs")
+        # A preset supplies what is a property of the case: the structure,
+        # the spec, its ligands and partner chains, the model type. How to
+        # judge the site is derived from the site, so the preset says
+        # nothing about it.
         assert applied["SITE_KEEP_PARTNERS"] == "E"
-        assert applied["SITE_RESIDUE_POLICY"] == "exempt,interface=measure_only"
+        assert applied["SITE_KEEP_LIGANDS"] == "GAP"
+        assert applied["MPNN_MODEL_TYPE"] == "ligand_mpnn"
         assert os.environ["SITE_KEEP_PARTNERS"] == "E"
-        # Anything typed still wins over the preset's recommendation.
+        # Anything typed still wins.
         applied = C.configure_site(
             mode="site_aware", preset="glyrs", policy="measure_only",
             keep_partners="C",

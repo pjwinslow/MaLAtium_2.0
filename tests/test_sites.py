@@ -418,7 +418,7 @@ def test_incomplete_backbone_at_a_site_residue_is_unmeasurable():
 
 
 def test_presets_exist_and_parse():
-    assert set(S.PRESETS) == {"atp", "tev", "glyrs", "alars", "alars_cat"}
+    assert set(S.PRESETS) == {"atp", "tev", "glyrs", "alars"}
     from redaa.config import parse_site_policy
 
     for key in S.PRESETS:
@@ -466,14 +466,7 @@ def test_glyrs_preset_pairs_chain_a_with_the_trna_it_binds():
     spec = S.parse_site_spec(pre.site_spec)
     assert [t.chain for t in spec.partners] == ["E"]
     assert [t.comp_id for t in spec.ligands] == ["GAP"]
-    settings = dict(pre.settings)
-    # One blanket policy would force 18 letters before the search starts.
-    assert "interface=measure_only" in settings["SITE_RESIDUE_POLICY"]
-    # The interface spans the whole chain, so it is measured, not gated.
-    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
-    # The worst-pair CB check grows with site size; the RMS one does not.
-    assert float(settings["SITE_MAX_CB_DEV"]) == 0.0
-    assert float(settings["SITE_MAX_CB_RMS_DEV"]) > 0.0
+    assert pre.settings == ()
 
 
 def test_atp_preset_is_a_ligand_derived_pocket():
@@ -730,24 +723,6 @@ def test_apply_site_leaves_free_positions_alone():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_alars_cat_is_the_same_case_cut_to_fit_a_smaller_card():
-    full = S.preset("alars")
-    cut = S.preset("alars_cat")
-    # Same site, same ligand, same partner chain, same policies.
-    assert cut.site_spec == full.site_spec
-    assert cut.keep_ligands == full.keep_ligands
-    assert cut.keep_partners == full.keep_partners
-    assert dict(cut.settings) == dict(full.settings)
-    # It differs only in carrying a residue range.
-    assert full.fetch_spec == "3wqy_A"
-    assert cut.fetch_spec == "3wqy_A:1-490"
-    from redaa.fetch import parse_spec
-
-    assert parse_spec(cut.fetch_spec).resid_range == (1, 490)
-    # And it says what the cut gives up, since the answer is not AlaRS.
-    assert "catalytic domain" in cut.notes
-
-
 def test_alars_preset_pairs_chain_a_with_its_trna_and_frees_barred_residues():
     """The Ala-free case: hold the pocket, except where that reinstates Ala."""
     pre = S.preset("alars")
@@ -755,16 +730,9 @@ def test_alars_preset_pairs_chain_a_with_its_trna_and_frees_barred_residues():
     spec = S.parse_site_spec(pre.site_spec)
     assert [t.chain for t in spec.partners] == ["C"]
     assert [t.comp_id for t in spec.ligands] == ["A5A"]
-    settings = dict(pre.settings)
-    assert "interface=measure_only" in settings["SITE_RESIDUE_POLICY"]
-    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
-    # Without this, EXCLUDE_AAS=A would be contradicted by the held pocket.
-    assert settings["SITE_FREE_EXCLUDED"] == "1"
-    # Size-stable CB check, as for every site past a few positions.
-    assert float(settings["SITE_MAX_CB_DEV"]) == 0.0
-    assert float(settings["SITE_MAX_CB_RMS_DEV"]) > 0.0
-    # The interface is gated, and more loosely than the pocket.
-    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 1.0
+    # A preset carries no judging settings at all: those are derived from
+    # the site's shape, so a target needs no preset to be judged sensibly.
+    assert pre.settings == ()
 
 
 def test_cb_max_dev_grows_with_site_size_but_the_rms_does_not():
@@ -979,16 +947,67 @@ def test_rest_thresholds_on_an_empty_second_group_cannot_fail():
     assert m.rest_passed(3.0, 2.5, 0.0, 3.0)
 
 
-def test_glyrs_preset_gates_the_interface_loosely_not_at_all():
-    """The pocket is held and judged tightly; the interface is free but placed."""
-    settings = dict(S.preset("glyrs").settings)
-    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
-    # The interface is gated -- "in the same spot" is a requirement.
-    assert float(settings["SITE_REST_MAX_BB_RMSD"]) > 0
-    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 0
-    # ...and more loosely than the pocket, which does the chemistry.
-    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 1.0
-    assert float(settings["SITE_REST_MAX_BB_RMSD"]) > 1.5
+def test_derivation_gates_a_sprawling_interface_loosely_not_at_all():
+    """The pocket is judged tightly; the interface is placed, not shaped.
+
+    Derived from the site's shape rather than written per target, so a new
+    structure needs no preset to be judged this way.
+    """
+    site = _synthetic_site(
+        pocket=range(200, 221),          # 21 residues, compact
+        interface=range(50, 900, 17),    # 50 residues, spanning the chain
+    )
+    got, why = S.derive_site_settings(site, n_polymer=905)
+    assert "interface=measure_only" in got["SITE_RESIDUE_POLICY"]
+    assert got["SITE_GATE_ROLES"] == "contact"
+    # The interface is gated -- "in the same spot" is a requirement -- but
+    # on its own numbers, which are looser than the pocket's.
+    assert got["SITE_REST_MAX_BB_RMSD"] > 1.5
+    assert got["SITE_REST_MAX_LOCAL_RMSD"] > 1.0
+    assert any("judged on placement" in w for w in why), why
+    # 21 gated positions is past where the worst CB pair means anything.
+    assert got["SITE_MAX_CB_DEV"] == 0.0
+    assert got["SITE_MAX_CB_RMS_DEV"] > 0.0
+
+
+def _synthetic_site(pocket, interface):
+    """A ResolvedSite with chosen spans, for testing the derivation itself."""
+    pos = [
+        S.SitePosition(index=i, chain="A", resseq=i + 1, icode="",
+                       native_aa="E", role=S.ROLE_CONTACT)
+        for i in pocket
+    ] + [
+        S.SitePosition(index=i, chain="A", resseq=i + 1, icode="",
+                       native_aa="R", role=S.ROLE_INTERFACE)
+        for i in interface
+    ]
+    return S.ResolvedSite(
+        name="synthetic", positions=tuple(sorted(pos, key=lambda p: p.index)),
+        partners=("C",),
+    )
+
+
+def test_derivation_keeps_one_threshold_set_for_a_compact_site():
+    """A small, local site is judged by one set of numbers, as before."""
+    site = _synthetic_site(pocket=range(40, 46), interface=())
+    got, why = S.derive_site_settings(site, n_polymer=200)
+    assert got["SITE_RESIDUE_POLICY"] == "exempt"
+    assert got["SITE_GATE_ROLES"] == ""          # every role, tightly
+    assert got["SITE_REST_MAX_BB_RMSD"] == 0.0   # nothing outside the gate
+    # Six positions is 15 CB pairs, where the worst pair is still meaningful.
+    assert got["SITE_MAX_CB_DEV"] == 1.5
+    assert got["SITE_MAX_CB_RMS_DEV"] == 0.0
+    assert not any("judged on placement" in w for w in why), why
+
+
+def test_derivation_only_advises_on_an_excluded_held_residue():
+    """It must not resolve a clash between two explicit instructions."""
+    site = _synthetic_site(pocket=range(40, 46), interface=())
+    got, why = S.derive_site_settings(site, n_polymer=200, excluding="E")
+    # The clash is reported...
+    assert any("SITE_FREE_EXCLUDED=1" in w for w in why), why
+    # ...and NOT silently settled: that is the user's call, not a derivation.
+    assert "SITE_FREE_EXCLUDED" not in got
 
 
 def test_config_roles_match_the_site_roles():

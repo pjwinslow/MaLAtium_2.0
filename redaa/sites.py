@@ -1064,6 +1064,147 @@ def apply_site_to_sequence(
 
 
 # ---------------------------------------------------------------------------
+# What a site's shape implies about how to judge it
+# ---------------------------------------------------------------------------
+
+# Thresholds for a group judged on placement rather than chemistry. These are
+# not per-case constants: measured independently on 5E6M and 3WQY, a
+# chain-spanning interface reports BB 2.48/2.50 A, local 2.30/2.32 A and
+# cbRMS 1.94/2.01 A under 1.5 A of correlated backbone error, and roughly
+# 4.3/3.9/3.4 under 2.5 A. The two structures agree to within 0.03 A, which
+# is why these can be derived rather than hand-set per target.
+LOOSE_BB_RMSD = 3.0
+LOOSE_LOCAL_RMSD = 2.5
+LOOSE_CB_RMS_DEV = 3.0
+# Above this many gated positions the worst-CB-pair statistic stops being
+# comparable between sites, because the pair count grows as n^2.
+CB_MAX_USABLE_POSITIONS = 8
+TIGHT_CB_RMS_DEV = 2.0
+
+
+def derive_site_settings(
+    site: ResolvedSite | None,
+    n_polymer: int,
+    excluding: str = "",
+) -> tuple[dict, list[str]]:
+    """The settings a site's shape implies, each with its reason.
+
+    Everything here was previously hand-written per target, which meant a new
+    target needed a new preset before it could be judged sensibly -- and a
+    target without one was judged by defaults calibrated on a six-residue
+    catalytic triad. The shape of a site is measurable, so it is measured.
+
+    Returns ``(settings, reasons)`` where *settings* maps the environment
+    variable name to a resolved value.
+    """
+    out: dict = {}
+    why: list[str] = []
+    if site is None or not site.positions or n_polymer <= 0:
+        return out, why
+
+    groups: dict[str, list[SitePosition]] = {}
+    for pos in site.positions:
+        groups.setdefault(pos.role, []).append(pos)
+
+    def span(ps):
+        idx = [p.index for p in ps]
+        return max(idx) - min(idx) + 1
+
+    # A group whose positions run across most of the chain is describing where
+    # a domain sits, not the geometry of a pocket.
+    sprawling = {
+        role for role, ps in groups.items() if span(ps) > 0.5 * n_polymer
+    }
+
+    # -- policy per role ---------------------------------------------------
+    policies = {}
+    for role in groups:
+        if role == ROLE_INTERFACE:
+            # An interface to another chain is about presenting a surface in
+            # the right place. Holding its identities would force most of the
+            # alphabet before the search began: on both aaRS targets the
+            # interface alone needs 17 of 20 amino acids.
+            policies[role] = "measure_only"
+        else:
+            policies[role] = "exempt"
+    if set(policies.values()) == {"exempt"}:
+        out["SITE_RESIDUE_POLICY"] = "exempt"
+    else:
+        blanket = "exempt"
+        overrides = [
+            f"{r}={p}" for r, p in sorted(policies.items()) if p != blanket
+        ]
+        out["SITE_RESIDUE_POLICY"] = ",".join([blanket] + overrides)
+        for role, pol in sorted(policies.items()):
+            if pol == "measure_only":
+                n = len(groups[role])
+                types = len({p.native_aa for p in groups[role]})
+                why.append(
+                    f"{role}={pol}: {n} residues using {types} of 20 amino "
+                    "acids, so holding their identities would fix the "
+                    "alphabet before the search starts"
+                )
+
+    # -- which roles the tight thresholds apply to -------------------------
+    compact = [r for r in groups if r not in sprawling]
+    if sprawling and compact:
+        out["SITE_GATE_ROLES"] = ",".join(sorted(compact))
+        out["SITE_REST_MAX_BB_RMSD"] = LOOSE_BB_RMSD
+        out["SITE_REST_MAX_LOCAL_RMSD"] = LOOSE_LOCAL_RMSD
+        out["SITE_REST_MAX_CB_RMS_DEV"] = LOOSE_CB_RMS_DEV
+        for role in sorted(sprawling):
+            why.append(
+                f"{role} spans {span(groups[role])} of {n_polymer} residues, "
+                "so it is judged on placement "
+                f"({LOOSE_BB_RMSD:g}/{LOOSE_LOCAL_RMSD:g} A) rather than by "
+                "the pocket's thresholds, which it could never meet"
+            )
+        gated_n = sum(len(groups[r]) for r in compact)
+    else:
+        out["SITE_GATE_ROLES"] = ""
+        out["SITE_REST_MAX_BB_RMSD"] = 0.0
+        out["SITE_REST_MAX_LOCAL_RMSD"] = 0.0
+        out["SITE_REST_MAX_CB_RMS_DEV"] = 0.0
+        gated_n = len(site.positions)
+
+    # -- which CB statistic is meaningful at this size ---------------------
+    if gated_n > CB_MAX_USABLE_POSITIONS:
+        out["SITE_MAX_CB_DEV"] = 0.0
+        out["SITE_MAX_CB_RMS_DEV"] = TIGHT_CB_RMS_DEV
+        why.append(
+            f"{gated_n} gated positions is {gated_n * (gated_n - 1) // 2} "
+            "CB-CB pairs, so the worst pair is not comparable with a small "
+            f"site's; gating the RMS at {TIGHT_CB_RMS_DEV:g} A instead"
+        )
+    else:
+        out["SITE_MAX_CB_DEV"] = 1.5
+        out["SITE_MAX_CB_RMS_DEV"] = 0.0
+
+    # A held position whose residue the run has barred is NOT decided here.
+    # SITE_FREE_EXCLUDED stays opt-in on purpose: EXCLUDE_AAS and a policy
+    # that holds the site are both explicit instructions, and resolving the
+    # contradiction by quietly dropping one of them is not a derivation. The
+    # run already names the clash and the switch that settles it. What is
+    # derived here is how to JUDGE a site, which the user has said nothing
+    # about; what to hold is theirs.
+    barred = {c.strip().upper() for c in excluding if c.strip()}
+    if barred:
+        clash = sorted({
+            p.native_aa for p in site.positions
+            if policies.get(p.role, "exempt") != "measure_only"
+            and p.native_aa in barred
+        })
+        if clash:
+            why.append(
+                f"note: EXCLUDE_AAS bars {', '.join(clash)}, which the site "
+                "would hold at native identity. Set SITE_FREE_EXCLUDED=1 to "
+                "free those positions instead; left as it is, the residue "
+                "stays in the protein"
+            )
+    return out, why
+
+
+# ---------------------------------------------------------------------------
 # Verified test cases
 # ---------------------------------------------------------------------------
 
@@ -1172,39 +1313,6 @@ PRESETS: dict[str, SitePreset] = {
         # the adenylate is 20 residues; the tRNA interface is 48, and between
         # them they use 18 of the 20 amino acids. Held under in_alphabet the
         # "minimal" alphabet would be 18 letters before the search began.
-        settings=(
-            # The pocket is 20 residues using 9 amino acids; the tRNA
-            # interface is 48 using 18. One policy for both would force an
-            # 18-letter alphabet before the search started, so the interface
-            # is designed freely and judged on geometry alone.
-            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
-            # The pocket spans sequence indices 158-369; the interface spans
-            # 54-515, essentially the whole chain. A 1.0 A local RMSD over a
-            # chain-spanning 48-residue set is a harder test than the global
-            # fold gate, so gating it would reject everything. The pocket is
-            # gated; the interface is measured and reported.
-            ("SITE_GATE_ROLES", "catalytic,contact"),
-            # Measured on these coordinates under 1 A of correlated backbone
-            # error: the worst CB-CB pair averages 2.6 A over 6 positions and
-            # 3.7 A over this pocket's 20, because the pair count grows as
-            # n^2. The RMS over pairs is 1.38 A either way. So the worst-pair
-            # check is switched off and the size-stable one gated instead.
-            ("SITE_MAX_CB_DEV", "0"),
-            ("SITE_MAX_CB_RMS_DEV", "2.0"),
-            # The interface IS gated, on its own looser numbers. The two
-            # halves are asked for different things: the pocket has to put
-            # side chains within bonding distance of an adenylate, while the
-            # interface has to be in the right place and present the right
-            # surface to a 75-nucleotide RNA. Measured on these coordinates,
-            # the interface shows BB 2.48 A / local 2.30 A / cbRMS 1.94 A
-            # under 1.5 A of correlated backbone error and roughly 4 / 3.9 /
-            # 3.4 under 2.5 A, so these thresholds accept a domain that is
-            # placed correctly to within about 2 A and reject one that has
-            # drifted further.
-            ("SITE_REST_MAX_BB_RMSD", "3.0"),
-            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
-            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
-        ),
         title="Glycyl-adenylate pocket + tRNA interface -- human GlyRS (5E6M, 2.93 A)",
         notes=(
             "Human wild-type GlyRS (GARS, P41250, EC 6.1.1.14) with "
@@ -1236,27 +1344,6 @@ PRESETS: dict[str, SitePreset] = {
         keep_ligands=("A5A",),
         keep_partners=("C",),
         mpnn_model_type="ligand_mpnn",
-        settings=(
-            # 21-residue pocket (indices 97-247) and a 52-residue interface
-            # spanning 91-881. Together they use 19 of the 20 amino acids, so
-            # a blanket in_alphabet would fix the answer before the search.
-            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
-            ("SITE_GATE_ROLES", "catalytic,contact"),
-            ("SITE_MAX_CB_DEV", "0"),
-            ("SITE_MAX_CB_RMS_DEV", "2.0"),
-            # Measured on these coordinates: the interface reports BB 2.50 A
-            # / local 2.32 A / cbRMS 2.01 A under 1.5 A of correlated
-            # backbone error and 4.29 / 3.96 / 3.47 under 2.5 A, so these
-            # accept a domain placed correctly to within roughly 2 A.
-            ("SITE_REST_MAX_BB_RMSD", "3.0"),
-            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
-            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
-            # Inert unless EXCLUDE_AAS is set. With EXCLUDE_AAS=A it frees
-            # the only two alanines in the pocket (A99 and A211) rather than
-            # holding them and contradicting the exclusion. Neither is a
-            # specificity determinant -- see the notes.
-            ("SITE_FREE_EXCLUDED", "1"),
-        ),
         title=(
             "Alanyl-adenylate pocket + tRNA interface -- A. fulgidus AlaRS "
             "(3WQY, 3.3 A)"
@@ -1289,56 +1376,6 @@ PRESETS: dict[str, SitePreset] = {
             "no analogue of the positive-phi problem that makes a Gly-free "
             "GlyRS a different kind of question. Two cis-prolines (106, 119) "
             "force P into every alphabet regardless."
-        ),
-    ),
-    "alars_cat": SitePreset(
-        key="alars_cat",
-        # Residues 1-490 of the same entry: 489 modelled residues, which fits
-        # a 24 GB card's 512 cap where the full 905 does not. 490 is not an
-        # arbitrary cut. Severed CB-CB contacts per 100 residues, measured on
-        # these coordinates across end points from 240 to 560, are lowest at
-        # 480-500 (16-17) and worst in the 240-320 range (46-97), so a cut
-        # near 490 is the one place the chain comes apart cleanly -- and a
-        # 320-residue construct, which is what a 16 GB card would need, has
-        # no acceptable cut at all.
-        fetch_spec="3wqy_A:1-490",
-        site_spec="ligand:A5A@4.5 partner:C@4.5",
-        keep_ligands=("A5A",),
-        keep_partners=("C",),
-        mpnn_model_type="ligand_mpnn",
-        settings=(
-            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
-            ("SITE_GATE_ROLES", "catalytic,contact"),
-            ("SITE_MAX_CB_DEV", "0"),
-            ("SITE_MAX_CB_RMS_DEV", "2.0"),
-            ("SITE_REST_MAX_BB_RMSD", "3.0"),
-            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
-            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
-            ("SITE_FREE_EXCLUDED", "1"),
-        ),
-        title=(
-            "AlaRS catalytic domain + acceptor-stem interface -- "
-            "A. fulgidus (3WQY, residues 1-490)"
-        ),
-        notes=(
-            "The alars case cut down to what a 24 GB card can fold. Use this "
-            "when the full 905-residue chain exceeds FOLD_MAX_RESIDUES; use "
-            "alars when it does not. What survives the cut, computed from "
-            "the coordinates: the alanyl-adenylate pocket entire (all 21 "
-            "residues, author 99-249) and 32 of the 52 tRNA-interface "
-            "residues. What survives is also the right 32. The N-terminal "
-            "half contacts the tRNA acceptor stem (13 nucleotides) and D-arm "
-            "(4); the discarded C-terminal half contributes only scattered "
-            "contacts across the acceptor stem, D-arm, T-arm, variable loop "
-            "and anticodon stem. Crucially the G3-U70 pair -- the single "
-            "base pair that makes a tRNA alanine-accepting, and the reason "
-            "this entry was solved -- is still read: G1603 is contacted by "
-            "D450 and S451, and U1670 by T422, G453, N359, D450, Y449, H452, "
-            "S451 and R371, every one of them inside 1-490. Only D727, the "
-            "weakest of those contacts at 4.2 A, is lost. So this construct "
-            "keeps both the amino-acid specificity pocket and the tRNA "
-            "identity determinant, and gives up the editing-domain contacts. "
-            "Report it as the catalytic domain, not as AlaRS."
         ),
     ),
 }

@@ -592,7 +592,7 @@ code_with_bootstrap(
 #@markdown Pick a `SITE_PRESET` to load a verified test case and leave
 #@markdown `PDB_SPECS` alone — it fills in the structure and the ligands to
 #@markdown keep. `none` uses whatever you type.
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars", "alars_cat"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
 INPUT_MODE = "fetch" #@param ["fetch", "upload", "drive_folder", "both"]
 PDB_SPECS = "1ubq_A\\n2gb1_A" #@param {type:"string"}
 CHAIN_OVERRIDE = "" #@param {type:"string"}
@@ -821,7 +821,7 @@ code_with_bootstrap(
     """
 #@title Step 5 — Mode and functional site
 SEARCH_MODE = "alphabet_only" #@param ["alphabet_only", "site_aware", "scaffold_then_site"]
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars", "alars_cat"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
 SITE_SPEC = "" #@param {type:"string"}
 SITE_CHAIN = "" #@param {type:"string"}
 #@markdown One policy for every role, or a blanket policy plus per-role
@@ -836,11 +836,14 @@ SITE_GATE = True #@param {type:"boolean"}
 SITE_MAX_BB_RMSD = 1.5 #@param {type:"number"}
 SITE_MAX_LOCAL_RMSD = 1.0 #@param {type:"number"}
 SITE_MAX_CB_DEV = 1.5 #@param {type:"number"}
-#@markdown `SITE_MAX_CB_DEV` gates the **worst** CB–CB pair. That statistic
-#@markdown grows with site size at unchanged accuracy, so for anything past a
-#@markdown handful of positions set it to 0 and gate `SITE_MAX_CB_RMS_DEV`
-#@markdown instead, which is size-stable. `SITE_GATE_ROLES` limits the gate to
-#@markdown some roles; the rest are still measured and reported.
+#@markdown **Leave these alone unless you mean to override.** Every one is
+#@markdown derived from the site's shape when left at its default, and the run
+#@markdown prints each decision with its reason. Set a value and yours is kept
+#@markdown and reported as yours. `SITE_MAX_CB_DEV` gates the **worst** CB–CB
+#@markdown pair, which grows with site size at unchanged accuracy, so past a
+#@markdown handful of positions the derivation switches to the size-stable
+#@markdown `SITE_MAX_CB_RMS_DEV`. `SITE_GATE_ROLES` names the tightly-gated
+#@markdown roles; the rest get the `SITE_REST_MAX_*` numbers.
 SITE_MAX_CB_RMS_DEV = 0.0 #@param {type:"number"}
 SITE_GATE_ROLES = "" #@param ["", "catalytic,contact", "catalytic"] {allow-input: true}
 #@markdown The roles left out of `SITE_GATE_ROLES` are judged by these

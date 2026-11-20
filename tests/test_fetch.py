@@ -892,6 +892,118 @@ def test_chain_classification():
     assert F._classify_chain([]) == "other"
 
 
+def test_cif_conversion_keeps_ligands_and_non_protein_chains():
+    """A CIF must be exactly as capable as the same entry in PDB format.
+
+    It was not: the converter kept protein ATOM records alone, so a locally
+    prepared CIF lost its ligand and its whole tRNA chain on the way in. A
+    configured site then resolved to nothing and the run went ahead against a
+    bare backbone -- with ligand_mpnn selected and no ligand atoms to see.
+    """
+    cif = """data_test
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.pdbx_formal_charge
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+ATOM   1 N N   . ALA A 1 1 ? 0.000 0.000 0.000 1.00 10.00 0 A 1
+ATOM   2 C CA  . ALA A 1 1 ? 1.000 0.000 0.000 1.00 10.00 0 A 1
+ATOM   3 C C   . ALA A 1 1 ? 2.000 0.000 0.000 1.00 10.00 0 A 1
+ATOM   4 P P   . G   C 2 1601 ? 3.000 3.000 0.000 1.00 20.00 0 C 1
+ATOM   5 C C1' . G   C 2 1601 ? 3.500 3.500 0.000 1.00 20.00 0 C 1
+HETATM 6 N N   . A5A D 3 1001 ? 1.000 2.000 0.000 1.00 30.00 0 A 1
+HETATM 7 C CB  . A5A D 3 1001 ? 1.500 2.500 0.000 1.00 30.00 0 A 1
+HETATM 8 O O   . HOH E 4 2001 ? 50.00 50.00 50.00 1.00 40.00 0 A 1
+"""
+    out = F.cif_to_pdb(cif)
+    lines = [l for l in out.splitlines() if l.startswith(("ATOM", "HETATM"))]
+    kinds = {}
+    for l in lines:
+        kinds.setdefault(l[17:20].strip(), []).append(l[:6])
+    # The protein stays ATOM, so the polymer parsers see it.
+    assert kinds["ALA"] == ["ATOM  ", "ATOM  ", "ATOM  "], kinds
+    # The ligand survives at all, which it did not before.
+    assert kinds["A5A"] == ["HETATM", "HETATM"], kinds
+    # A nucleotide written as ATOM in the CIF becomes HETATM here: emitting
+    # it as ATOM would splice a tRNA into the designed chain's sequence.
+    assert kinds["G"] == ["HETATM", "HETATM"], kinds
+    # Water is still dropped; a CIF can carry thousands.
+    assert "HOH" not in kinds, kinds
+    # Chains are preserved, so partner:C can select the nucleic chain.
+    assert {l[21] for l in lines if l[17:20].strip() == "G"} == {"C"}
+
+
+def test_a_cif_with_a_ligand_and_a_partner_prepares_like_a_pdb():
+    """End to end: the same content, via CIF, reaches the site machinery."""
+    from redaa import sites as S
+    from redaa import structure as st
+
+    tmp = tempfile.mkdtemp()
+    try:
+        pdb_text = _partner_pdb()
+        # Round-trip the PDB fixture's content through a minimal CIF.
+        rows = []
+        serial = 0
+        for line in pdb_text.splitlines():
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            serial += 1
+            rec = "ATOM" if line.startswith("ATOM") else "HETATM"
+            name = line[12:16].strip()
+            comp = line[17:20].strip()
+            ch = line[21]
+            seq = int(line[22:26])
+            x, y, z = line[30:38], line[38:46], line[46:54]
+            rows.append(
+                f"{rec} {serial} {name[:1]} {name} . {comp} {ch} 1 {seq} ? "
+                f"{float(x)} {float(y)} {float(z)} 1.00 0.00 0 {ch} 1"
+            )
+        header = [
+            "data_test", "loop_",
+            "_atom_site.group_PDB", "_atom_site.id", "_atom_site.type_symbol",
+            "_atom_site.label_atom_id", "_atom_site.label_alt_id",
+            "_atom_site.label_comp_id", "_atom_site.label_asym_id",
+            "_atom_site.label_entity_id", "_atom_site.label_seq_id",
+            "_atom_site.pdbx_PDB_ins_code", "_atom_site.Cartn_x",
+            "_atom_site.Cartn_y", "_atom_site.Cartn_z", "_atom_site.occupancy",
+            "_atom_site.B_iso_or_equiv", "_atom_site.pdbx_formal_charge",
+            "_atom_site.auth_asym_id", "_atom_site.pdbx_PDB_model_num",
+        ]
+        cif_path = os.path.join(tmp, "x.cif")
+        with open(cif_path, "w") as fh:
+            fh.write("\n".join(header + rows) + "\n")
+
+        out = os.path.join(tmp, "out.pdb")
+        report = F.prepare(
+            F.read_structure_text(cif_path), out, chain="A",
+            keep_partners=("D",), spec="x_A",
+        )
+        assert report["n_residues"] == 6, report
+        assert [c for c, *_ in report["partners_kept"]] == ["D"], report
+        recs = st.parse_residues_from_file(
+            out, atom_names=None, include_hetatm=True
+        )
+        site = S.resolve_site(S.parse_site_spec("partner:D@6.0"), recs)
+        assert len(site) > 0, "the partner interface vanished via CIF"
+        assert site.partner_atom_counts.get("D", 0) > 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]
