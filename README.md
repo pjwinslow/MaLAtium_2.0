@@ -804,6 +804,7 @@ taken from memory.
 | `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
 | `glyrs` | `5e6m_A` — human GlyRS·tRNA-Gly, 2.93 Å, 519 residues | `ligand:GAP@4.5 partner:E@4.5` → 20 + 48 residues | Catalytic site **and** tRNA interface from one structure |
 | `alars` | `3wqy_A` — *A. fulgidus* AlaRS·tRNA-Ala, 3.3 Å, 905 residues | `ligand:A5A@4.5 partner:C@4.5` → 21 + 52 residues | The same, cleaner: no chain gaps, 95% single-subunit interface |
+| `alars_cat` | `3wqy_A:1-490` — the same, 489 residues | the same spec → 21 + 32 residues | For a 24 GB card, where the full 905 will not fold |
 
 **Why 3WQY for AlaRS.** `A5A` is 5'-O-[N-(L-alanyl)sulfamoyl]adenosine, the
 non-hydrolysable alanyl-adenylate analogue — 28 atoms carrying the alanyl
@@ -817,6 +818,33 @@ is UniProt numbering here (DBREF 1-906 → O28029 1-906), unlike 5E6M.
 
 AlaRS still dimerises (chain B contacts 67 residues of chain A), so a result
 describes one subunit of a dimer.
+
+**905 residues is the catch.** ESMFold2's memory is what sets
+`FOLD_MAX_RESIDUES`, and the notebook's GPU cell derives it from VRAM: 320
+under 17 GB (T4, V100), 512 under 26 GB (L4), 1024 above (A100). The full
+chain folds only on the last of those. Raising the cap on a smaller card buys
+an out-of-memory error instead of a skip, so this is a hardware fact, not a
+setting — and preflight now fails on it before loading a model rather than
+after resolving the site.
+
+`alars_cat` is the answer for a 24 GB card, and the cut is not arbitrary.
+Severed CB–CB contacts per 100 residues, measured on these coordinates across
+end points from 240 to 560, are lowest at 480–500 (16–17) and worst in the
+240–320 band (46–97) — so there is a clean seam near 490 and **no acceptable
+cut at all near 320**, which is what a 16 GB card would need. At 1–490 the
+construct keeps:
+
+- the alanyl-adenylate pocket entire (21/21 residues, author 99–249);
+- 32 of 52 tRNA-interface residues, and the right 32 — the N-terminal half
+  contacts the acceptor stem (13 nucleotides) and D-arm (4), while the
+  discarded half contributes only scattered contacts across five regions;
+- the **G3·U70 pair**, the single base pair that makes a tRNA
+  alanine-accepting and the reason this entry was solved. G1603 is read by
+  D450 and S451, U1670 by T422, G453, N359, D450, Y449, H452, S451 and R371 —
+  every one inside 1–490. Only D727, the weakest at 4.2 Å, is lost.
+
+What it gives up is the editing-domain contacts, so report it as the catalytic
+domain rather than as AlaRS.
 
 A preset also carries the settings its case needs where the blanket defaults
 get it wrong, applied only where you have not set them yourself;

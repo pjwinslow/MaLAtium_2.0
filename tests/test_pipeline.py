@@ -1837,6 +1837,51 @@ def test_site_free_excluded_frees_the_barred_positions_and_says_so():
         assert row["site_n_held"] == "2", row["site_n_held"]
 
 
+def test_preflight_fails_early_when_an_input_exceeds_the_fold_cap():
+    """A target too long for the card is a hardware fact, not a setting.
+
+    This used to surface as "no model for the native sequence" after the
+    whole site had been resolved, which reads like a model failure. It cost
+    a Colab session. Now it fails first, before any model is loaded, and
+    says why the cap exists.
+    """
+    import contextlib
+    import io
+
+    from redaa import structure as st
+
+    with tempfile.TemporaryDirectory(prefix="redaa_cap_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        length = len(st.parse_ca_from_file(ref)[1])
+
+        cfg = _make_config(tmp, fold_max_residues=length - 1)
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = ref
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pipe.preflight()
+        out = buf.getvalue()
+        assert rc == 1
+        assert "inputs fit FOLD_MAX_RESIDUES" in out, out[-700:]
+        # It has to say the cap tracks VRAM, or the reader just raises it.
+        assert "VRAM" in out
+        assert "larger card or a shorter construct" in out
+        # And it must come before the models are touched.
+        assert "load models" not in out
+
+        # With room, the same check passes and says so.
+        cfg = _make_config(tmp, fold_max_residues=length + 10)
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = ref
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pipe.preflight()
+        out = buf.getvalue()
+        assert "[ok  ] inputs fit FOLD_MAX_RESIDUES" in out, out[-700:]
+
+
 def test_the_designer_and_the_validator_get_the_same_plan():
     """One fact, one implementation.
 

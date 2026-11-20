@@ -592,7 +592,7 @@ code_with_bootstrap(
 #@markdown Pick a `SITE_PRESET` to load a verified test case and leave
 #@markdown `PDB_SPECS` alone — it fills in the structure and the ligands to
 #@markdown keep. `none` uses whatever you type.
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars", "alars_cat"]
 INPUT_MODE = "fetch" #@param ["fetch", "upload", "drive_folder", "both"]
 PDB_SPECS = "1ubq_A\\n2gb1_A" #@param {type:"string"}
 CHAIN_OVERRIDE = "" #@param {type:"string"}
@@ -821,7 +821,7 @@ code_with_bootstrap(
     """
 #@title Step 5 — Mode and functional site
 SEARCH_MODE = "alphabet_only" #@param ["alphabet_only", "site_aware", "scaffold_then_site"]
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars", "alars_cat"]
 SITE_SPEC = "" #@param {type:"string"}
 SITE_CHAIN = "" #@param {type:"string"}
 #@markdown One policy for every role, or a blanket policy plus per-role

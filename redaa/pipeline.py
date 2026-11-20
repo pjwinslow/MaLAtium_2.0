@@ -1118,6 +1118,37 @@ class Pipeline:
         record("parse reference", len(ref_xyz) >= 15,
                f"{domain}: {len(ref_xyz)} residues")
 
+        # Length against the fold cap, before any model is loaded. The cap is
+        # set from VRAM by the notebook's GPU cell, so a target that is simply
+        # too long for the card is a hardware fact, not a setting to raise:
+        # raising it buys an out-of-memory error instead of a skip. This used
+        # to surface only as "no model for the native sequence" after the
+        # whole site had been resolved, which reads like a model failure.
+        over = [
+            (name, n) for name, n in (
+                (d, _length(item)) for d, item in
+                ((dd, (dd, pp)) for dd, pp in domains)
+            ) if n > cfg.fold_max_residues
+        ]
+        if over:
+            worst = max(n for _d, n in over)
+            record(
+                "inputs fit FOLD_MAX_RESIDUES", False,
+                f"{len(over)} of {len(domains)} input(s) are longer than "
+                f"FOLD_MAX_RESIDUES={cfg.fold_max_residues} (longest "
+                f"{worst}); they would be skipped, not folded. That cap comes "
+                "from the GPU's VRAM, so the fix is a larger card or a "
+                "shorter construct -- raising it on this card buys an "
+                "out-of-memory error instead of a skip",
+            )
+            self._preflight_summary(checks)
+            return 1
+        record(
+            "inputs fit FOLD_MAX_RESIDUES", True,
+            f"longest {max(_length((d, p)) for d, p in domains)} <= "
+            f"{cfg.fold_max_residues}",
+        )
+
         # -- engines -------------------------------------------------------
         try:
             self.setup()
@@ -1682,7 +1713,8 @@ class Pipeline:
                     "threshold set for a small site rejects almost "
                     "everything here.\n"
                     "      Prefer the size-stable check: SITE_MAX_CB_DEV=0 "
-                    "with SITE_MAX_CB_RMS_DEV=2.0 (--preset glyrs does this)."
+                    "with SITE_MAX_CB_RMS_DEV=2.0, which every multi-residue "
+                    "preset sets for you."
                 )
             with open(info_path, "a") as fh:
                 fh.write("\nFunctional site:\n")

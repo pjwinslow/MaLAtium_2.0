@@ -1291,6 +1291,56 @@ PRESETS: dict[str, SitePreset] = {
             "force P into every alphabet regardless."
         ),
     ),
+    "alars_cat": SitePreset(
+        key="alars_cat",
+        # Residues 1-490 of the same entry: 489 modelled residues, which fits
+        # a 24 GB card's 512 cap where the full 905 does not. 490 is not an
+        # arbitrary cut. Severed CB-CB contacts per 100 residues, measured on
+        # these coordinates across end points from 240 to 560, are lowest at
+        # 480-500 (16-17) and worst in the 240-320 range (46-97), so a cut
+        # near 490 is the one place the chain comes apart cleanly -- and a
+        # 320-residue construct, which is what a 16 GB card would need, has
+        # no acceptable cut at all.
+        fetch_spec="3wqy_A:1-490",
+        site_spec="ligand:A5A@4.5 partner:C@4.5",
+        keep_ligands=("A5A",),
+        keep_partners=("C",),
+        mpnn_model_type="ligand_mpnn",
+        settings=(
+            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
+            ("SITE_GATE_ROLES", "catalytic,contact"),
+            ("SITE_MAX_CB_DEV", "0"),
+            ("SITE_MAX_CB_RMS_DEV", "2.0"),
+            ("SITE_REST_MAX_BB_RMSD", "3.0"),
+            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
+            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
+            ("SITE_FREE_EXCLUDED", "1"),
+        ),
+        title=(
+            "AlaRS catalytic domain + acceptor-stem interface -- "
+            "A. fulgidus (3WQY, residues 1-490)"
+        ),
+        notes=(
+            "The alars case cut down to what a 24 GB card can fold. Use this "
+            "when the full 905-residue chain exceeds FOLD_MAX_RESIDUES; use "
+            "alars when it does not. What survives the cut, computed from "
+            "the coordinates: the alanyl-adenylate pocket entire (all 21 "
+            "residues, author 99-249) and 32 of the 52 tRNA-interface "
+            "residues. What survives is also the right 32. The N-terminal "
+            "half contacts the tRNA acceptor stem (13 nucleotides) and D-arm "
+            "(4); the discarded C-terminal half contributes only scattered "
+            "contacts across the acceptor stem, D-arm, T-arm, variable loop "
+            "and anticodon stem. Crucially the G3-U70 pair -- the single "
+            "base pair that makes a tRNA alanine-accepting, and the reason "
+            "this entry was solved -- is still read: G1603 is contacted by "
+            "D450 and S451, and U1670 by T422, G453, N359, D450, Y449, H452, "
+            "S451 and R371, every one of them inside 1-490. Only D727, the "
+            "weakest of those contacts at 4.2 A, is lost. So this construct "
+            "keeps both the amino-acid specificity pocket and the tRNA "
+            "identity determinant, and gives up the editing-domain contacts. "
+            "Report it as the catalytic domain, not as AlaRS."
+        ),
+    ),
 }
 
 

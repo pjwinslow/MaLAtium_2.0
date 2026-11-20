@@ -418,7 +418,7 @@ def test_incomplete_backbone_at_a_site_residue_is_unmeasurable():
 
 
 def test_presets_exist_and_parse():
-    assert set(S.PRESETS) == {"atp", "tev", "glyrs", "alars"}
+    assert set(S.PRESETS) == {"atp", "tev", "glyrs", "alars", "alars_cat"}
     from redaa.config import parse_site_policy
 
     for key in S.PRESETS:
@@ -728,6 +728,24 @@ def test_apply_site_leaves_free_positions_alone():
             assert full[i] == "ACDEFGH"[i]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_alars_cat_is_the_same_case_cut_to_fit_a_smaller_card():
+    full = S.preset("alars")
+    cut = S.preset("alars_cat")
+    # Same site, same ligand, same partner chain, same policies.
+    assert cut.site_spec == full.site_spec
+    assert cut.keep_ligands == full.keep_ligands
+    assert cut.keep_partners == full.keep_partners
+    assert dict(cut.settings) == dict(full.settings)
+    # It differs only in carrying a residue range.
+    assert full.fetch_spec == "3wqy_A"
+    assert cut.fetch_spec == "3wqy_A:1-490"
+    from redaa.fetch import parse_spec
+
+    assert parse_spec(cut.fetch_spec).resid_range == (1, 490)
+    # And it says what the cut gives up, since the answer is not AlaRS.
+    assert "catalytic domain" in cut.notes
 
 
 def test_alars_preset_pairs_chain_a_with_its_trna_and_frees_barred_residues():
