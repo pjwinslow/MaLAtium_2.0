@@ -781,8 +781,22 @@ def test_configure_site_sets_the_environment():
         assert applied["SEARCH_MODE"] == "site_aware"
         assert os.environ["SEARCH_MODE"] == "site_aware"
         assert os.environ["SITE_SPEC"] == "H46 D81 C151"
-        assert os.environ["SITE_RESIDUE_POLICY"] == "exempt"
         assert os.environ["SITE_GATE"] == "1"
+        # A field left at the form default is written as "auto", so the run
+        # derives it from the site. Writing the literal default pinned six of
+        # the seven derivable settings on every notebook run and reported
+        # them back as the user's, which disabled the derivation entirely.
+        assert os.environ["SITE_RESIDUE_POLICY"] == "auto"
+        assert os.environ["SITE_MAX_CB_DEV"] == "auto"
+        assert os.environ["SITE_REST_MAX_BB_RMSD"] == "auto"
+
+        # A typed value is written through and counts as a choice.
+        C.configure_site(mode="site_aware", spec="H46", max_cb_dev=2.5)
+        assert os.environ["SITE_MAX_CB_DEV"] == "2.5"
+        assert os.environ["SITE_MAX_CB_RMS_DEV"] == "auto"
+        from redaa.config import RedAAConfig
+
+        assert RedAAConfig().site_explicit == frozenset({"SITE_MAX_CB_DEV"})
     finally:
         _clear_site_env()
 

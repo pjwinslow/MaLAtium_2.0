@@ -639,6 +639,26 @@ def configure_site(
     if problems:
         raise ValueError("; ".join(problems))
 
+    # A field left at the form's default is not a choice: write "auto" so the
+    # run derives it from the site. Writing the literal default pinned six of
+    # the seven derivable settings on every run and reported them as the
+    # user's, which silently disabled the derivation in the notebook.
+    _FORM_DEFAULTS = {
+        "SITE_RESIDUE_POLICY": ("exempt", policy),
+        "SITE_GATE_ROLES": ("", gate_roles),
+        "SITE_MAX_CB_DEV": (1.5, max_cb_dev),
+        "SITE_MAX_CB_RMS_DEV": (0.0, max_cb_rms_dev),
+        "SITE_REST_MAX_BB_RMSD": (0.0, rest_max_bb_rmsd),
+        "SITE_REST_MAX_LOCAL_RMSD": (0.0, rest_max_local_rmsd),
+        "SITE_REST_MAX_CB_RMS_DEV": (0.0, rest_max_cb_rms_dev),
+    }
+
+    def _or_auto(key: str, text: str) -> str:
+        default, given = _FORM_DEFAULTS[key]
+        if isinstance(default, str):
+            return "auto" if str(given).strip() == default else text
+        return "auto" if abs(float(given) - default) < 1e-9 else text
+
     # Always decide the model type here, rather than only when one is given.
     # A notebook's cells get re-run in any order: configuring the ATP preset
     # once leaves MPNN_MODEL_TYPE=ligand_mpnn in the environment, and if a
@@ -655,16 +675,16 @@ def configure_site(
         "SITE_KEEP_LIGANDS": keep_ligands.strip(),
         "SITE_KEEP_PARTNERS": keep_partners.strip(),
         "SITE_CONTACT_MAX": str(int(contact_max)),
-        "SITE_RESIDUE_POLICY": policy,
+        "SITE_RESIDUE_POLICY": _or_auto("SITE_RESIDUE_POLICY", policy),
         "SITE_GATE": "1" if gate else "0",
-        "SITE_GATE_ROLES": gate_roles.strip(),
+        "SITE_GATE_ROLES": _or_auto("SITE_GATE_ROLES", gate_roles.strip()),
         "SITE_MAX_BB_RMSD": str(float(max_bb_rmsd)),
         "SITE_MAX_LOCAL_RMSD": str(float(max_local_rmsd)),
-        "SITE_MAX_CB_DEV": str(float(max_cb_dev)),
-        "SITE_MAX_CB_RMS_DEV": str(float(max_cb_rms_dev)),
-        "SITE_REST_MAX_BB_RMSD": str(float(rest_max_bb_rmsd)),
-        "SITE_REST_MAX_LOCAL_RMSD": str(float(rest_max_local_rmsd)),
-        "SITE_REST_MAX_CB_RMS_DEV": str(float(rest_max_cb_rms_dev)),
+        "SITE_MAX_CB_DEV": _or_auto("SITE_MAX_CB_DEV", str(float(max_cb_dev))),
+        "SITE_MAX_CB_RMS_DEV": _or_auto("SITE_MAX_CB_RMS_DEV", str(float(max_cb_rms_dev))),
+        "SITE_REST_MAX_BB_RMSD": _or_auto("SITE_REST_MAX_BB_RMSD", str(float(rest_max_bb_rmsd))),
+        "SITE_REST_MAX_LOCAL_RMSD": _or_auto("SITE_REST_MAX_LOCAL_RMSD", str(float(rest_max_local_rmsd))),
+        "SITE_REST_MAX_CB_RMS_DEV": _or_auto("SITE_REST_MAX_CB_RMS_DEV", str(float(rest_max_cb_rms_dev))),
         "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
         "SITE_FREE_EXCLUDED": "1" if free_excluded else "0",
     }

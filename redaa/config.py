@@ -568,15 +568,16 @@ class RedAAConfig:
         """
         out = set()
         for name in self.SITE_AUTO_ENV:
-            raw = os.environ.get(name)
-            if raw is not None and raw.strip().lower() not in ("", "auto"):
-                out.add(name)
-                continue
             field_name = self.ENV_TO_FIELD.get(name)
             if field_name is None:
                 continue
             current = getattr(self, field_name, None)
             default = self.SITE_AUTO_DEFAULTS.get(name)
+            # A value equal to the default is not a choice, however it
+            # arrived. Treating mere presence in the environment as a choice
+            # disabled the derivation entirely in the notebook, because the
+            # settings cell writes every variable on every run -- so six of
+            # seven were pinned to their defaults and reported as "yours".
             if isinstance(default, float):
                 if current is not None and abs(float(current) - default) > 1e-9:
                     out.add(name)
@@ -600,6 +601,7 @@ class RedAAConfig:
             return []
         explicit = self.site_explicit
         lines: list[str] = []
+        applied: set[str] = set()
         for name in self.SITE_AUTO_ENV:
             if name not in derived:
                 continue
@@ -616,8 +618,14 @@ class RedAAConfig:
                 else (f"{value:g}" if isinstance(value, float) else str(value))
             )
             self.apply_env_setting(name, text)
+            applied.add(name)
             lines.append(f"{name}={text or '(all roles)'} (derived)")
-        return lines + [f"-> {w}" for w in why]
+        # Only the reasons for decisions actually taken. A reason beside a
+        # setting the user overrode describes something that did not happen.
+        return lines + [
+            f"-> {text}" for key, text in why
+            if key is None or key in applied
+        ]
 
     # Env var -> config attribute, for the settings a preset may carry.
     ENV_TO_FIELD = {

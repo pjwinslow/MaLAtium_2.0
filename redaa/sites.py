@@ -1094,11 +1094,16 @@ def derive_site_settings(
     target without one was judged by defaults calibrated on a six-residue
     catalytic triad. The shape of a site is measurable, so it is measured.
 
-    Returns ``(settings, reasons)`` where *settings* maps the environment
-    variable name to a resolved value.
+    Returns ``(settings, reasons)``, where *settings* maps an environment
+    variable name to a resolved value and each reason is tagged with the
+    variable it justifies (or ``None`` for a general note).  The tag matters:
+    a reason printed next to a setting the user overrode describes a decision
+    that was not taken, and one run's log duly announced
+    "interface=measure_only" while the policy in force was
+    "interface=exempt".
     """
     out: dict = {}
-    why: list[str] = []
+    why: list[tuple[str | None, str]] = []
     if site is None or not site.positions or n_polymer <= 0:
         return out, why
 
@@ -1139,11 +1144,12 @@ def derive_site_settings(
             if pol == "measure_only":
                 n = len(groups[role])
                 types = len({p.native_aa for p in groups[role]})
-                why.append(
+                why.append((
+                    "SITE_RESIDUE_POLICY",
                     f"{role}={pol}: {n} residues using {types} of 20 amino "
                     "acids, so holding their identities would fix the "
-                    "alphabet before the search starts"
-                )
+                    "alphabet before the search starts",
+                ))
 
     # -- which roles the tight thresholds apply to -------------------------
     compact = [r for r in groups if r not in sprawling]
@@ -1153,12 +1159,13 @@ def derive_site_settings(
         out["SITE_REST_MAX_LOCAL_RMSD"] = LOOSE_LOCAL_RMSD
         out["SITE_REST_MAX_CB_RMS_DEV"] = LOOSE_CB_RMS_DEV
         for role in sorted(sprawling):
-            why.append(
+            why.append((
+                "SITE_GATE_ROLES",
                 f"{role} spans {span(groups[role])} of {n_polymer} residues, "
                 "so it is judged on placement "
                 f"({LOOSE_BB_RMSD:g}/{LOOSE_LOCAL_RMSD:g} A) rather than by "
-                "the pocket's thresholds, which it could never meet"
-            )
+                "the pocket's thresholds, which it could never meet",
+            ))
         gated_n = sum(len(groups[r]) for r in compact)
     else:
         out["SITE_GATE_ROLES"] = ""
@@ -1171,11 +1178,12 @@ def derive_site_settings(
     if gated_n > CB_MAX_USABLE_POSITIONS:
         out["SITE_MAX_CB_DEV"] = 0.0
         out["SITE_MAX_CB_RMS_DEV"] = TIGHT_CB_RMS_DEV
-        why.append(
+        why.append((
+            "SITE_MAX_CB_RMS_DEV",
             f"{gated_n} gated positions is {gated_n * (gated_n - 1) // 2} "
             "CB-CB pairs, so the worst pair is not comparable with a small "
-            f"site's; gating the RMS at {TIGHT_CB_RMS_DEV:g} A instead"
-        )
+            f"site's; gating the RMS at {TIGHT_CB_RMS_DEV:g} A instead",
+        ))
     else:
         out["SITE_MAX_CB_DEV"] = 1.5
         out["SITE_MAX_CB_RMS_DEV"] = 0.0
@@ -1195,12 +1203,13 @@ def derive_site_settings(
             and p.native_aa in barred
         })
         if clash:
-            why.append(
+            why.append((
+                None,
                 f"note: EXCLUDE_AAS bars {', '.join(clash)}, which the site "
                 "would hold at native identity. Set SITE_FREE_EXCLUDED=1 to "
                 "free those positions instead; left as it is, the residue "
-                "stays in the protein"
-            )
+                "stays in the protein",
+            ))
     return out, why
 
 

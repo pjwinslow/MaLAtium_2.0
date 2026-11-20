@@ -964,10 +964,17 @@ def test_derivation_gates_a_sprawling_interface_loosely_not_at_all():
     # on its own numbers, which are looser than the pocket's.
     assert got["SITE_REST_MAX_BB_RMSD"] > 1.5
     assert got["SITE_REST_MAX_LOCAL_RMSD"] > 1.0
-    assert any("judged on placement" in w for w in why), why
+    assert any("judged on placement" in t for _k, t in why), why
     # 21 gated positions is past where the worst CB pair means anything.
     assert got["SITE_MAX_CB_DEV"] == 0.0
     assert got["SITE_MAX_CB_RMS_DEV"] > 0.0
+    # Every reason names the setting it justifies, so a reason is never
+    # printed beside a setting the user overrode. One run's log announced
+    # "interface=measure_only" while the policy in force was
+    # "interface=exempt", because the reasons were untagged.
+    tags = {k for k, _t in why if k is not None}
+    assert tags <= set(got), (tags, sorted(got))
+    assert "SITE_RESIDUE_POLICY" in tags, why
 
 
 def _synthetic_site(pocket, interface):
@@ -997,7 +1004,7 @@ def test_derivation_keeps_one_threshold_set_for_a_compact_site():
     # Six positions is 15 CB pairs, where the worst pair is still meaningful.
     assert got["SITE_MAX_CB_DEV"] == 1.5
     assert got["SITE_MAX_CB_RMS_DEV"] == 0.0
-    assert not any("judged on placement" in w for w in why), why
+    assert not any("judged on placement" in t for _k, t in why), why
 
 
 def test_derivation_only_advises_on_an_excluded_held_residue():
@@ -1005,7 +1012,7 @@ def test_derivation_only_advises_on_an_excluded_held_residue():
     site = _synthetic_site(pocket=range(40, 46), interface=())
     got, why = S.derive_site_settings(site, n_polymer=200, excluding="E")
     # The clash is reported...
-    assert any("SITE_FREE_EXCLUDED=1" in w for w in why), why
+    assert any("SITE_FREE_EXCLUDED=1" in t for _k, t in why), why
     # ...and NOT silently settled: that is the user's call, not a derivation.
     assert "SITE_FREE_EXCLUDED" not in got
 
