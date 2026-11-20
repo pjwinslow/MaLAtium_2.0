@@ -359,6 +359,14 @@ def test_site_step_offers_per_role_policies_and_allows_typing_one():
     assert "allow-input: true" in site
 
 
+def test_search_step_exposes_the_memory_chunk_and_leaves_it_to_the_gpu_cell():
+    """The lever that governs ESMFold2's peak memory, and the one that does not."""
+    step6 = next(c for c in _code_cells() if "Step 6 — Search settings" in c)
+    assert "FOLD_CHUNK_SIZE = 0" in step6, "0 must mean 'keep the GPU cell's choice'"
+    # Writing it unconditionally would overwrite the VRAM-derived value with 0.
+    assert "if FOLD_CHUNK_SIZE > 0 else {}" in step6, step6[:0] or "guard missing"
+
+
 def test_site_step_exposes_the_size_stable_cb_gate():
     site = next(c for c in _code_cells() if "Mode and functional site" in c)
     assert "SITE_MAX_CB_RMS_DEV" in site

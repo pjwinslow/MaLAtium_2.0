@@ -931,6 +931,12 @@ FOLD_STEPS_SCREEN = 50 #@param {type:"integer"}
 FOLD_STEPS_FINAL = 200 #@param {type:"integer"}
 FOLD_MODEL_ID = "Synthyra/ESMFold2-Fast" #@param ["Synthyra/ESMFold2-Fast", "Synthyra/ESMFold2", "Synthyra/ESMFold2-600", "Synthyra/ESMFold2-300"]
 FOLD_PRECISION = "auto" #@param ["auto", "bf16", "fp16", "fp32"]
+#@markdown `FOLD_CHUNK_SIZE` caps the L² operations that dominate ESMFold2's
+#@markdown memory (the model's own default is 64). Smaller is slower but fits
+#@markdown a longer chain on a small card. 0 keeps whatever step 2 set from
+#@markdown your VRAM, and the engine halves it again on any out-of-memory
+#@markdown error, so you should not need to touch this.
+FOLD_CHUNK_SIZE = 0 #@param {type:"integer"}
 DO_BACKWARD_PRUNING = True #@param {type:"boolean"}
 START_ALPHABET = "AG" #@param {type:"string"}
 EXCLUDE_AAS = "" #@param {type:"string"}
@@ -960,6 +966,8 @@ _settings = {
     "FOLD_STEPS_FINAL": FOLD_STEPS_FINAL,
     "FOLD_MODEL_ID": FOLD_MODEL_ID,
     "FOLD_PRECISION": FOLD_PRECISION,
+    # 0 means "leave what the GPU cell chose"; anything else overrides it.
+    **({"FOLD_CHUNK_SIZE": FOLD_CHUNK_SIZE} if FOLD_CHUNK_SIZE > 0 else {}),
     "DO_BACKWARD_PRUNING": int(DO_BACKWARD_PRUNING),
     "START_ALPHABET": START_ALPHABET.strip() or "AG",
     "EXCLUDE_AAS": EXCLUDE_AAS.strip(),

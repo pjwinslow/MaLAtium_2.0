@@ -116,21 +116,31 @@ def recommend(gpu: GpuInfo | None = None) -> Recommendation:
     # Length cap, erring low: a fold that OOMs costs the time it ran for and
     # then still has to be skipped.
     if gpu.total_gb < 17:
+        # ESMFold2's own default chunk is 64, documented as fitting L~2000 on
+        # an 80 GB card. On a 16 GB card the L^2 operations are what runs out
+        # of memory, so start low rather than pay an OOM to find out.
+        rec.env["FOLD_CHUNK_SIZE"] = "16"
         rec.env["FOLD_MAX_RESIDUES"] = "320"
         rec.warnings.append(
             f"Only {gpu.total_gb:.0f} GB of VRAM (a T4 or V100 class card). "
             "Setting FOLD_MAX_RESIDUES=320, which is an ESTIMATE and errs "
             "low. A longer input is still attempted once -- an out-of-memory "
             "error is caught and reports this card's real limit -- so do not "
-            "treat 320 as a verdict. If it does run out of memory, a smaller "
-            "FOLD_MODEL_ID (ESMFold2-600, ESMFold2-300) is the next thing to "
-            "try before a shorter construct."
+            "treat 320 as a verdict. "
+            "FOLD_CHUNK_SIZE is set to 16 (the model's default is 64), which "
+            "caps the L-squared operations that dominate this memory; the "
+            "engine halves it again on any out-of-memory error. That is the "
+            "lever that matters here -- the ESMFold2 variants differ in their "
+            "language-model backbone, not the folding trunk, so switching "
+            "variant saves little."
         )
     elif gpu.total_gb < 26:
         rec.env["FOLD_MAX_RESIDUES"] = "512"
+        rec.env["FOLD_CHUNK_SIZE"] = "32"
         rec.notes.append(
             "FOLD_MAX_RESIDUES=512 for this VRAM budget -- an estimate, not a "
-            "measurement; a longer input is attempted once anyway."
+            "measurement; a longer input is attempted once anyway. "
+            "FOLD_CHUNK_SIZE=32 halves the model's default L-squared chunk."
         )
     else:
         rec.env["FOLD_MAX_RESIDUES"] = "1024"

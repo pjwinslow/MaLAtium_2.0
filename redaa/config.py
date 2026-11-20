@@ -262,6 +262,16 @@ class RedAAConfig:
     # error is caught, costs one fold, and tells us the real limit -- which
     # is strictly better information than the guess. After an OOM the
     # measured limit applies and nothing longer is attempted again.
+    # Token-axis chunk for ESMFold2's L^2 operations (triangle updates, outer
+    # product mean, pair transition). The model's own default is 64, which it
+    # documents as fitting L~2000 on an 80 GB card; a smaller chunk trades
+    # speed for peak memory, which is the only knob that makes a long chain
+    # fit a small one. 0 leaves the model's default alone. On an
+    # out-of-memory error the engine halves this and retries, so it
+    # self-tunes rather than needing to be guessed.
+    fold_chunk_size: int = field(
+        default_factory=lambda: _env_int("FOLD_CHUNK_SIZE", 0)
+    )
     fold_try_over_cap: bool = field(
         default_factory=lambda: _env_bool("FOLD_TRY_OVER_CAP", True)
     )

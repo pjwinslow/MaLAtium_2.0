@@ -1347,13 +1347,19 @@ def test_the_vram_cap_is_presented_as_an_estimate_not_a_verdict():
     assert "ESTIMATE" in text, text
     # It must say a longer input is still tried, or the reader stops here.
     assert "attempted once" in text, text
-    # And name the cheaper lever before "use a shorter construct".
-    assert "ESMFold2-600" in text, text
+    # And name the lever that actually governs this memory. Pointing at the
+    # model variants was wrong: all four are 179-235 M parameters with under
+    # 1 GB of weights, and the "-600"/"-300" names refer to the
+    # language-model backbone, not the folding trunk.
+    assert rec.env["FOLD_CHUNK_SIZE"] == "16"
+    assert "FOLD_CHUNK_SIZE" in text, text
+    assert "switching variant saves little" in text, text
 
     # A 24 GB card: same honesty, different number.
     rec = C.recommend(C.GpuInfo(available=True, name="NVIDIA L4", total_gb=23.0,
                                 capability=(8, 9), bf16=True))
     assert rec.env["FOLD_MAX_RESIDUES"] == "512"
+    assert rec.env["FOLD_CHUNK_SIZE"] == "32"
     assert "estimate" in " ".join(rec.notes), rec.notes
 
 

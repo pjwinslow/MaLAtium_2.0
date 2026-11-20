@@ -122,6 +122,12 @@ class FoldEngine:
         # length this GPU and model actually manage. A measurement, unlike
         # FOLD_MAX_RESIDUES, which is an estimate from VRAM.
         self.measured_limit: int | None = None
+        # The token-axis chunk currently in force, and whether the loaded
+        # model lets us change it. ESMFold2 exposes set_chunk_size, which
+        # caps its L^2 operations; halving it is the difference between a
+        # 489-residue chain fitting a 16 GB card and not.
+        self.chunk_size: int | None = None
+        self._chunk_floor = 8
         self._announced_over_cap = False
         self._raised_cap = False
         self.cache = cache if cache is not None else FoldCache(None, enabled=False)
@@ -241,6 +247,13 @@ class FoldEngine:
         self._fold_kwargs = self._supported_kwargs(self._fold_fn)
         self._steps_name = self._resolve_steps_name()
 
+        if self.cfg.fold_chunk_size > 0:
+            if self._set_chunk(self.cfg.fold_chunk_size) and self.verbose:
+                print(
+                    f"  chunk size {self.cfg.fold_chunk_size} "
+                    "(FOLD_CHUNK_SIZE; smaller is slower but needs less VRAM)"
+                )
+
         for name in ("result_to_pdb", "output_to_pdb", "to_pdb"):
             fn = getattr(model, name, None)
             if callable(fn):
@@ -311,6 +324,19 @@ class FoldEngine:
             "so FOLD_STEPS_SCREEN/FOLD_STEPS_FINAL have no effect"
         )
         return None
+
+    def _set_chunk(self, size: int) -> bool:
+        """Ask the model to cap its L^2 ops at *size* tokens. True if it did."""
+        model = self.model
+        fn = getattr(model, "set_chunk_size", None)
+        if not callable(fn):
+            return False
+        try:
+            fn(size)
+        except Exception:  # noqa: BLE001
+            return False
+        self.chunk_size = size
+        return True
 
     def _steps_kwarg(self, steps: int) -> dict[str, object]:
         if self._steps_name is None:
@@ -399,23 +425,47 @@ class FoldEngine:
         call_kwargs.update(self._steps_kwarg(steps))
 
         started = time.time()
+        result = None
         try:
-            with torch.inference_mode():
-                result = self._fold_fn(sequence, **call_kwargs)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            # Now we know, rather than guess. Record it so the rest of the run
-            # stops attempting lengths this card cannot do.
-            self.measured_limit = len(sequence) - 1
-            self.last_error = (
-                f"CUDA out of memory at L={len(sequence)}. This GPU's real "
-                f"limit is below {len(sequence)} for {self.cfg.fold_model_id}. "
-                "Use a shorter construct, a smaller FOLD_MODEL_ID "
-                "(ESMFold2-600 / ESMFold2-300), lower FOLD_STEPS_SCREEN, or a "
-                "larger card"
-            )
-            print(f"    ESMFold2 OOM: {self.last_error}")
-            return None
+            while True:
+                try:
+                    with torch.inference_mode():
+                        result = self._fold_fn(sequence, **call_kwargs)
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    # Before declaring this length impossible, spend the knob
+                    # the model gives us. ESMFold2's set_chunk_size caps its
+                    # L^2 operations on the token axis; the default is 64, and
+                    # halving it trades speed for peak memory. Picking a value
+                    # from VRAM would be another estimate, so the
+                    # out-of-memory error itself does the tuning.
+                    current = self.chunk_size or 64
+                    nxt = max(self._chunk_floor, current // 2)
+                    if nxt < current and self._set_chunk(nxt):
+                        print(
+                            "    ESMFold2 ran out of memory at "
+                            f"L={len(sequence)} with chunk={current}; "
+                            f"retrying at chunk={nxt} (slower, less memory)"
+                        )
+                        continue
+                    self.measured_limit = len(sequence) - 1
+                    floor_note = (
+                        f" even at chunk={self.chunk_size}"
+                        if self.chunk_size is not None else ""
+                    )
+                    self.last_error = (
+                        f"CUDA out of memory at L={len(sequence)}"
+                        f"{floor_note}. This GPU cannot fold "
+                        f"{len(sequence)} residues with "
+                        f"{self.cfg.fold_model_id}. A shorter construct or a "
+                        "larger card is what is left -- the ESMFold2 variants "
+                        "differ in their language-model backbone, not the "
+                        "folding trunk that dominates this memory, so "
+                        "switching variant saves little"
+                    )
+                    print(f"    ESMFold2 OOM: {self.last_error}")
+                    return None
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
             hint = self._missing_module_hint(exc) or self._precision_hint(exc)

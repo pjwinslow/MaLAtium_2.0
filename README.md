@@ -867,9 +867,19 @@ length this card and model actually manage. Nothing longer is attempted
 again, because by then it is measured rather than guessed. Preflight reports
 an over-cap input as a note, not a failure, for the same reason.
 
-If a fold really does run out of memory, a smaller `FOLD_MODEL_ID`
-(`ESMFold2-600`, `ESMFold2-300`) is the next lever, before shortening the
-construct.
+**The lever that matters is `FOLD_CHUNK_SIZE`, not the model variant.**
+ESMFold2 caps its L² operations (triangle updates, outer-product mean, pair
+transition) at a token-axis chunk, 64 by default, which its own code
+documents as fitting L≈2000 on an 80 GB card. A smaller chunk trades speed
+for peak memory and is what makes a long chain fit a small card. The GPU cell
+sets 16 under 17 GB and 32 under 26 GB, and on any out-of-memory error the
+engine halves it again and retries, down to 8, before declaring the length
+impossible — so the limit is tuned by the failure rather than guessed.
+
+Switching `FOLD_MODEL_ID` is the weaker lever and was initially suggested
+here in error: the four variants are 179–235 M parameters with under 1 GB of
+weights, and the "-600"/"-300" names refer to the language-model backbone,
+not the folding trunk that this memory is spent in.
 
 **905 residues will not fold on a small card.** The site spans residues 93–883, so no
 truncation keeps all of it; residues 1–490 keep the pocket entire (21/21) and

@@ -1876,6 +1876,7 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
             super().__init__(cfg, cache=None, verbose=False)
             self.breaks_at = breaks_at
             self.attempts: list[int] = []
+            self.n_res = 0
             self.model = object()
 
         def load(self):
@@ -1883,6 +1884,7 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
 
         def _call(self, sequence, **kw):
             self.attempts.append(len(sequence))
+            self.n_res = len(sequence)
             if len(sequence) >= self.breaks_at:
                 import torch
 
@@ -1890,7 +1892,14 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
             return object()
 
         def _result_pdb_text(self, _result):
-            return "ATOM\nEND\n"
+            # A real CA trace, so a successful fold parses rather than
+            # failing downstream for an unrelated reason.
+            lines = [
+                f"ATOM  {i + 1:>5d}  CA  ALA A{i + 1:>4d}    "
+                f"{3.8 * i:>8.3f}{0.0:>8.3f}{0.0:>8.3f}  1.00 50.00"
+                for i in range(self.n_res)
+            ]
+            return "\n".join(lines) + "\nEND\n"
 
     cfg = _make_config(tempfile.mkdtemp(), fold_max_residues=100)
     eng = OOMAt(cfg, breaks_at=300)
@@ -1914,7 +1923,7 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
     with contextlib.redirect_stdout(buf):
         assert eng.fold("A" * 300) is None
     assert eng.measured_limit == 299, eng.measured_limit
-    assert "real limit is below 300" in buf.getvalue()
+    assert "cannot fold 300 residues" in buf.getvalue()
 
     # Past a measured limit nothing is attempted again: the guess was worth
     # testing, the measurement is not.
@@ -1924,6 +1933,61 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
         assert eng.fold("A" * 400) is None
     assert eng.attempts == before, "a measured limit must not be re-probed"
     assert "measured at (299)" in buf.getvalue()
+
+    # --- and when the model offers a memory knob, spend it before giving up.
+    # ESMFold2 exposes set_chunk_size, which caps its L^2 operations. A long
+    # chain that will not fit at the default chunk of 64 may well fit at 16,
+    # and that is the difference between running this target on a 16 GB card
+    # and not. Guessing the value from VRAM would be another estimate, so the
+    # OOM does the tuning.
+    class ChunkAware(OOMAt):
+        """Needs chunk <= 16 to fold at all; records what it was asked for."""
+
+        def __init__(self, cfg):
+            super().__init__(cfg, breaks_at=0)
+            self.chunks: list[int] = []
+            self.model = self
+
+        def set_chunk_size(self, n):
+            self.chunks.append(n)
+
+        def _call(self, sequence, **kw):
+            self.attempts.append(len(sequence))
+            self.n_res = len(sequence)
+            if (self.chunk_size or 64) > 16:
+                import torch
+
+                raise torch.cuda.OutOfMemoryError("synthetic")
+            return object()
+
+    eng2 = ChunkAware(_make_config(tempfile.mkdtemp(), fold_max_residues=100))
+    eng2._fold_fn = eng2._call
+    eng2._fold_kwargs = {}
+    eng2.cache = _NoCache()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        got = eng2.fold("A" * 489)
+    out = buf.getvalue()
+    assert got is not None, out            # it folded in the end
+    assert eng2.chunks == [32, 16], eng2.chunks   # halved until it fitted
+    assert eng2.attempts == [489, 489, 489], eng2.attempts
+    assert "retrying at chunk=32" in out, out
+    assert eng2.measured_limit is None, "a fold that succeeded set a limit"
+
+    # A model with no such knob is not retried, and says what is left.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        eng3 = OOMAt(_make_config(tempfile.mkdtemp(), fold_max_residues=100),
+                     breaks_at=1)
+        eng3._fold_fn = eng3._call
+        eng3._fold_kwargs = {}
+        eng3.cache = _NoCache()
+        assert eng3.fold("A" * 489) is None
+    out = buf.getvalue()
+    assert "shorter construct or a larger card" in out, out
+    # And it must not send the reader off to swap model variants, which share
+    # the folding trunk this memory is spent in.
+    assert "switching variant saves little" in out, out
 
     if installed:
         del sys.modules["torch"]
