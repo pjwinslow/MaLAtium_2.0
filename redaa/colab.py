@@ -119,13 +119,19 @@ def recommend(gpu: GpuInfo | None = None) -> Recommendation:
         rec.env["FOLD_MAX_RESIDUES"] = "320"
         rec.warnings.append(
             f"Only {gpu.total_gb:.0f} GB of VRAM (a T4 or V100 class card). "
-            "Capping inputs at 320 residues; larger domains will be skipped "
-            "rather than run until they OOM. Raise FOLD_MAX_RESIDUES if your "
-            "domains fit."
+            "Setting FOLD_MAX_RESIDUES=320, which is an ESTIMATE and errs "
+            "low. A longer input is still attempted once -- an out-of-memory "
+            "error is caught and reports this card's real limit -- so do not "
+            "treat 320 as a verdict. If it does run out of memory, a smaller "
+            "FOLD_MODEL_ID (ESMFold2-600, ESMFold2-300) is the next thing to "
+            "try before a shorter construct."
         )
     elif gpu.total_gb < 26:
         rec.env["FOLD_MAX_RESIDUES"] = "512"
-        rec.notes.append("Capping inputs at 512 residues for this VRAM budget.")
+        rec.notes.append(
+            "FOLD_MAX_RESIDUES=512 for this VRAM budget -- an estimate, not a "
+            "measurement; a longer input is attempted once anyway."
+        )
     else:
         rec.env["FOLD_MAX_RESIDUES"] = "1024"
 

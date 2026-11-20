@@ -1319,6 +1319,30 @@ def test_configure_site_rejects_a_malformed_per_role_policy():
         raise AssertionError("a bad role name should have been rejected")
 
 
+def test_the_vram_cap_is_presented_as_an_estimate_not_a_verdict():
+    """It errs low by design, and was twice mistaken for a hardware limit.
+
+    A 489-residue target was skipped on a card that had never been asked
+    whether it could fold it, because the GPU cell's wording read like a
+    measurement. The number stays; what it claims does not.
+    """
+    rec = C.recommend(C.GpuInfo(available=True, name="Tesla T4", total_gb=15.0,
+                                capability=(7, 5), bf16=False))
+    assert rec.env["FOLD_MAX_RESIDUES"] == "320"
+    text = " ".join(rec.warnings + rec.notes)
+    assert "ESTIMATE" in text, text
+    # It must say a longer input is still tried, or the reader stops here.
+    assert "attempted once" in text, text
+    # And name the cheaper lever before "use a shorter construct".
+    assert "ESMFold2-600" in text, text
+
+    # A 24 GB card: same honesty, different number.
+    rec = C.recommend(C.GpuInfo(available=True, name="NVIDIA L4", total_gb=23.0,
+                                capability=(8, 9), bf16=True))
+    assert rec.env["FOLD_MAX_RESIDUES"] == "512"
+    assert "estimate" in " ".join(rec.notes), rec.notes
+
+
 def main():
     failures = []
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_")]

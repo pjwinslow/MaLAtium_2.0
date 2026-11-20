@@ -118,6 +118,12 @@ class FoldEngine:
         # preflight could say no more than "produced no usable model" about a
         # failure whose cause was one line further up the log.
         self.last_error = ""
+        # Set the first time an over-cap fold runs out of memory: the longest
+        # length this GPU and model actually manage. A measurement, unlike
+        # FOLD_MAX_RESIDUES, which is an estimate from VRAM.
+        self.measured_limit: int | None = None
+        self._announced_over_cap = False
+        self._raised_cap = False
         self.cache = cache if cache is not None else FoldCache(None, enabled=False)
         self.verbose = verbose
         self.model = None
@@ -345,14 +351,44 @@ class FoldEngine:
             plddt, ptm, ca, frames = cached
             return FoldResult(sequence, plddt, ptm, ca, frames=frames)
 
-        if len(sequence) > self.cfg.fold_max_residues:
-            self.last_error = (
-                f"{len(sequence)} residues exceeds FOLD_MAX_RESIDUES="
-                f"{self.cfg.fold_max_residues}; raise it, or use shorter "
-                "domains"
+        cap = self.cfg.fold_max_residues
+        over_cap = len(sequence) > cap
+        if over_cap:
+            # The cap is derived from VRAM by a formula that deliberately errs
+            # low, so it is a guess and not a measurement. Refusing to try
+            # turned that guess into a hard limit, and a 489-residue target
+            # was skipped twice on a card that may well have folded it. An
+            # out-of-memory error is caught below, costs one fold, and
+            # measures the real limit -- which beats the guess. Once measured,
+            # the measurement is what applies.
+            blocked = (
+                self.measured_limit is not None
+                and len(sequence) > self.measured_limit
             )
-            print(f"    skipping fold: {self.last_error}")
-            return None
+            if blocked:
+                self.last_error = (
+                    f"{len(sequence)} residues is past the limit this GPU was "
+                    f"measured at ({self.measured_limit}); use a shorter "
+                    "construct, a smaller FOLD_MODEL_ID (ESMFold2-600 or "
+                    "ESMFold2-300), or a larger card"
+                )
+                print(f"    skipping fold: {self.last_error}")
+                return None
+            if not self.cfg.fold_try_over_cap:
+                self.last_error = (
+                    f"{len(sequence)} residues exceeds FOLD_MAX_RESIDUES="
+                    f"{cap} and FOLD_TRY_OVER_CAP is off; raise the cap, turn "
+                    "it on, or use shorter domains"
+                )
+                print(f"    skipping fold: {self.last_error}")
+                return None
+            if not self._announced_over_cap:
+                self._announced_over_cap = True
+                print(
+                    f"    L={len(sequence)} is over FOLD_MAX_RESIDUES={cap}, "
+                    "which is only a VRAM estimate -- trying it once to find "
+                    "out. An out-of-memory error here is caught, not fatal."
+                )
 
         if self.model is None:
             self.load()
@@ -368,10 +404,15 @@ class FoldEngine:
                 result = self._fold_fn(sequence, **call_kwargs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
+            # Now we know, rather than guess. Record it so the rest of the run
+            # stops attempting lengths this card cannot do.
+            self.measured_limit = len(sequence) - 1
             self.last_error = (
-                f"CUDA out of memory at L={len(sequence)}. Lower "
-                "FOLD_STEPS_SCREEN, use a smaller FOLD_MODEL_ID "
-                "(ESMFold2-600 / ESMFold2-300), or a larger GPU"
+                f"CUDA out of memory at L={len(sequence)}. This GPU's real "
+                f"limit is below {len(sequence)} for {self.cfg.fold_model_id}. "
+                "Use a shorter construct, a smaller FOLD_MODEL_ID "
+                "(ESMFold2-600 / ESMFold2-300), lower FOLD_STEPS_SCREEN, or a "
+                "larger card"
             )
             print(f"    ESMFold2 OOM: {self.last_error}")
             return None
@@ -385,6 +426,15 @@ class FoldEngine:
         finally:
             self.fold_seconds += time.time() - started
         self.n_folded += 1
+        if over_cap and not self._raised_cap:
+            # It fitted. Say so loudly: the cap would otherwise go on being
+            # quoted as this card's limit when it is not.
+            self._raised_cap = True
+            print(
+                f"    L={len(sequence)} folded despite FOLD_MAX_RESIDUES={cap}"
+                f"; the cap was an underestimate. Set FOLD_MAX_RESIDUES="
+                f"{len(sequence)} to skip this notice."
+            )
 
         pdb_text = self._result_pdb_text(result)
         if not pdb_text:

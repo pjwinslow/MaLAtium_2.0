@@ -1130,19 +1130,33 @@ class Pipeline:
                 ((dd, (dd, pp)) for dd, pp in domains)
             ) if n > cfg.fold_max_residues
         ]
-        if over:
+        if over and not cfg.fold_try_over_cap:
             worst = max(n for _d, n in over)
             record(
                 "inputs fit FOLD_MAX_RESIDUES", False,
                 f"{len(over)} of {len(domains)} input(s) are longer than "
                 f"FOLD_MAX_RESIDUES={cfg.fold_max_residues} (longest "
-                f"{worst}); they would be skipped, not folded. That cap comes "
-                "from the GPU's VRAM, so the fix is a larger card or a "
-                "shorter construct -- raising it on this card buys an "
-                "out-of-memory error instead of a skip",
+                f"{worst}), and FOLD_TRY_OVER_CAP is off, so they would be "
+                "skipped without being attempted",
             )
             self._preflight_summary(checks)
             return 1
+        if over:
+            # Not a failure. The cap is an estimate from VRAM that errs low,
+            # and an over-cap fold is attempted once: either it works and the
+            # cap was wrong, or it runs out of memory, which is caught and
+            # measures the real limit. Refusing here would make the estimate
+            # binding, which is how a 489-residue target came to be skipped
+            # twice on a card that had not been asked.
+            worst = max(n for _d, n in over)
+            note(
+                "inputs over FOLD_MAX_RESIDUES",
+                f"{len(over)} of {len(domains)} input(s) exceed "
+                f"FOLD_MAX_RESIDUES={cfg.fold_max_residues} (longest "
+                f"{worst}). That cap is a VRAM estimate, so the fold below "
+                "attempts it anyway; an out-of-memory error there is caught "
+                "and reports this GPU's real limit",
+            )
         record(
             "inputs fit FOLD_MAX_RESIDUES", True,
             f"longest {max(_length((d, p)) for d, p in domains)} <= "

@@ -855,14 +855,23 @@ describes one subunit of a dimer.
 
 **905 residues is the catch.** ESMFold2's memory is what sets
 `FOLD_MAX_RESIDUES`, and the notebook's GPU cell derives it from VRAM: 320
-under 17 GB (T4, V100), 512 under 26 GB (L4), 1024 above (A100). The full
-chain folds only on the last of those. Raising the cap on a smaller card buys
-an out-of-memory error instead of a skip, so this is a hardware fact, not a
-setting — and preflight now fails on it before loading a model rather than
-after resolving the site.
+under 17 GB (T4, V100), 512 under 26 GB (L4), 1024 above (A100).
 
-**905 residues will not fold on a small card**, and the fix is a shorter
-construct rather than a larger cap. The site spans residues 93–883, so no
+**Those numbers are estimates that err low, not measurements**, and treating
+one as a verdict is a mistake this pipeline made twice: a 489-residue target
+was skipped on a card that had never been asked whether it could fold it. An
+over-cap sequence is now attempted once (`FOLD_TRY_OVER_CAP`, on by default).
+Either it folds — and the run says the cap was an underestimate — or it runs
+out of memory, which was always caught, costs one fold, and records the
+length this card and model actually manage. Nothing longer is attempted
+again, because by then it is measured rather than guessed. Preflight reports
+an over-cap input as a note, not a failure, for the same reason.
+
+If a fold really does run out of memory, a smaller `FOLD_MODEL_ID`
+(`ESMFold2-600`, `ESMFold2-300`) is the next lever, before shortening the
+construct.
+
+**905 residues will not fold on a small card.** The site spans residues 93–883, so no
 truncation keeps all of it; residues 1–490 keep the pocket entire (21/21) and
 32 of 52 interface residues, including the whole 3'-CCA approach to the
 adenylate. Nothing about that needs a preset: point `PDB_SPECS` at
@@ -1036,6 +1045,7 @@ resolved values. The ones you are most likely to touch:
 | `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
 | `FOLD_PRECISION` | `auto` | `auto` asks the GPU: bf16 where supported, else fp16; fp32 on CPU. Also `bf16`, `fp16`, `fp32` |
+| `FOLD_TRY_OVER_CAP` | `1` | Attempt an over-cap sequence once; an OOM is caught and measures the real limit |
 | `FOLD_MAX_RESIDUES` | `1024` | Longer sequences are skipped, not run until they die |
 | `FOLD_STEPS_SCREEN` | `50` | Diffusion steps for screening folds |
 | `FOLD_STEPS_FINAL` | `200` | Diffusion steps for reported folds |

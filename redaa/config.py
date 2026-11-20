@@ -257,6 +257,14 @@ class RedAAConfig:
     fold_loops: int = field(default_factory=lambda: _env_int("FOLD_LOOPS", 1))
     fold_seed: int = field(default_factory=lambda: _env_int("FOLD_SEED", 7))
     fold_batch_size: int = field(default_factory=lambda: _env_int("FOLD_BATCH_SIZE", 4))
+    # Attempt a sequence longer than FOLD_MAX_RESIDUES once, rather than
+    # refusing outright. The cap is a guess from VRAM; an out-of-memory
+    # error is caught, costs one fold, and tells us the real limit -- which
+    # is strictly better information than the guess. After an OOM the
+    # measured limit applies and nothing longer is attempted again.
+    fold_try_over_cap: bool = field(
+        default_factory=lambda: _env_bool("FOLD_TRY_OVER_CAP", True)
+    )
     fold_max_residues: int = field(
         default_factory=lambda: _env_int("FOLD_MAX_RESIDUES", 1024)
     )

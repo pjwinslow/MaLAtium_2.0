@@ -1837,6 +1837,106 @@ def test_site_free_excluded_frees_the_barred_positions_and_says_so():
         assert row["site_n_held"] == "2", row["site_n_held"]
 
 
+def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
+    """The cap is a VRAM estimate; the GPU is the authority.
+
+    A 489-residue target was skipped twice on a card that had never been
+    asked whether it could fold it, because a conservative guess was being
+    enforced as a hard limit. An OOM is caught, costs one fold, and tells us
+    something the guess could not.
+    """
+    import contextlib
+    import io
+    import types
+
+    # No torch in this environment, and fold() needs its OOM exception type
+    # and inference_mode. A fake is enough: nothing here touches a tensor.
+    installed = "torch" not in sys.modules
+    if installed:
+        torch_stub = types.ModuleType("torch")
+
+        class _OOM(RuntimeError):
+            pass
+
+        cuda = types.SimpleNamespace(
+            OutOfMemoryError=_OOM,
+            empty_cache=lambda: None,
+            is_available=lambda: False,
+        )
+        torch_stub.cuda = cuda
+        torch_stub.inference_mode = contextlib.nullcontext
+        sys.modules["torch"] = torch_stub
+
+    from redaa.folding import FoldEngine
+
+    class OOMAt(FoldEngine):
+        """Folds anything below *breaks_at*, runs out of memory at or above."""
+
+        def __init__(self, cfg, breaks_at):
+            super().__init__(cfg, cache=None, verbose=False)
+            self.breaks_at = breaks_at
+            self.attempts: list[int] = []
+            self.model = object()
+
+        def load(self):
+            pass
+
+        def _call(self, sequence, **kw):
+            self.attempts.append(len(sequence))
+            if len(sequence) >= self.breaks_at:
+                import torch
+
+                raise torch.cuda.OutOfMemoryError("synthetic")
+            return object()
+
+        def _result_pdb_text(self, _result):
+            return "ATOM\nEND\n"
+
+    cfg = _make_config(tempfile.mkdtemp(), fold_max_residues=100)
+    eng = OOMAt(cfg, breaks_at=300)
+    eng._fold_fn = eng._call
+    eng._fold_kwargs = {}
+    eng.cache = _NoCache()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        # 200 is over the cap of 100 but under the card's real limit: it is
+        # attempted, and the engine says the cap was an underestimate.
+        eng.fold("A" * 200)
+    out = buf.getvalue()
+    assert eng.attempts == [200], eng.attempts
+    assert "trying it once" in out, out
+    assert "was an underestimate" in out, out
+    assert eng.measured_limit is None
+
+    # 300 OOMs. That is caught, and recorded as the measured limit.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert eng.fold("A" * 300) is None
+    assert eng.measured_limit == 299, eng.measured_limit
+    assert "real limit is below 300" in buf.getvalue()
+
+    # Past a measured limit nothing is attempted again: the guess was worth
+    # testing, the measurement is not.
+    before = list(eng.attempts)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert eng.fold("A" * 400) is None
+    assert eng.attempts == before, "a measured limit must not be re-probed"
+    assert "measured at (299)" in buf.getvalue()
+
+    if installed:
+        del sys.modules["torch"]
+
+
+class _NoCache:
+    def get(self, *_a, **_k):
+        return None
+
+    def put(self, *_a, **_k):
+        return None
+
+
 def test_preflight_fails_early_when_an_input_exceeds_the_fold_cap():
     """A target too long for the card is a hardware fact, not a setting.
 
@@ -1856,7 +1956,11 @@ def test_preflight_fails_early_when_an_input_exceeds_the_fold_cap():
         _write_reference(ref)
         length = len(st.parse_ca_from_file(ref)[1])
 
-        cfg = _make_config(tmp, fold_max_residues=length - 1)
+        # With FOLD_TRY_OVER_CAP off, an over-cap input is a hard failure
+        # before any model is loaded.
+        cfg = _make_config(
+            tmp, fold_max_residues=length - 1, fold_try_over_cap=False
+        )
         pipe = StubPipeline(cfg)
         pipe.ref_path = ref
         buf = io.StringIO()
@@ -1865,11 +1969,22 @@ def test_preflight_fails_early_when_an_input_exceeds_the_fold_cap():
         out = buf.getvalue()
         assert rc == 1
         assert "inputs fit FOLD_MAX_RESIDUES" in out, out[-700:]
-        # It has to say the cap tracks VRAM, or the reader just raises it.
-        assert "VRAM" in out
-        assert "larger card or a shorter construct" in out
-        # And it must come before the models are touched.
         assert "load models" not in out
+
+        # With it on -- the default -- the cap is an estimate, so this is a
+        # note and the run goes on to measure. Refusing here is what made a
+        # guessed cap binding.
+        cfg = _make_config(tmp, fold_max_residues=length - 1)
+        assert cfg.fold_try_over_cap
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = ref
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pipe.preflight()
+        out = buf.getvalue()
+        assert "inputs over FOLD_MAX_RESIDUES" in out, out[-700:]
+        assert "VRAM estimate" in out
+        assert "load models" in out
 
         # With room, the same check passes and says so.
         cfg = _make_config(tmp, fold_max_residues=length + 10)
