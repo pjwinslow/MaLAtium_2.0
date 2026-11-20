@@ -699,6 +699,31 @@ worst-pair check is still active, and the console prints whichever CB column
 is actually gated — so a `PASS` never appears next to a number that had no say
 in it.
 
+#### Removing a residue the site holds
+
+A held site position keeps its **native** residue, so holding one whose type
+`EXCLUDE_AAS` bars puts that residue straight back into the protein — at the
+positions that matter most. The run has always warned about this.
+`SITE_FREE_EXCLUDED=1` resolves it: those positions are left for the design to choose,
+and are still measured, so the geometry decides whether the substitution was
+survivable. It is the only configuration that can ask for a preserved site
+*and* a residue genuinely absent, and every freed position is named in the log
+and counted in `site_n_freed_excluded`.
+
+Worked example — AlaRS without alanine. The chain has 66 Ala (7.3%). Only two
+are in the adenylate pocket, and neither recognises the substrate methyl:
+that sub-site is D242 (3.05 Å), G244, M147, T243, S100, T212, W191 and V214,
+with A99 outermost at 4.80 Å, while A211 contacts the ribose O3' and sits
+7.63 Å from the methyl. Four more alanines are in the tRNA interface, where
+residues are free anyway. So `EXCLUDE_AAS=A` with `SITE_FREE_EXCLUDED=1`
+frees exactly A99 and A211 and holds the other 19 pocket positions.
+
+Alanine also carries no backbone requirement here, which is what makes this a
+different question from a Gly-free GlyRS: 1 of 66 alanines sits at positive
+phi (A503, +56°), against **41 of 73 glycines**. On a fixed backbone there is
+no substitute for Gly at a positive-phi position; there is nothing comparable
+to work around for Ala.
+
 #### Two threshold sets, because a site's halves are asked different things
 
 `SITE_GATE_ROLES` names the roles judged by the tight `SITE_MAX_*`
@@ -778,6 +803,20 @@ taken from memory.
 | `atp` | `5etn_A` — *E. coli* HPPK, 1.4 Å, 159 residues | `ligand:ATP@4.5` → 17 residues | **Monomeric**, which is the whole reason for this choice |
 | `tev` | `1lvm_A:1-221` — TEV protease, 1.8 Å | `H46 D81 C151 D148 G149 Q150` | The Cys–His–Asp triad plus the specificity and oxyanion loop |
 | `glyrs` | `5e6m_A` — human GlyRS·tRNA-Gly, 2.93 Å, 519 residues | `ligand:GAP@4.5 partner:E@4.5` → 20 + 48 residues | Catalytic site **and** tRNA interface from one structure |
+| `alars` | `3wqy_A` — *A. fulgidus* AlaRS·tRNA-Ala, 3.3 Å, 905 residues | `ligand:A5A@4.5 partner:C@4.5` → 21 + 52 residues | The same, cleaner: no chain gaps, 95% single-subunit interface |
+
+**Why 3WQY for AlaRS.** `A5A` is 5'-O-[N-(L-alanyl)sulfamoyl]adenosine, the
+non-hydrolysable alanyl-adenylate analogue — 28 atoms carrying the alanyl
+N/CA/**CB**/C/O, a sulfamoyl linker in place of the α-phosphate, and the whole
+adenosine. The CB matters: it is the methyl AlaRS has to tell from glycine and
+serine. All 28 atoms lie within 4.5 Å of chain A and none within 47 Å of chain
+B, so the pocket is wholly intra-subunit. The tRNA touches 54 residues of
+chain A and 3 of chain B at 4.5 Å — about 95% single-subunit, against 78% for
+GlyRS — and the chain has **no gaps at all**, unusual at 3.3 Å. File numbering
+is UniProt numbering here (DBREF 1-906 → O28029 1-906), unlike 5E6M.
+
+AlaRS still dimerises (chain B contacts 67 residues of chain A), so a result
+describes one subunit of a dimer.
 
 A preset also carries the settings its case needs where the blanket defaults
 get it wrong, applied only where you have not set them yourself;
@@ -942,6 +981,7 @@ resolved values. The ones you are most likely to touch:
 | `SITE_REST_MAX_BB_RMSD` | `0` (off) | Å, same-place threshold for the roles left out of `SITE_GATE_ROLES` |
 | `SITE_REST_MAX_LOCAL_RMSD` | `0` (off) | Å, same-shape threshold for those roles |
 | `SITE_REST_MAX_CB_RMS_DEV` | `0` (off) | Å, RMS CB–CB threshold for those roles |
+| `SITE_FREE_EXCLUDED` | `0` | Leave a site position free rather than hold a residue `EXCLUDE_AAS` bars; every freed position is named |
 | `SITE_REQUIRE_IDENTITY` | `1` | Fail if a site position lost its native residue |
 | `FOLD_MODEL_ID` | `Synthyra/ESMFold2-Fast` | Any ESMFold2 variant |
 | `FOLD_PRECISION` | `auto` | `auto` asks the GPU: bf16 where supported, else fp16; fp32 on CPU. Also `bf16`, `fp16`, `fp32` |

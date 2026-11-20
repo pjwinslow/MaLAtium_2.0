@@ -398,6 +398,13 @@ class RedAAConfig:
     site_rest_max_cb_rms_dev: float = field(
         default_factory=lambda: _env_float("SITE_REST_MAX_CB_RMS_DEV", 0.0)
     )
+    # Leave a site position free rather than holding a residue EXCLUDE_AAS
+    # bars. Off by default: holding the site is usually the point, and
+    # quietly not holding part of it would be worse than the contradiction.
+    # The run names every position this frees.
+    site_free_excluded: bool = field(
+        default_factory=lambda: _env_bool("SITE_FREE_EXCLUDED", False)
+    )
     site_require_identity: bool = field(
         default_factory=lambda: _env_bool("SITE_REQUIRE_IDENTITY", True)
     )
@@ -503,6 +510,7 @@ class RedAAConfig:
         "SITE_MAX_LOCAL_RMSD": "site_max_local_rmsd",
         "SITE_MAX_CB_DEV": "site_max_cb_dev",
         "SITE_MAX_CB_RMS_DEV": "site_max_cb_rms_dev",
+        "SITE_FREE_EXCLUDED": "site_free_excluded",
         "SITE_REST_MAX_BB_RMSD": "site_rest_max_bb_rmsd",
         "SITE_REST_MAX_LOCAL_RMSD": "site_rest_max_local_rmsd",
         "SITE_REST_MAX_CB_DEV": "site_rest_max_cb_dev",

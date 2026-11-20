@@ -704,6 +704,9 @@ class SitePlan:
     n_measured: int = 0
     gated: frozenset[int] = frozenset()
     recorded: frozenset[int] = frozenset()
+    # Positions that WOULD have been held, but whose native residue the run
+    # has excluded. Reported so freeing them is never silent.
+    freed_excluded: tuple[tuple[int, str], ...] = ()
 
     @property
     def any_fixed(self) -> bool:
@@ -730,6 +733,11 @@ class SitePlan:
             bits.append(
                 f"{len(self.gated)} tightly gated, {len(self.recorded)} {how}"
             )
+        if self.freed_excluded:
+            bits.append(
+                f"{len(self.freed_excluded)} freed as excluded "
+                f"({''.join(sorted({aa for _i, aa in self.freed_excluded}))})"
+            )
         return "; ".join(bits)
 
 
@@ -737,6 +745,7 @@ def site_plan(
     site: ResolvedSite | None,
     policies: dict[str, str],
     gate_roles: "tuple[str, ...] | None" = None,
+    free_aas: "frozenset[str] | None" = None,
 ) -> SitePlan:
     """Resolve *site* against a role -> policy map.
 
@@ -748,6 +757,14 @@ def site_plan(
 
     *gate_roles*, when given, limits which roles the geometry thresholds are
     applied to.  The rest of the site is still measured and reported.
+
+    *free_aas* names residue types that must not be held.  A held position
+    keeps its native residue, so holding one whose type the run has excluded
+    puts that residue straight back into the protein -- which defeats the
+    exclusion at exactly the positions that matter most.  Those positions are
+    left for the design to choose instead, and still measured, so the
+    geometry decides whether the substitution was survivable.  It is the only
+    way to ask for a site preserved and a residue genuinely absent.
     """
     if site is None or not site.positions:
         return SitePlan(by_role=dict(policies))
@@ -758,12 +775,18 @@ def site_plan(
     gated: set[int] = set()
     recorded: set[int] = set()
     measured = 0
+    freed: list[tuple[int, str]] = []
+    barred = free_aas or frozenset()
     for pos in site.positions:
         policy = policies.get(pos.role, "exempt")
         if gate_roles is None or pos.role in gate_roles:
             gated.add(pos.index)
         else:
             recorded.add(pos.index)
+        if policy != "measure_only" and pos.native_aa in barred:
+            freed.append((pos.index, pos.native_aa))
+            measured += 1
+            continue
         if policy == "measure_only":
             measured += 1
             continue
@@ -780,6 +803,7 @@ def site_plan(
         n_measured=measured,
         gated=frozenset(gated),
         recorded=frozenset(recorded),
+        freed_excluded=tuple(freed),
     )
 
 
@@ -841,6 +865,49 @@ class SiteMetrics:
             if value > limit:
                 return False
         return True
+
+    def failing_checks(
+        self,
+        max_bb_rmsd: float,
+        max_local_rmsd: float,
+        max_cb_dev: float,
+        require_identity: bool = True,
+        max_cb_rms_dev: float = 0.0,
+        rest: "tuple[float, float, float, float] | None" = None,
+    ) -> list[str]:
+        """Which site checks this fold failed, named.
+
+        "fail[site]" says the site gate bound but not which part of it, and
+        the remedy differs completely: a failed identity check means the
+        design did not carry the residues, a failed cbRMS means the pocket is
+        distorted, and a failed rest check means the other half of the site
+        moved. Without this the next step is guesswork.
+        """
+        out: list[str] = []
+        if require_identity and not self.identity_kept:
+            out.append("identity")
+        for name, value, limit in (
+            ("bb", self.bb_rmsd, max_bb_rmsd),
+            ("local", self.local_rmsd, max_local_rmsd),
+            ("cbMax", self.cb_max_dev, max_cb_dev),
+            ("cbRMS", self.cb_rms_dev, max_cb_rms_dev),
+        ):
+            if limit <= 0:
+                continue
+            if value is None or value > limit:
+                out.append(name)
+        if rest is not None and any(x > 0 for x in rest) and self.recorded is not None:
+            for name, value, limit in (
+                ("restBB", self.recorded.bb_rmsd, rest[0]),
+                ("restLocal", self.recorded.local_rmsd, rest[1]),
+                ("restCbMax", self.recorded.cb_max_dev, rest[2]),
+                ("restCbRMS", self.recorded.cb_rms_dev, rest[3]),
+            ):
+                if limit <= 0:
+                    continue
+                if value is None or value > limit:
+                    out.append(name)
+        return out
 
     def rest_passed(
         self,
@@ -1155,6 +1222,73 @@ PRESETS: dict[str, SitePreset] = {
             "contacts 98 residues of chain A), so treat a result here as one "
             "subunit of a dimer rather than a free-standing protein. Chain E "
             "is paired with chain A deliberately: chain C binds chain B."
+        ),
+    ),
+    "alars": SitePreset(
+        key="alars",
+        # Chain A, whole: 905 modelled residues, none dropped for an
+        # incomplete backbone and NO chain gaps, which is unusual at 3.3 A.
+        # File numbering IS UniProt numbering here (DBREF 1-906 -> O28029
+        # 1-906), unlike 5E6M, so literature residue numbers match a spec
+        # written against this file directly.
+        fetch_spec="3wqy_A",
+        site_spec="ligand:A5A@4.5 partner:C@4.5",
+        keep_ligands=("A5A",),
+        keep_partners=("C",),
+        mpnn_model_type="ligand_mpnn",
+        settings=(
+            # 21-residue pocket (indices 97-247) and a 52-residue interface
+            # spanning 91-881. Together they use 19 of the 20 amino acids, so
+            # a blanket in_alphabet would fix the answer before the search.
+            ("SITE_RESIDUE_POLICY", "exempt,interface=measure_only"),
+            ("SITE_GATE_ROLES", "catalytic,contact"),
+            ("SITE_MAX_CB_DEV", "0"),
+            ("SITE_MAX_CB_RMS_DEV", "2.0"),
+            # Measured on these coordinates: the interface reports BB 2.50 A
+            # / local 2.32 A / cbRMS 2.01 A under 1.5 A of correlated
+            # backbone error and 4.29 / 3.96 / 3.47 under 2.5 A, so these
+            # accept a domain placed correctly to within roughly 2 A.
+            ("SITE_REST_MAX_BB_RMSD", "3.0"),
+            ("SITE_REST_MAX_LOCAL_RMSD", "2.5"),
+            ("SITE_REST_MAX_CB_RMS_DEV", "3.0"),
+            # Inert unless EXCLUDE_AAS is set. With EXCLUDE_AAS=A it frees
+            # the only two alanines in the pocket (A99 and A211) rather than
+            # holding them and contradicting the exclusion. Neither is a
+            # specificity determinant -- see the notes.
+            ("SITE_FREE_EXCLUDED", "1"),
+        ),
+        title=(
+            "Alanyl-adenylate pocket + tRNA interface -- A. fulgidus AlaRS "
+            "(3WQY, 3.3 A)"
+        ),
+        notes=(
+            "Archaeoglobus fulgidus AlaRS (O28029) with wild-type tRNA-Ala "
+            "having the G3-U70 recognition pair; chains A and B are the "
+            "protein, C the tRNA. Computed from the deposited file, not "
+            "recalled: A5A is 5'-O-[N-(L-alanyl)sulfamoyl]adenosine, the "
+            "non-hydrolysable alanyl-adenylate analogue, 28 atoms whose names "
+            "carry the alanyl N/CA/CB/C/O -- CB being the methyl that AlaRS "
+            "has to tell from glycine and serine -- a sulfamoyl linker in "
+            "place of the alpha-phosphate, and the whole adenosine. This is a "
+            "cleaner case than the glyrs preset in three ways. All 28 ligand "
+            "atoms lie within 4.5 A of chain A and none within 47 A of chain "
+            "B, so the pocket is wholly intra-subunit. The tRNA touches 54 "
+            "residues of chain A and only 3 of chain B at 4.5 A (78 and 6 at "
+            "6 A), so about 95% of the interface is single-subunit, against "
+            "78% for GlyRS. And the chain has no gaps at all. AlaRS still "
+            "dimerises (chain B contacts 67 residues of chain A), so treat a "
+            "result as one subunit of a dimer. For designing AlaRS without "
+            "alanine: the chain has 66 Ala (7.3%), only 2 of them in the "
+            "pocket (A99, A211) and 4 in the interface, where residues are "
+            "free anyway. Neither pocket alanine recognises the substrate "
+            "methyl -- that sub-site is D242 (3.05 A), G244, M147, T243, "
+            "S100, T212, W191 and V214, with A99 the outermost at 4.80 A, "
+            "while A211 contacts the ribose O3' and sits 7.63 A from the "
+            "methyl. Alanine also carries no backbone requirement here: 1 of "
+            "66 is at positive phi, against 41 of 73 glycines, so there is "
+            "no analogue of the positive-phi problem that makes a Gly-free "
+            "GlyRS a different kind of question. Two cis-prolines (106, 119) "
+            "force P into every alphabet regardless."
         ),
     ),
 }

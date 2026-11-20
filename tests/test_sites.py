@@ -418,7 +418,7 @@ def test_incomplete_backbone_at_a_site_residue_is_unmeasurable():
 
 
 def test_presets_exist_and_parse():
-    assert set(S.PRESETS) == {"atp", "tev", "glyrs"}
+    assert set(S.PRESETS) == {"atp", "tev", "glyrs", "alars"}
     from redaa.config import parse_site_policy
 
     for key in S.PRESETS:
@@ -730,6 +730,25 @@ def test_apply_site_leaves_free_positions_alone():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_alars_preset_pairs_chain_a_with_its_trna_and_frees_barred_residues():
+    """The Ala-free case: hold the pocket, except where that reinstates Ala."""
+    pre = S.preset("alars")
+    assert pre.fetch_spec.endswith("_A")
+    spec = S.parse_site_spec(pre.site_spec)
+    assert [t.chain for t in spec.partners] == ["C"]
+    assert [t.comp_id for t in spec.ligands] == ["A5A"]
+    settings = dict(pre.settings)
+    assert "interface=measure_only" in settings["SITE_RESIDUE_POLICY"]
+    assert settings["SITE_GATE_ROLES"] == "catalytic,contact"
+    # Without this, EXCLUDE_AAS=A would be contradicted by the held pocket.
+    assert settings["SITE_FREE_EXCLUDED"] == "1"
+    # Size-stable CB check, as for every site past a few positions.
+    assert float(settings["SITE_MAX_CB_DEV"]) == 0.0
+    assert float(settings["SITE_MAX_CB_RMS_DEV"]) > 0.0
+    # The interface is gated, and more loosely than the pocket.
+    assert float(settings["SITE_REST_MAX_LOCAL_RMSD"]) > 1.0
+
+
 def test_cb_max_dev_grows_with_site_size_but_the_rms_does_not():
     """The reason SITE_MAX_CB_RMS_DEV exists, pinned down as a measurement.
 
@@ -864,6 +883,42 @@ def test_measure_site_gates_a_subset_and_records_the_rest():
         assert pooled.recorded is None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_failing_checks_names_each_check_that_bound():
+    m = S.SiteMetrics(
+        bb_rmsd=0.5, local_rmsd=3.0, cb_rms_dev=2.5, n_positions=20,
+        identity_kept=False,
+    )
+    m.recorded = S.SiteMetrics(bb_rmsd=9.0, local_rmsd=1.0, n_positions=48)
+    names = m.failing_checks(
+        1.5, 1.0, 0.0, require_identity=True, max_cb_rms_dev=2.0,
+        rest=(3.0, 2.5, 0.0, 0.0),
+    )
+    assert "identity" in names
+    assert "local" in names        # 3.0 > 1.0
+    assert "cbRMS" in names        # 2.5 > 2.0
+    assert "restBB" in names       # 9.0 > 3.0
+    assert "bb" not in names       # 0.5 <= 1.5
+    assert "cbMax" not in names    # switched off
+    assert "restLocal" not in names
+
+    # Identity not required: not named even when lost.
+    assert "identity" not in m.failing_checks(
+        1.5, 1.0, 0.0, require_identity=False, max_cb_rms_dev=2.0
+    )
+    # A clean fold names nothing.
+    ok = S.SiteMetrics(bb_rmsd=0.3, local_rmsd=0.2, cb_rms_dev=0.4, n_positions=20)
+    assert ok.failing_checks(1.5, 1.0, 0.0, require_identity=False,
+                             max_cb_rms_dev=2.0) == []
+
+
+def test_an_unmeasurable_check_that_was_asked_for_counts_as_failing():
+    """Consistent with passed(): asked for and not measurable is not a pass."""
+    blind = S.SiteMetrics(n_positions=20)
+    names = blind.failing_checks(1.5, 1.0, 0.0, require_identity=False,
+                                 max_cb_rms_dev=2.0)
+    assert set(names) == {"bb", "local", "cbRMS"}
 
 
 def test_rest_thresholds_gate_the_second_group_independently():

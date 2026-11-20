@@ -555,6 +555,7 @@ def configure_site(
     rest_max_local_rmsd: float = 0.0,
     rest_max_cb_rms_dev: float = 0.0,
     require_identity: bool = True,
+    free_excluded: bool = False,
     mpnn_model_type: str = "",
 ) -> dict:
     """Write the mode and site settings into the environment.
@@ -596,6 +597,7 @@ def configure_site(
             "SITE_REST_MAX_BB_RMSD": (0.0, rest_max_bb_rmsd),
             "SITE_REST_MAX_LOCAL_RMSD": (0.0, rest_max_local_rmsd),
             "SITE_REST_MAX_CB_RMS_DEV": (0.0, rest_max_cb_rms_dev),
+            "SITE_FREE_EXCLUDED": ("0", "1" if free_excluded else "0"),
         }
         for key, value in chosen.settings:
             if key not in _defaults:
@@ -624,6 +626,8 @@ def configure_site(
                 rest_max_local_rmsd = float(value)
             elif key == "SITE_REST_MAX_CB_RMS_DEV":
                 rest_max_cb_rms_dev = float(value)
+            elif key == "SITE_FREE_EXCLUDED":
+                free_excluded = value.strip() not in ("", "0", "false", "False")
 
     policies, problems = parse_site_policy(policy)
     if problems:
@@ -656,6 +660,7 @@ def configure_site(
         "SITE_REST_MAX_LOCAL_RMSD": str(float(rest_max_local_rmsd)),
         "SITE_REST_MAX_CB_RMS_DEV": str(float(rest_max_cb_rms_dev)),
         "SITE_REQUIRE_IDENTITY": "1" if require_identity else "0",
+        "SITE_FREE_EXCLUDED": "1" if free_excluded else "0",
     }
     settings["MPNN_MODEL_TYPE"] = mpnn_model_type.strip()
 

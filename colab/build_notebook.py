@@ -592,7 +592,7 @@ code_with_bootstrap(
 #@markdown Pick a `SITE_PRESET` to load a verified test case and leave
 #@markdown `PDB_SPECS` alone — it fills in the structure and the ligands to
 #@markdown keep. `none` uses whatever you type.
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
 INPUT_MODE = "fetch" #@param ["fetch", "upload", "drive_folder", "both"]
 PDB_SPECS = "1ubq_A\\n2gb1_A" #@param {type:"string"}
 CHAIN_OVERRIDE = "" #@param {type:"string"}
@@ -821,7 +821,7 @@ code_with_bootstrap(
     """
 #@title Step 5 — Mode and functional site
 SEARCH_MODE = "alphabet_only" #@param ["alphabet_only", "site_aware", "scaffold_then_site"]
-SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs"]
+SITE_PRESET = "none" #@param ["none", "atp", "tev", "glyrs", "alars"]
 SITE_SPEC = "" #@param {type:"string"}
 SITE_CHAIN = "" #@param {type:"string"}
 #@markdown One policy for every role, or a blanket policy plus per-role
@@ -852,6 +852,13 @@ SITE_REST_MAX_BB_RMSD = 0.0 #@param {type:"number"}
 SITE_REST_MAX_LOCAL_RMSD = 0.0 #@param {type:"number"}
 SITE_REST_MAX_CB_RMS_DEV = 0.0 #@param {type:"number"}
 SITE_REQUIRE_IDENTITY = True #@param {type:"boolean"}
+#@markdown A held site position keeps its native residue, so holding one whose
+#@markdown type you put in `EXCLUDE_AAS` puts that residue straight back into
+#@markdown the protein. Tick this to leave those positions for the design
+#@markdown instead — still measured, so the geometry decides whether the
+#@markdown substitution survived. It is the only way to ask for a preserved
+#@markdown site *and* a residue genuinely absent. Every freed position is named.
+SITE_FREE_EXCLUDED = False #@param {type:"boolean"}
 
 import os
 
@@ -877,6 +884,7 @@ _applied = rc.configure_site(
     rest_max_local_rmsd=SITE_REST_MAX_LOCAL_RMSD,
     rest_max_cb_rms_dev=SITE_REST_MAX_CB_RMS_DEV,
     require_identity=SITE_REQUIRE_IDENTITY,
+    free_excluded=SITE_FREE_EXCLUDED,
     mpnn_model_type=MPNN_MODEL_TYPE,
 )
 

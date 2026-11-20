@@ -1367,8 +1367,13 @@ def test_a_failing_verdict_names_the_gate_that_bound():
         folder.break_site_for = {design}
         bad = v.validate(set("GVL"), pairs, 1)
         assert not bad.passed
-        assert bad.reason == "site", bad.reason
-        assert P._verdict(bad) == "fail[site]"
+        # The reason names WHICH site check bound, not just "site": the fix
+        # for a lost identity is nothing like the fix for a distorted pocket.
+        assert bad.reason.startswith("site:"), bad.reason
+        assert bad.reason.split(":")[1] in (
+            "identity", "bb", "local", "cbMax", "cbRMS"
+        ), bad.reason
+        assert P._verdict(bad) == f"fail[{bad.reason}]"
         # The fold really was fine, so TM cannot be what the reader blames.
         assert bad.metrics.max_tm > cfg.min_tm_score
         # And the site numbers are on the line now.
@@ -1694,7 +1699,8 @@ def test_an_exempt_site_holding_an_excluded_residue_is_called_out():
         out = buf.getvalue()
         assert "EXCLUDE_AAS bars C" in out, out[-900:]
         assert "still contain" in out
-        assert "measure_only" in out
+        # The message has to name the way out, not just the contradiction.
+        assert "SITE_FREE_EXCLUDED=1" in out
 
         # And the CSV says so rather than leaving it to be assumed.
         row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
@@ -1789,6 +1795,126 @@ def test_reconstruction_survives_a_replicate_with_no_logs_at_all():
         out = pipe._reconstruct_rep_result(os.path.join(tmp, "nothing"), 1)
         assert out["status"] == "resumed_reconstructed"
         assert "final_alphabet" not in out
+
+
+def test_site_free_excluded_frees_the_barred_positions_and_says_so():
+    """Hold the site, except where that would reinstate a banned residue.
+
+    This is the only configuration that can ask for a preserved site AND a
+    residue genuinely absent from the protein. Freeing those positions
+    silently would be worse than the contradiction it resolves, so the run
+    names each one.
+    """
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory(prefix="redaa_free_excl_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        cfg = _make_config(
+            tmp, search_mode="site_aware", site_spec=SITE,
+            site_residue_policy="exempt", exclude_aas=("C",),
+            site_free_excluded=True,
+            num_seqs_to_fold=3, prune_folds=1,
+        )
+        pipe = StubPipeline(cfg)
+        pipe.ref_path = ref
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pipe.run()
+        out = buf.getvalue()
+        assert "SITE_FREE_EXCLUDED: not holding" in out, out[-900:]
+        # The freed position is named, and the geometry still gates it.
+        assert "C2" in out
+        assert "still gated" in out
+        # And it is no longer reported as a contradiction, because it is not.
+        assert "still contain" not in out
+
+        row = _read_csv(os.path.join(pipe.run_dir, "BATCH_SUMMARY.csv"))[0]
+        assert row["site_n_freed_excluded"] == "1", row["site_n_freed_excluded"]
+        # Held count drops by the freed position: C2 of C2/D3/H7.
+        assert row["site_n_held"] == "2", row["site_n_held"]
+
+
+def test_the_designer_and_the_validator_get_the_same_plan():
+    """One fact, one implementation.
+
+    There were briefly two plan builders: the pipeline's knew about
+    SITE_FREE_EXCLUDED and the validator's did not, so MPNN was correctly
+    told to leave a position free while the validator went on demanding the
+    native residue there. Every design then failed on identity, with nothing
+    on the console to say why. Any future divergence fails here.
+    """
+    from redaa.pipeline import plan_for
+    from redaa.search import Validator, plan_for as search_plan_for
+    from redaa import sites as sitemod
+    from redaa import structure as st
+
+    assert plan_for is search_plan_for
+
+    with tempfile.TemporaryDirectory(prefix="redaa_one_plan_") as tmp:
+        ref = os.path.join(tmp, "ref.pdb")
+        _write_reference(ref)
+        records = st.parse_residues_from_file(
+            ref, atom_names=None, include_hetatm=True
+        )
+        frames, _ = st.frames_from_records(records)
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+        ref_xyz, ref_seq = st.parse_ca_from_file(ref)
+
+        for free in (False, True):
+            cfg = _make_config(
+                tmp, search_mode="site_aware", site_spec=SITE,
+                exclude_aas=("C",), site_free_excluded=free,
+                site_gate_roles="catalytic,contact",
+            )
+            v = Validator(cfg, None, np.array(ref_xyz), ref_seq,
+                          site=site, ref_frames=frames)
+            mine = plan_for(cfg, site)
+            assert v.plan.fixed == mine.fixed, free
+            assert v.plan.exempt == mine.exempt, free
+            assert v.plan.gated == mine.gated, free
+            assert v.plan.freed_excluded == mine.freed_excluded, free
+        # And the switch really did change something, so this is not vacuous.
+        cfg_off = _make_config(tmp, search_mode="site_aware", site_spec=SITE,
+                               exclude_aas=("C",), site_free_excluded=False)
+        cfg_on = _make_config(tmp, search_mode="site_aware", site_spec=SITE,
+                              exclude_aas=("C",), site_free_excluded=True)
+        assert plan_for(cfg_off, site).fixed != plan_for(cfg_on, site).fixed
+
+
+def test_site_free_excluded_leaves_unbarred_site_positions_held():
+    """It frees only what the exclusion forces, not the whole site."""
+    from redaa.pipeline import plan_for
+    from redaa import sites as sitemod
+    from redaa import structure as st
+
+    with tempfile.TemporaryDirectory(prefix="redaa_free_excl2_") as tmp:
+        os.makedirs(os.path.join(tmp, "inputs"), exist_ok=True)
+        ref = os.path.join(tmp, "inputs", "testdomA00.pdb")
+        _write_reference(ref)
+        records = st.parse_residues_from_file(
+            ref, atom_names=None, include_hetatm=True
+        )
+        site = sitemod.resolve_site(sitemod.parse_site_spec(SITE), records)
+        natives = {p.index: p.native_aa for p in site.positions}
+
+        cfg = _make_config(tmp, search_mode="site_aware", site_spec=SITE,
+                           exclude_aas=("C",), site_free_excluded=True)
+        plan = plan_for(cfg, site)
+        freed = {i for i, _aa in plan.freed_excluded}
+        assert all(natives[i] == "C" for i in freed), freed
+        assert freed, "the fixture site should hold a cysteine"
+        # Everything else is still held at native identity.
+        assert set(plan.fixed) == set(natives) - freed
+        assert "freed as excluded" in plan.describe()
+
+        # With the switch off, nothing is freed and the site is fully held.
+        cfg.site_free_excluded = False
+        plan = plan_for(cfg, site)
+        assert plan.freed_excluded == ()
+        assert set(plan.fixed) == set(natives)
 
 
 # ---------------------------------------------------------------------------

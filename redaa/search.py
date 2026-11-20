@@ -38,6 +38,30 @@ from . import sites as sitemod
 from . import structure as st
 
 
+def plan_for(cfg, site) -> "sitemod.SitePlan":
+    """The three sets a resolved site asks of the search, under *cfg*.
+
+    This lives here, and the pipeline imports it, so there is exactly one
+    place that turns a config into a plan. There were briefly two -- the
+    validator built its own and did not know about SITE_FREE_EXCLUDED -- and
+    the result was that MPNN was correctly told to leave a position free
+    while the validator went on demanding the native residue there, so every
+    design failed on identity. Config validation has already rejected a
+    malformed policy string, so the problems list is dropped.
+    """
+    from .config import parse_site_policy
+
+    policies, _ = parse_site_policy(cfg.site_residue_policy)
+    return sitemod.site_plan(
+        site,
+        policies,
+        gate_roles=cfg.gate_role_tuple,
+        free_aas=(
+            frozenset(cfg.exclude_aas) if cfg.site_free_excluded else frozenset()
+        ),
+    )
+
+
 def in_alphabet(seq: str, allowed: set[str], exempt: frozenset[int]) -> bool:
     """Whether every *designable* position of *seq* is inside *allowed*.
 
@@ -244,13 +268,9 @@ class Validator:
         self.ref_frames = ref_frames
         # One resolved plan, rather than a policy string compared ad hoc.
         # With per-role policies the same site can hold a pocket exactly and
-        # leave an interface free, so "the policy" is no longer a single value.
-        from .config import parse_site_policy
-
-        policies, _ = parse_site_policy(cfg.site_residue_policy)
-        self.plan = sitemod.site_plan(
-            self.site, policies, gate_roles=cfg.gate_role_tuple
-        )
+        # leave an interface free, so "the policy" is no longer a single
+        # value -- and this must be the SAME plan the designer was given.
+        self.plan = plan_for(cfg, self.site)
         self.exempt: frozenset[int] = self.plan.exempt
         # Identity is required only where the plan holds a position. Under
         # measure_only the design picks its own residues there, so checking
@@ -373,6 +393,7 @@ class Validator:
 
         passed = False
         site_ok_flags: list[bool | None] = []
+        site_fail_tally: dict[str, int] = {}
         n_tm_ok = 0
         n_plddt_ok = 0
         n_site_ok = 0
@@ -403,6 +424,21 @@ class Validator:
                 if ok_site:
                     metrics.num_site_pass += 1
                     n_site_ok += 1
+                else:
+                    for name in sm.failing_checks(
+                        self.cfg.site_max_bb_rmsd,
+                        self.cfg.site_max_local_rmsd,
+                        self.cfg.site_max_cb_dev,
+                        require_identity=self.require_identity,
+                        max_cb_rms_dev=self.cfg.site_max_cb_rms_dev,
+                        rest=(
+                            self.cfg.site_rest_max_bb_rmsd,
+                            self.cfg.site_rest_max_local_rmsd,
+                            self.cfg.site_rest_max_cb_dev,
+                            self.cfg.site_rest_max_cb_rms_dev,
+                        ),
+                    ):
+                        site_fail_tally[name] = site_fail_tally.get(name, 0) + 1
             site_ok_flags.append(ok_site)
 
             # The site is a gate only when asked for; otherwise the numbers
@@ -431,7 +467,14 @@ class Validator:
             elif self.cfg.use_plddt_gate and n_plddt_ok == 0:
                 reason = "pLDDT"
             elif gating_site and n_site_ok == 0:
-                reason = "site"
+                # Name the check that bound, not just "site": the remedy for
+                # a lost identity is nothing like the remedy for a distorted
+                # pocket or a displaced second half.
+                if site_fail_tally:
+                    worst = max(sorted(site_fail_tally), key=site_fail_tally.get)
+                    reason = f"site:{worst}"
+                else:
+                    reason = "site"
             elif gating_site:
                 reason = "no single design passed both"
             else:

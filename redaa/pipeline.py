@@ -38,7 +38,6 @@ from .config import (
     MODE_ALPHABET_ONLY,
     MODE_SCAFFOLD_THEN_SITE,
     MODE_SITE_AWARE,
-    parse_site_policy,
 )
 from .foldcache import FoldCache
 from .folding import FoldEngine
@@ -46,6 +45,7 @@ from .mpnn import MPNNEngine
 from .search import (
     Metrics,
     Validator,
+    plan_for,
     backward_prune,
     in_alphabet,
     select_sequences,
@@ -101,16 +101,6 @@ def _verdict(validation) -> str:
         return "PASS"
     reason = getattr(validation, "reason", "")
     return f"fail[{reason}]" if reason else "fail"
-
-
-def plan_for(cfg, site) -> "sitemod.SitePlan":
-    """The three sets a resolved site asks of the search, under *cfg*.
-
-    Config validation has already rejected a malformed policy string, so the
-    problems list is dropped here.
-    """
-    policies, _ = parse_site_policy(cfg.site_residue_policy)
-    return sitemod.site_plan(site, policies, gate_roles=cfg.gate_role_tuple)
 
 
 class _SkipCheck(Exception):
@@ -885,6 +875,7 @@ class Pipeline:
                 site_n_measured=plan.n_measured,
                 site_forced_types="".join(sorted(plan.forced_types)),
                 site_n_gated=len(plan.gated),
+                site_n_freed_excluded=len(plan.freed_excluded),
                 site_gate_roles=",".join(cfg.gate_role_tuple),
                 best_seq_site_rec_bb_rmsd=best.get("site_rec_bb_rmsd"),
                 best_seq_site_rec_local_rmsd=best.get("site_rec_local_rmsd"),
@@ -1738,16 +1729,26 @@ class Pipeline:
             ]
             if held:
                 where = ", ".join(p.label for p in held)
-                roles = sorted({p.role for p in held})
-                free = ",".join(f"{r}=measure_only" for r in roles)
                 print(
                     f"\n  WARNING: EXCLUDE_AAS bars "
                     f"{''.join(sorted({p.native_aa for p in held}))}, but the "
                     f"site holds {where} at native identity.\n"
                     f"    The designed protein will still contain "
-                    f"{len(held)} of them. If the point is to remove the "
-                    "residue entirely, drop those positions from SITE_SPEC or "
-                    f"set SITE_RESIDUE_POLICY={free}."
+                    f"{len(held)} of them. To hold the rest of the site and "
+                    "still be rid of the residue, set SITE_FREE_EXCLUDED=1: "
+                    "those positions are then designed and still measured, so "
+                    "the geometry decides whether the substitution survived."
+                )
+            if site_plan_obj.freed_excluded:
+                by_index = {p.index: p for p in site.positions}
+                freed = ", ".join(
+                    by_index[i].label for i, _aa in site_plan_obj.freed_excluded
+                )
+                print(
+                    f"\n  SITE_FREE_EXCLUDED: not holding {freed} -- their "
+                    "native residue is barred by EXCLUDE_AAS.\n"
+                    "    The design chooses these, and their geometry is still "
+                    "gated, so a substitution that breaks the site fails."
                 )
         if site is not None:
             site_clash = sorted(set(site_plan_obj.forced_types) & barred)
@@ -1962,6 +1963,7 @@ class Pipeline:
         "site_residues", "site_residue_types", "site_policy",
         "site_partners", "site_n_interface", "site_n_held", "site_n_measured",
         "site_forced_types", "site_n_gated", "site_gate_roles",
+        "site_n_freed_excluded",
         "best_seq_site_rec_bb_rmsd", "best_seq_site_rec_local_rmsd",
         "best_seq_site_rec_cb_dev",
         "best_seq_site_bb_rmsd", "best_seq_site_local_rmsd",
