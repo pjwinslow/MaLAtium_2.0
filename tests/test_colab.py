@@ -29,7 +29,9 @@ def test_no_gpu_is_reported_as_a_blocker():
 def test_t4_is_warned_about_bf16_and_capped_on_length():
     t4 = C.GpuInfo(True, "Tesla T4", 15.0, (7, 5), bf16=False)
     rec = C.recommend(t4)
-    assert rec.env["FOLD_MAX_RESIDUES"] == "320"
+    # 700 with the recommended small backbone, not 320 with the 12.7 GB one.
+    assert rec.env["FOLD_MAX_RESIDUES"] == "700"
+    assert rec.env["FOLD_MODEL_ID"] == "Synthyra/ESMFold2-600"
     assert any("bfloat16" in w for w in rec.warnings)
     assert any("FOLD_PRECISION" in w for w in rec.warnings)
 
@@ -47,7 +49,15 @@ def test_a100_gets_the_full_length_budget_and_no_bf16_warning():
 
 def test_l4_sits_between_the_two():
     l4 = C.GpuInfo(True, "NVIDIA L4", 22.5, (8, 9), bf16=True)
-    assert C.recommend(l4).env["FOLD_MAX_RESIDUES"] == "512"
+    rec = C.recommend(l4)
+    # More room than a 16 GB card, less than an A100: the length budget sits
+    # between them, and it assumes the small backbone it also recommends.
+    assert rec.env["FOLD_MAX_RESIDUES"] == "900"
+    assert rec.env["FOLD_MODEL_ID"] == "Synthyra/ESMFold2-600"
+    a100 = C.GpuInfo(True, "A100-SXM4-40GB", 40.0, (8, 0), bf16=True)
+    assert int(rec.env["FOLD_MAX_RESIDUES"]) < int(
+        C.recommend(a100).env["FOLD_MAX_RESIDUES"]
+    )
 
 
 def test_gpu_label_is_human_readable():
@@ -1342,25 +1352,37 @@ def test_the_vram_cap_is_presented_as_an_estimate_not_a_verdict():
     """
     rec = C.recommend(C.GpuInfo(available=True, name="Tesla T4", total_gb=15.0,
                                 capability=(7, 5), bf16=False))
-    assert rec.env["FOLD_MAX_RESIDUES"] == "320"
     text = " ".join(rec.warnings + rec.notes)
     assert "ESTIMATE" in text, text
     # It must say a longer input is still tried, or the reader stops here.
     assert "attempted once" in text, text
+    # And it must not hand a 16 GB card a 12.7 GB backbone. ESMFold2-Fast
+    # loads biohub/ESMC-6B, which left ~3 GB for activations and made a
+    # 489-residue chain impossible at every chunk size.
+    assert rec.env["FOLD_MODEL_ID"] == "Synthyra/ESMFold2-600", rec.env
+    assert "12.7 GB" in text, text
     # And name the lever that actually governs this memory. Pointing at the
     # model variants was wrong: all four are 179-235 M parameters with under
     # 1 GB of weights, and the "-600"/"-300" names refer to the
     # language-model backbone, not the folding trunk.
-    assert rec.env["FOLD_CHUNK_SIZE"] == "16"
+    # 32, not 16: with a 1.2 GB backbone instead of 12.7 GB there is room,
+    # and the engine halves it on an OOM anyway.
+    assert rec.env["FOLD_CHUNK_SIZE"] == "32"
     assert "FOLD_CHUNK_SIZE" in text, text
-    assert "switching variant saves little" in text, text
 
     # A 24 GB card: same honesty, different number.
     rec = C.recommend(C.GpuInfo(available=True, name="NVIDIA L4", total_gb=23.0,
                                 capability=(8, 9), bf16=True))
-    assert rec.env["FOLD_MAX_RESIDUES"] == "512"
     assert rec.env["FOLD_CHUNK_SIZE"] == "32"
-    assert "estimate" in " ".join(rec.notes), rec.notes
+    assert rec.env["FOLD_MODEL_ID"] == "Synthyra/ESMFold2-600", rec.env
+    assert "estimates" in " ".join(rec.notes), rec.notes
+    # ...and say how to go back, since the 6 B backbone is the better model.
+    assert "back to Synthyra/ESMFold2-Fast" in " ".join(rec.notes)
+
+    # A 40 GB card has room for the big backbone, so it keeps the default.
+    big = C.recommend(C.GpuInfo(available=True, name="A100-SXM4-40GB",
+                                total_gb=40.0, capability=(8, 0), bf16=True))
+    assert "FOLD_MODEL_ID" not in big.env, big.env
 
 
 def main():

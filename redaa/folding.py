@@ -95,6 +95,48 @@ def normalise_plddt(value: float | None) -> float | None:
     return value * 100.0 if value <= 1.5 else value
 
 
+# ESMFold2 variants differ in their language-model backbone, and that is
+# where the VRAM goes. Verified against the Hub rather than inferred from the
+# names: each variant's config.json names an esmc_id, and those repos report
+#
+#   ESMFold2-Fast -> biohub/ESMC-6B            6.35 B params  ~12.7 GB bf16
+#   ESMFold2      -> biohub/ESMC-6B            6.35 B params  ~12.7 GB bf16
+#   ESMFold2-600  -> ESMplusplus_large         0.58 B params   ~1.2 GB bf16
+#   ESMFold2-300  -> ESMplusplus_small         0.33 B params   ~0.7 GB bf16
+#
+# The folding trunk is 24 layers in all of them, so the choice costs little
+# in the structure module and nearly twelve gigabytes at the backbone. On a
+# 16 GB card ESMFold2-Fast spends ~12.7 GB before a single activation is
+# allocated, which is why a 489-residue chain ran out of memory there at
+# every chunk size: chunking caps activations, and the weights were the
+# problem. This table exists because the repo sizes alone are misleading --
+# each variant's own safetensors is only 0.7-0.9 GB, the backbone is pulled
+# from a separate repo, and reading the former led to exactly the wrong
+# advice.
+FOLD_BACKBONE_GB = {
+    "Synthyra/ESMFold2-Fast": 12.7,
+    "Synthyra/ESMFold2": 12.7,
+    "Synthyra/ESMFold2-600": 1.2,
+    "Synthyra/ESMFold2-300": 0.7,
+}
+# Smallest-to-largest, for recommending one that fits.
+FOLD_VARIANTS_BY_SIZE = (
+    "Synthyra/ESMFold2-300",
+    "Synthyra/ESMFold2-600",
+    "Synthyra/ESMFold2-Fast",
+    "Synthyra/ESMFold2",
+)
+
+
+def smaller_backbone(model_id: str) -> str | None:
+    """The next variant down in backbone size, or None at the smallest."""
+    try:
+        i = FOLD_VARIANTS_BY_SIZE.index(model_id)
+    except ValueError:
+        return FOLD_VARIANTS_BY_SIZE[1]
+    return FOLD_VARIANTS_BY_SIZE[i - 1] if i > 0 else None
+
+
 class FoldEngine:
     """Thin, cached wrapper around an ESMFold2-Fast checkpoint."""
 
@@ -454,15 +496,34 @@ class FoldEngine:
                         f" even at chunk={self.chunk_size}"
                         if self.chunk_size is not None else ""
                     )
+                    # Chunking caps activations. If the weights are what does
+                    # not fit, no chunk size helps and the remedy is a
+                    # smaller language-model backbone -- which is the one
+                    # thing that differs between the ESMFold2 variants.
+                    weights = FOLD_BACKBONE_GB.get(self.cfg.fold_model_id)
+                    smaller = smaller_backbone(self.cfg.fold_model_id)
+                    advice = (
+                        f"A shorter construct or a larger card is what is left"
+                    )
+                    if smaller:
+                        saving = (
+                            f" ({weights:.1f} GB -> "
+                            f"{FOLD_BACKBONE_GB.get(smaller, 0):.1f} GB of "
+                            "weights)" if weights else ""
+                        )
+                        advice = (
+                            f"set FOLD_MODEL_ID={smaller}{saving}. Its "
+                            "folding trunk is the same 24 layers; only the "
+                            "language-model backbone is smaller, and on this "
+                            "card that is where the memory went"
+                        )
                     self.last_error = (
                         f"CUDA out of memory at L={len(sequence)}"
-                        f"{floor_note}. This GPU cannot fold "
-                        f"{len(sequence)} residues with "
-                        f"{self.cfg.fold_model_id}. A shorter construct or a "
-                        "larger card is what is left -- the ESMFold2 variants "
-                        "differ in their language-model backbone, not the "
-                        "folding trunk that dominates this memory, so "
-                        "switching variant saves little"
+                        f"{floor_note}. {self.cfg.fold_model_id} cannot fold "
+                        f"{len(sequence)} residues on this GPU"
+                        + (f"; its backbone alone is ~{weights:.1f} GB of "
+                           "weights before any activation" if weights else "")
+                        + f". {advice}"
                     )
                     print(f"    ESMFold2 OOM: {self.last_error}")
                     return None

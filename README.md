@@ -867,7 +867,29 @@ length this card and model actually manage. Nothing longer is attempted
 again, because by then it is measured rather than guessed. Preflight reports
 an over-cap input as a note, not a failure, for the same reason.
 
-**The lever that matters is `FOLD_CHUNK_SIZE`, not the model variant.**
+**What actually governs the memory is the language-model backbone.** Each
+ESMFold2 variant's `config.json` names an `esmc_id`, and those are separate
+repositories whose sizes differ by more than an order of magnitude:
+
+| `FOLD_MODEL_ID` | backbone | parameters | weights (bf16) |
+|---|---|---|---|
+| `ESMFold2-Fast` | `biohub/ESMC-6B` | 6.35 B | **~12.7 GB** |
+| `ESMFold2` | `biohub/ESMC-6B` | 6.35 B | ~12.7 GB |
+| `ESMFold2-600` | `ESMplusplus_large` | 0.58 B | ~1.2 GB |
+| `ESMFold2-300` | `ESMplusplus_small` | 0.33 B | ~0.7 GB |
+
+The folding trunk is 24 layers in every one, so the choice costs little in
+the structure module and nearly twelve gigabytes at the backbone. On a 16 GB
+card the default variant spends ~12.7 GB before a single activation, which
+leaves ~3 GB and makes a 500-residue chain impossible at *any* chunk size.
+The GPU cell therefore recommends `ESMFold2-600` below 26 GB and says how to
+go back.
+
+Reading each variant's own `safetensors` is misleading here -- they are all
+0.7-0.9 GB, because the backbone lives in another repository -- and doing
+exactly that produced the opposite advice for a while.
+
+**The second lever is `FOLD_CHUNK_SIZE`.**
 ESMFold2 caps its L² operations (triangle updates, outer-product mean, pair
 transition) at a token-axis chunk, 64 by default, which its own code
 documents as fitting L≈2000 on an 80 GB card. A smaller chunk trades speed
@@ -876,10 +898,9 @@ sets 16 under 17 GB and 32 under 26 GB, and on any out-of-memory error the
 engine halves it again and retries, down to 8, before declaring the length
 impossible — so the limit is tuned by the failure rather than guessed.
 
-Switching `FOLD_MODEL_ID` is the weaker lever and was initially suggested
-here in error: the four variants are 179–235 M parameters with under 1 GB of
-weights, and the "-600"/"-300" names refer to the language-model backbone,
-not the folding trunk that this memory is spent in.
+Chunking caps activations, so it cannot help when the *weights* are what
+does not fit. An out-of-memory error now says which of the two it is, and
+names the smaller backbone with the saving in gigabytes.
 
 **905 residues will not fold on a small card.** The site spans residues 93–883, so no
 truncation keeps all of it; residues 1–490 keep the pocket entire (21/21) and

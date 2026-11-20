@@ -1984,10 +1984,12 @@ def test_an_over_cap_fold_is_attempted_and_the_real_limit_measured():
         eng3.cache = _NoCache()
         assert eng3.fold("A" * 489) is None
     out = buf.getvalue()
-    assert "shorter construct or a larger card" in out, out
-    # And it must not send the reader off to swap model variants, which share
-    # the folding trunk this memory is spent in.
-    assert "switching variant saves little" in out, out
+    # The remedy has to name the backbone, with numbers. Chunking caps
+    # activations; when the WEIGHTS are what does not fit, no chunk size
+    # helps, and the variants differ by nearly twelve gigabytes there.
+    assert "FOLD_MODEL_ID=Synthyra/ESMFold2-600" in out, out
+    assert "12.7 GB -> 1.2 GB" in out, out
+    assert "same 24 layers" in out, out
 
     if installed:
         del sys.modules["torch"]

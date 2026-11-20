@@ -119,15 +119,28 @@ def recommend(gpu: GpuInfo | None = None) -> Recommendation:
         # ESMFold2's own default chunk is 64, documented as fitting L~2000 on
         # an 80 GB card. On a 16 GB card the L^2 operations are what runs out
         # of memory, so start low rather than pay an OOM to find out.
-        rec.env["FOLD_CHUNK_SIZE"] = "16"
-        rec.env["FOLD_MAX_RESIDUES"] = "320"
+        # The default variant's backbone is ~12.7 GB of weights in bf16,
+        # which on this card leaves almost nothing for activations: a
+        # 489-residue chain ran out of memory at every chunk size until the
+        # backbone was changed. Recommend one that fits and say why.
+        rec.env["FOLD_MODEL_ID"] = "Synthyra/ESMFold2-600"
+        rec.env["FOLD_CHUNK_SIZE"] = "32"
+        rec.env["FOLD_MAX_RESIDUES"] = "700"
         rec.warnings.append(
-            f"Only {gpu.total_gb:.0f} GB of VRAM (a T4 or V100 class card). "
-            "Setting FOLD_MAX_RESIDUES=320, which is an ESTIMATE and errs "
-            "low. A longer input is still attempted once -- an out-of-memory "
-            "error is caught and reports this card's real limit -- so do not "
-            "treat 320 as a verdict. "
-            "FOLD_CHUNK_SIZE is set to 16 (the model's default is 64), which "
+            f"Only {gpu.total_gb:.0f} GB of VRAM. ESMFold2-Fast and ESMFold2 "
+            "load biohub/ESMC-6B, a 6.35 B-parameter backbone that is about "
+            "12.7 GB of weights in bf16 -- before a single activation -- so "
+            "on this card they cannot fold much. Recommending "
+            "ESMFold2-600 instead: the same 24-layer folding trunk with a "
+            "0.58 B backbone (~1.2 GB), which frees about 11.5 GB. "
+            "ESMFold2-300 is smaller again (~0.7 GB) if you need the room."
+        )
+        rec.warnings.append(
+            "FOLD_MAX_RESIDUES=700 with that backbone, which is an ESTIMATE "
+            "and errs low. A longer input is still attempted once -- an "
+            "out-of-memory error is caught and reports this card's real "
+            "limit -- so do not treat it as a verdict. "
+            "FOLD_CHUNK_SIZE is set to 32 (the model's default is 64), which "
             "caps the L-squared operations that dominate this memory; the "
             "engine halves it again on any out-of-memory error. That is the "
             "lever that matters here -- the ESMFold2 variants differ in their "
@@ -135,12 +148,22 @@ def recommend(gpu: GpuInfo | None = None) -> Recommendation:
             "variant saves little."
         )
     elif gpu.total_gb < 26:
-        rec.env["FOLD_MAX_RESIDUES"] = "512"
+        # 12.7 GB of backbone weights is still half of a 24 GB card, so the
+        # same reasoning applies as below 17 GB -- just with more headroom.
+        rec.env["FOLD_MODEL_ID"] = "Synthyra/ESMFold2-600"
+        rec.env["FOLD_MAX_RESIDUES"] = "900"
         rec.env["FOLD_CHUNK_SIZE"] = "32"
         rec.notes.append(
-            "FOLD_MAX_RESIDUES=512 for this VRAM budget -- an estimate, not a "
-            "measurement; a longer input is attempted once anyway. "
-            "FOLD_CHUNK_SIZE=32 halves the model's default L-squared chunk."
+            "ESMFold2-Fast and ESMFold2 load biohub/ESMC-6B, ~12.7 GB of "
+            "weights in bf16, which is half this card before any activation. "
+            "Recommending FOLD_MODEL_ID=Synthyra/ESMFold2-600: the same "
+            "24-layer folding trunk, a 0.58 B backbone (~1.2 GB). "
+            "FOLD_MAX_RESIDUES=900 and FOLD_CHUNK_SIZE=32 follow from that; "
+            "both are estimates, and a longer input is attempted once anyway."
+        )
+        rec.notes.append(
+            "Set FOLD_MODEL_ID back to Synthyra/ESMFold2-Fast if your chains "
+            "are short and you want the 6 B backbone's accuracy."
         )
     else:
         rec.env["FOLD_MAX_RESIDUES"] = "1024"
